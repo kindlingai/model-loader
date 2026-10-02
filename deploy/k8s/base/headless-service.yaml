@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-loader-headless
+spec:
+  clusterIP: None
+  # Selects every node -- root and peer alike -- so -discovery=k8s's DNS
+  # lookup lists the whole mesh. Root is a valid LAN source too: every node
+  # runs the same HTTP API (see docs/protocol.md).
+  selector:
+    app: model-loader
+  ports:
+    - name: http
+      port: 7762
+      targetPort: 7762

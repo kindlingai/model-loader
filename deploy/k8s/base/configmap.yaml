@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-loader-catalog
+data:
+  # Fleet-wide desired state. See docs/design.md and internal/catalog for the
+  # schema. Overlay this ConfigMap (or patch this key) per environment rather
+  # than editing it in place here.
+  catalog.yaml: |
+    models: []

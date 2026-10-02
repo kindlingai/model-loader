@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-loader-root
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-loader
+      role: root
+  template:
+    metadata:
+      labels:
+        app: model-loader
+        role: root
+    spec:
+      containers:
+        - name: model-loader
+          image: ghcr.io/kindlingai/model-loader:latest
+          args:
+            - -mode=root
+            - -catalog=/etc/model-loader/catalog.yaml
+            - -store=/var/lib/model-loader
+            - -listen=:7762
+            - -discovery=k8s
+            - -k8s-service=model-loader-headless
+            - -k8s-port=7762
+          ports:
+            - name: http
+              containerPort: 7762
+          readinessProbe:
+            httpGet: { path: /status, port: http }
+            initialDelaySeconds: 2
+          volumeMounts:
+            - name: catalog
+              mountPath: /etc/model-loader
+            - name: store
+              mountPath: /var/lib/model-loader
+      volumes:
+        - name: catalog
+          configMap:
+            name: model-loader-catalog
+        - name: store
+          # emptyDir, not hostPath: the peer DaemonSet already uses
+          # /var/lib/model-loader as a hostPath on every node, and two
+          # separate model-loader processes must never share one on-disk
+          # store (no cross-process locking on state.json). If this pod lands
+          # on the same node as that node's peer, emptyDir keeps them
+          # isolated. Losing root's cache on reschedule just means a re-fetch
+          # from WAN, not a correctness problem.
+          emptyDir: {}

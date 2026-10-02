@@ -25,6 +25,11 @@ import (
 // default for a box that may also be serving an LLM workload.
 const defaultMaxConcurrentTransfers = 2
 
+// defaultStallTimeout aborts a download from a model's origin that has
+// received no bytes for this long. A CDN connection can stall without
+// closing, which would otherwise hang that model's reconcile forever.
+const defaultStallTimeout = 2 * time.Minute
+
 // Config configures a Daemon. Store, Catalog, Selection, Sources, and
 // Discoverer are required; the rest have sane defaults.
 type Config struct {
@@ -47,6 +52,10 @@ type Config struct {
 	// MaxConcurrentTransfers bounds simultaneous file downloads across all
 	// models. Defaults to defaultMaxConcurrentTransfers.
 	MaxConcurrentTransfers int
+
+	// StallTimeout bounds how long a download from a model's origin may go
+	// without receiving any bytes. Defaults to defaultStallTimeout.
+	StallTimeout time.Duration
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -66,6 +75,9 @@ func New(cfg Config) *Daemon {
 	}
 	if cfg.MaxConcurrentTransfers <= 0 {
 		cfg.MaxConcurrentTransfers = defaultMaxConcurrentTransfers
+	}
+	if cfg.StallTimeout <= 0 {
+		cfg.StallTimeout = defaultStallTimeout
 	}
 	return &Daemon{
 		cfg:      cfg,

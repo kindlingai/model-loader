@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: useblacksmith/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -race ./...
+
+  deploy-manifests:
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: validate kustomize base
+        run: kubectl kustomize deploy/k8s/base >/dev/null
+
+      - name: validate docker compose
+        run: docker compose -f deploy/compose/docker-compose.yml config >/dev/null

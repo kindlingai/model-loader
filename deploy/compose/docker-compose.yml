@@ -1,0 +1,30 @@
+# A single-box "both" deployment by default: one container acts as root and
+# peer at once, matching the project's goal of a complete, self-contained
+# setup on one machine. For a multi-box LAN, run this on each box with
+# MODEL_LOADER_MODE=peer (and MODEL_LOADER_PEERS pointing at the others, plus
+# one box running MODEL_LOADER_MODE=root or "both").
+services:
+  model-loader:
+    image: ghcr.io/kindlingai/model-loader:latest
+    restart: unless-stopped
+    ports:
+      - "${MODEL_LOADER_PORT:-7762}:7762"
+    environment:
+      MODEL_LOADER_MODE: "${MODEL_LOADER_MODE:-both}"
+      MODEL_LOADER_PEERS: "${MODEL_LOADER_PEERS:-}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        exec /usr/local/bin/model-loader
+        -mode="$$MODEL_LOADER_MODE"
+        -catalog=/etc/model-loader/catalog.yaml
+        -store=/var/lib/model-loader
+        -listen=:7762
+        -discovery=static
+        -peers="$$MODEL_LOADER_PEERS"
+    volumes:
+      - ./catalog.yaml:/etc/model-loader/catalog.yaml:ro
+      - model-loader-store:/var/lib/model-loader
+
+volumes:
+  model-loader-store:

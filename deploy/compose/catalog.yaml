@@ -1,0 +1,3 @@
+# Fleet-wide desired state. See docs/design.md and internal/catalog for the
+# schema. Replace this with your own models before deploying.
+models: []

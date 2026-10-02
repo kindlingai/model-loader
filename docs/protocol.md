@@ -10,7 +10,7 @@ Returns this node's view of every catalog entry it is tracking.
 
 ```json
 {
-  "node_id": "spark-1",
+  "node_id": "spark-01",
   "roles": ["peer"],
   "models": [
     {
@@ -19,7 +19,7 @@ Returns this node's view of every catalog entry it is tracking.
       "state": "downloading",
       "bytes_total": 20834697216,
       "bytes_done": 1048576,
-      "source": "peer:spark-0",
+      "source": "peer:nas",
       "updated_at": "2026-10-02T12:00:00Z"
     }
   ]

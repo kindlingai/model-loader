@@ -1,21 +1,37 @@
 # model-loader
 
-Fetches large model files from the WAN once and fans them out to every box on
-the LAN, with a near-zero idle footprint on boxes that are just serving what
-they already have.
+Downloads large model files once and copies them to every machine on your
+network. A node that is only serving files it already has uses very little
+memory.
 
-Every node runs the same binary in one of two roles:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/fleet-dark.png">
+  <img src="docs/img/fleet.png" alt="A model downloaded once by the root, nas, and copied to four peers">
+</picture>
 
-- **root** — has WAN egress; downloads catalog entries from their origin
-  (Hugging Face, plain HTTP, ...) into the local store.
-- **peer** — no WAN required; fetches missing files from whichever LAN node
-  (root or another peer) already reports them ready.
+Every node runs the same binary. `--mode` sets what it does:
 
-A node can be both at once — "root" is just a peer with WAN fetch turned on,
-which is what makes a single box a complete, self-contained setup.
+- **root** downloads catalog models from their source (Hugging Face or plain
+  HTTP) into its local store.
+- **peer** copies missing files from other nodes, either the root or another
+  peer. It doesn't need internet access.
+- **both** does both. Use this on a single machine.
 
-Once a node holds a file, it serves it to the rest of the LAN too, so the
-root's bandwidth doesn't scale with fleet size: peers reseed each other.
+Every node serves the files it has to the other nodes, so peers can copy from
+each other instead of all copying from the root.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/node-dark.png">
+  <img src="docs/img/node.png" alt="The parts of one node: inputs, reconcile loop, transfer, store and HTTP server">
+</picture>
+
+Files are transferred in 64 MiB segments. Each segment is checked against the
+sha256 in the manifest before it's marked done or served to other nodes.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/segments-dark.png">
+  <img src="docs/img/segments.png" alt="spark-02 copying a file in segments from spark-01 and nas">
+</picture>
 
 See [docs/design.md](docs/design.md) for the full design and
 [docs/protocol.md](docs/protocol.md) for the wire format.
@@ -32,7 +48,7 @@ end-to-end.
 cmd/model-loader/   CLI entrypoint
 internal/catalog/   desired-state parsing (catalog.yaml)
 internal/store/     local content store, manifests, integrity
-internal/source/    WAN source plugins (http, huggingface)
+internal/source/    download sources (http, huggingface)
 internal/transfer/  resumable range-fetch engine
 internal/discovery/ peer discovery backends (static, k8s DNS)
 internal/server/    LAN-facing HTTP server (status/manifest/blob)

@@ -1,0 +1,33 @@
+# model-loader node daemon. Per-box settings (MODEL_LOADER_MODE and friends)
+# come from /etc/spark/model-loader.env, which the initramfs copies from the
+# box's own disk the same way it does for /etc/spark/node.env (mentat).
+#
+# Flags are passed via a shell wrapper rather than the binary reading the
+# environment itself, so the same catalog.yaml/binary work unmodified across
+# the k8s, compose, and spark-os deploy targets -- only this unit's
+# env-to-flag mapping is spark-os-specific.
+[Unit]
+Description=model-loader node daemon
+After=network.target NetworkManager.service
+ConditionPathExists=/etc/spark/model-loader.env
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=/etc/spark/model-loader.env
+ExecStart=/bin/sh -c '\
+  exec /usr/local/bin/model-loader \
+    -mode="$MODEL_LOADER_MODE" \
+    -catalog="${MODEL_LOADER_CATALOG:-/etc/model-loader/catalog.yaml}" \
+    -store="${MODEL_LOADER_STORE:-/var/lib/model-loader}" \
+    -listen="${MODEL_LOADER_LISTEN:-:7762}" \
+    -discovery="${MODEL_LOADER_DISCOVERY:-static}" \
+    -peers="${MODEL_LOADER_PEERS:-}" \
+    -node-id="${MODEL_LOADER_NODE_ID:-}" \
+'
+Restart=always
+RestartSec=2
+RestartSteps=10
+RestartMaxDelaySec=60
+
+[Install]
+WantedBy=multi-user.target

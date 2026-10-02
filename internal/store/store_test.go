@@ -92,6 +92,39 @@ func TestVerifySegmentDetectsCorruption(t *testing.T) {
 	}
 }
 
+// A file holding the right bytes followed by stale extra bytes is not the
+// manifest's file, even though its first fm.Size bytes hash correctly.
+func TestVerifyWholeFileRejectsTrailingBytes(t *testing.T) {
+	dir := t.TempDir()
+	content := bytes.Repeat([]byte("c"), 1024)
+	path := filepath.Join(dir, "f.bin")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manifest{Model: "m", Revision: "r", Files: []FileManifest{{Path: "f.bin", Size: int64(len(content))}}}
+	if err := m.BuildSegmentHashes(func(relPath string) (io.ReadCloser, error) {
+		return os.Open(filepath.Join(dir, relPath))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(content, "stale tail"...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	ok, err := VerifyWholeFile(f, m.Files[0])
+	if err != nil {
+		t.Fatalf("VerifyWholeFile: %v", err)
+	}
+	if ok {
+		t.Fatal("VerifyWholeFile = true for a file with trailing bytes, want false")
+	}
+}
+
 func TestStoreManifestRoundTrip(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {

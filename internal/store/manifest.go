@@ -88,8 +88,9 @@ func (m *Manifest) Find(path string) (FileManifest, bool) {
 // BuildSegmentHashes computes SegmentSHA256 for every file by reading it
 // from disk at root. It is used when publishing a manifest for files this
 // node fetched itself (e.g. in root mode, after a WAN download completes).
-// When openFile returns an *os.File, its pages are dropped from page cache
-// once hashed, so hashing a multi-hundred-GB model doesn't leave it resident.
+// When openFile returns an *os.File, each segment is dropped from page cache
+// as soon as it is hashed, so hashing a multi-hundred-GB model keeps at most
+// one segment resident.
 func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadCloser, error)) error {
 	for i := range m.Files {
 		f := &m.Files[i]
@@ -97,14 +98,11 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 		if err != nil {
 			return fmt.Errorf("open %s: %w", f.Path, err)
 		}
-		hashes, whole, err := hashSegments(rc, f.Size, DefaultSegmentSize)
-		if err == nil {
-			if file, ok := rc.(*os.File); ok {
-				if uerr := Uncache(file, 0, f.Size); uerr != nil {
-					err = fmt.Errorf("uncache: %w", uerr)
-				}
-			}
+		var hashed func(off, n int64) error
+		if file, ok := rc.(*os.File); ok {
+			hashed = func(off, n int64) error { return Uncache(file, off, n) }
 		}
+		hashes, whole, err := hashSegments(rc, f.Size, DefaultSegmentSize, hashed)
 		closeErr := rc.Close()
 		if err != nil {
 			return fmt.Errorf("hash %s: %w", f.Path, err)
@@ -119,14 +117,12 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 	return nil
 }
 
-func hashSegments(r io.Reader, size, segSize int64) (segments []string, whole string, err error) {
+// hashSegments reads size bytes from r, hashing each segSize segment and the
+// whole. hashed, if non-nil, runs after each segment with its byte range.
+func hashSegments(r io.Reader, size, segSize int64, hashed func(off, n int64) error) (segments []string, whole string, err error) {
 	wholeHash := sha256.New()
-	var remaining = size
-	for remaining > 0 {
-		n := segSize
-		if n > remaining {
-			n = remaining
-		}
+	for off := int64(0); off < size; {
+		n := min(segSize, size-off)
 		segHash := sha256.New()
 		w := io.MultiWriter(wholeHash, segHash)
 		copied, err := io.CopyN(w, r, n)
@@ -136,8 +132,13 @@ func hashSegments(r io.Reader, size, segSize int64) (segments []string, whole st
 		if copied != n {
 			return nil, "", fmt.Errorf("short read: wanted %d bytes, got %d", n, copied)
 		}
+		if hashed != nil {
+			if err := hashed(off, n); err != nil {
+				return nil, "", fmt.Errorf("uncache: %w", err)
+			}
+		}
 		segments = append(segments, hex.EncodeToString(segHash.Sum(nil)))
-		remaining -= n
+		off += n
 	}
 	return segments, hex.EncodeToString(wholeHash.Sum(nil)), nil
 }

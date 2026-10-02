@@ -126,40 +126,59 @@ func (s *Store) EnsureFile(model, revision string, fm FileManifest) (*os.File, e
 	return f, nil
 }
 
+// hashUncached writes bytes [start, start+length) of f to w in chunks of
+// DefaultSegmentSize, dropping each chunk from page cache as soon as it is
+// read. Hashing is the last read of these bytes until a peer asks for them,
+// and on unified-memory hardware resident cache competes with GPU-visible
+// RAM, so at most one chunk stays resident however large the file is.
+func hashUncached(f *os.File, start, length int64, w io.Writer) error {
+	for off, end := start, start+length; off < end; {
+		n := min(DefaultSegmentSize, end-off)
+		copied, err := io.Copy(w, io.NewSectionReader(f, off, n))
+		if err != nil {
+			return err
+		}
+		if copied != n {
+			return fmt.Errorf("short read at offset %d: wanted %d bytes, got %d", off, n, copied)
+		}
+		if err := Uncache(f, off, n); err != nil {
+			return fmt.Errorf("uncache: %w", err)
+		}
+		off += n
+	}
+	return nil
+}
+
 // VerifySegment reads segment i of fm from disk and reports whether it
-// matches the manifest's hash for that segment. The segment's pages are
-// dropped from page cache afterwards: verification is the last read until a
-// peer asks for the bytes, and on unified-memory hardware resident cache
-// competes with GPU-visible RAM.
+// matches the manifest's hash for that segment, dropping the segment's pages
+// from page cache afterwards.
 func VerifySegment(f *os.File, fm FileManifest, i int) (bool, error) {
 	if i >= len(fm.SegmentSHA256) {
 		return false, fmt.Errorf("segment %d out of range for %s (%d segments)", i, fm.Path, len(fm.SegmentSHA256))
 	}
 	start, end := fm.SegmentBounds(i)
 	h := sha256.New()
-	if _, err := io.Copy(h, io.NewSectionReader(f, start, end-start)); err != nil {
-		return false, err
-	}
-	if err := Uncache(f, start, end-start); err != nil {
-		return false, fmt.Errorf("uncache %s segment %d: %w", fm.Path, i, err)
+	if err := hashUncached(f, start, end-start, h); err != nil {
+		return false, fmt.Errorf("%s segment %d: %w", fm.Path, i, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)) == fm.SegmentSHA256[i], nil
 }
 
-// VerifyWholeFile reads the entire file and reports whether it matches the
-// manifest's whole-file hash. It is the final authority on correctness,
-// used once every segment is believed done. Like VerifySegment, it drops the
-// file's pages from page cache once hashed.
+// VerifyWholeFile reports whether the file is exactly fm.Size bytes and
+// matches the manifest's whole-file hash. It is the final authority on
+// correctness, used once every segment is believed done. Pages are dropped
+// from page cache chunk by chunk as they are hashed.
 func VerifyWholeFile(f *os.File, fm FileManifest) (bool, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
+	info, err := f.Stat()
+	if err != nil {
 		return false, err
+	}
+	if info.Size() != fm.Size {
+		return false, nil
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return false, err
-	}
-	if err := Uncache(f, 0, fm.Size); err != nil {
-		return false, fmt.Errorf("uncache %s: %w", fm.Path, err)
+	if err := hashUncached(f, 0, fm.Size, h); err != nil {
+		return false, fmt.Errorf("%s: %w", fm.Path, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)) == fm.SHA256, nil
 }

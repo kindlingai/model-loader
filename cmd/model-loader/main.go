@@ -29,6 +29,9 @@ import (
 // defaultPort matches docs/protocol.md.
 const defaultPort = 7762
 
+// version is set at release build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "model-loader:", err)
@@ -37,6 +40,7 @@ func main() {
 }
 
 type config struct {
+	showVersion bool
 	mode        string
 	storeDir    string
 	catalogPath string
@@ -68,8 +72,12 @@ func parseFlags(args []string) (*config, error) {
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
 	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous file downloads")
+	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
+	}
+	if cfg.showVersion {
+		return cfg, nil
 	}
 
 	var errs []error
@@ -107,6 +115,10 @@ func run(args []string) error {
 	cfg, err := parseFlags(args)
 	if err != nil {
 		return err
+	}
+	if cfg.showVersion {
+		fmt.Println("model-loader", version)
+		return nil
 	}
 	roles, err := parseRoles(cfg.mode)
 	if err != nil {
@@ -161,7 +173,7 @@ func run(args []string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("model-loader: node %q (%s) serving on %s", nodeID, strings.Join(roles, "+"), cfg.listen)
+		log.Printf("model-loader %s: node %q (%s) serving on %s", version, nodeID, strings.Join(roles, "+"), cfg.listen)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http server: %w", err)
 			return

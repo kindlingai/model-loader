@@ -61,6 +61,16 @@ func TestParseFlagsK8sRequiresService(t *testing.T) {
 	}
 }
 
+func TestParseFlagsVersionSkipsRequiredFlags(t *testing.T) {
+	cfg, err := parseFlags([]string{"-version"})
+	if err != nil {
+		t.Fatalf("-version alone should parse without -mode/-catalog: %v", err)
+	}
+	if !cfg.showVersion {
+		t.Fatal("showVersion = false, want true")
+	}
+}
+
 func TestParseFlagsValid(t *testing.T) {
 	cfg, err := parseFlags([]string{"-mode=both", "-catalog=/tmp/catalog.yaml", "-store=/tmp/store"})
 	if err != nil {

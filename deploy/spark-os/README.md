@@ -7,9 +7,10 @@ from here.
 
 To wire it in on the kindling-spark-os side:
 
-1. Build the `model-loader` binary and install it at `/usr/local/bin/model-loader`
-   in the rootfs (same staging pattern as `mentatd`: `install -m755 ... "$stage/usr/local/bin/"`
-   in `setup/build-rootfs.sh`).
+1. Take the binary from the published image,
+   `ghcr.io/kindlingai/model-loader:<version>` pinned by digest, the same way
+   kindling-spark-os takes mentatd (`COPY --from=... /usr/local/bin/model-loader`),
+   and stage it at `/usr/local/bin/model-loader` in the rootfs.
 2. Copy `model-loader.service` to `overlay/etc/systemd/system/model-loader.service`
    and enable it (`overlay/etc/systemd/system/multi-user.target.wants/model-loader.service`
    symlink, matching how other overlay units are enabled).

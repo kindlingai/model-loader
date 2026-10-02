@@ -1,0 +1,125 @@
+name: release
+
+# Pushing a v* tag (e.g. v0.0.1) runs the tests, then publishes:
+#   - ghcr.io/kindlingai/model-loader:<version> for linux/amd64 and linux/arm64,
+#     plus :latest unless the version has a pre-release suffix (v0.1.0-rc.1)
+#   - a GitHub release with linux amd64/arm64 tarballs and SHA256SUMS
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v7
+      - uses: useblacksmith/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  binaries:
+    needs: test
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v7
+      - uses: useblacksmith/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build tarballs
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          mkdir -p build dist
+          for arch in amd64 arm64; do
+            name=model-loader_${v}_linux_${arch}
+            mkdir -p "build/$name"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$v" \
+              -o "build/$name/model-loader" ./cmd/model-loader
+            cp README.md "build/$name/"
+            tar -C build -czf "dist/$name.tar.gz" "$name"
+          done
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Check the tag matches the binary
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          got=$("build/model-loader_${v}_linux_amd64/model-loader" -version)
+          echo "tag $v, binary: $got"
+          [ "$got" = "model-loader $v" ]
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  image:
+    needs: test
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pick the image tags
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          tags="$IMAGE:$v"
+          case "$v" in *-*) ;; *) tags="$tags,$IMAGE:latest" ;; esac
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "TAGS=$tags" >> "$GITHUB_ENV"
+      # QEMU only so the arm64 image can be run below; the build itself
+      # cross-compiles on the runner's platform.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: VERSION=${{ env.VERSION }}
+          tags: ${{ env.TAGS }}
+          push: true
+      - name: Check each architecture runs and reports the tag
+        run: |
+          for arch in amd64 arm64; do
+            got=$(docker run --rm --pull always --platform "linux/$arch" "$IMAGE:$VERSION" -version)
+            echo "$arch: $got"
+            [ "$got" = "model-loader $VERSION" ]
+          done
+
+  release:
+    needs: [binaries, image]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Publish the release
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          pre=false
+          case "$v" in *-*) pre=true ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --prerelease="$pre" \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+            --notes "Image: \`$IMAGE:$v\` (\`$IMAGE@$DIGEST\`)"

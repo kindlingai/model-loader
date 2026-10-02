@@ -42,6 +42,18 @@ Core packages, CLI, and all three deploy targets (k8s, docker compose,
 spark-os) are in place and tested. Not yet run against a real model catalog
 end-to-end.
 
+## Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes:
+
+- `ghcr.io/kindlingai/model-loader:<version>` for linux/amd64 and
+  linux/arm64 (and `:latest` for versions without a `-suffix`). The binary is
+  at `/usr/local/bin/model-loader`.
+- A GitHub release with `model-loader_<version>_linux_{amd64,arm64}.tar.gz`
+  and `SHA256SUMS`.
+
+`model-loader -version` prints the version the binary was built from.
+
 ## Layout
 
 ```

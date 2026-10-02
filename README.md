@@ -22,7 +22,9 @@ See [docs/design.md](docs/design.md) for the full design and
 
 ## Status
 
-Early scaffolding. Not ready to run yet.
+Core packages, CLI, and all three deploy targets (k8s, docker compose,
+spark-os) are in place and tested. Not yet run against a real model catalog
+end-to-end.
 
 ## Layout
 

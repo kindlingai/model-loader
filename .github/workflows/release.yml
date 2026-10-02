@@ -47,7 +47,7 @@ jobs:
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=$v" \
               -o "build/$name/model-loader" ./cmd/model-loader
-            cp README.md "build/$name/"
+            cp README.md LICENSE "build/$name/"
             tar -C build -czf "dist/$name.tar.gz" "$name"
           done
           (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)

@@ -69,3 +69,7 @@ deploy/k8s/         Kustomize manifests
 deploy/compose/     docker-compose.yml
 deploy/spark-os/    systemd unit + env template for kindling-spark-os
 ```
+
+## License
+
+AGPL-3.0. See [LICENSE](LICENSE).

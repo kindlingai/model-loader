@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -77,19 +78,25 @@ func Load(path string) (*Catalog, error) {
 	return Parse(f)
 }
 
-// Validate checks that every entry is well formed and names are unique. A
-// catalog is desired state shared across the whole fleet, so a mistake here
-// should be caught before it reaches any node, not discovered mid-download.
+// Validate checks that every entry is well formed and each (name, revision)
+// pair appears once. A catalog is desired state shared across the whole
+// fleet, so a mistake here should be caught before it reaches any node, not
+// discovered mid-download. One name may be pinned at several revisions;
+// every node keys models by name@revision.
 func (c *Catalog) Validate() error {
 	seen := make(map[string]bool, len(c.Models))
 	for i, m := range c.Models {
 		if m.Name == "" {
 			return fmt.Errorf("catalog: entry %d: name is required", i)
 		}
-		if seen[m.Name] {
-			return fmt.Errorf("catalog: duplicate model name %q", m.Name)
+		if strings.Contains(m.Name, "/") {
+			return fmt.Errorf("catalog: model %q: name must not contain '/' (it is a URL path segment)", m.Name)
 		}
-		seen[m.Name] = true
+		key := m.Name + "@" + m.Revision
+		if seen[key] {
+			return fmt.Errorf("catalog: duplicate model %s", key)
+		}
+		seen[key] = true
 
 		if m.Revision == "" {
 			return fmt.Errorf("catalog: model %q: revision is required (pin it)", m.Name)
@@ -111,16 +118,6 @@ func (c *Catalog) Validate() error {
 		}
 	}
 	return nil
-}
-
-// Find looks up a model by name.
-func (c *Catalog) Find(name string) (Model, bool) {
-	for _, m := range c.Models {
-		if m.Name == name {
-			return m, true
-		}
-	}
-	return Model{}, false
 }
 
 // Selection is a node's local choice of which catalog entries to actually

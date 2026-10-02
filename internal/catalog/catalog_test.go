@@ -28,9 +28,9 @@ func TestParseValid(t *testing.T) {
 	if len(c.Models) != 2 {
 		t.Fatalf("got %d models, want 2", len(c.Models))
 	}
-	m, ok := c.Find("nemotron-3-nano")
-	if !ok {
-		t.Fatalf("Find: missing nemotron-3-nano")
+	m := c.Models[0]
+	if m.Name != "nemotron-3-nano" {
+		t.Fatalf("Models[0].Name = %q, want nemotron-3-nano", m.Name)
 	}
 	if m.Source.Type != SourceHuggingFace || m.Source.Repo != "nvidia/nemotron-3-nano-30b-a3b" {
 		t.Fatalf("unexpected source: %+v", m.Source)
@@ -68,7 +68,7 @@ models:
 	}
 }
 
-func TestValidateRejectsDuplicateNames(t *testing.T) {
+func TestValidateRejectsDuplicateNameAndRevision(t *testing.T) {
 	doc := `
 models:
   - name: dup
@@ -76,10 +76,37 @@ models:
     revision: v1
   - name: dup
     source: {type: http, url: https://example.com/b}
-    revision: v2
+    revision: v1
 `
 	if _, err := Parse(strings.NewReader(doc)); err == nil {
-		t.Fatalf("expected error for duplicate name, got nil")
+		t.Fatalf("expected error for duplicate name@revision, got nil")
+	}
+}
+
+func TestValidateAllowsOneNameAtTwoRevisions(t *testing.T) {
+	doc := `
+models:
+  - name: drafter
+    source: {type: http, url: https://example.com/a}
+    revision: v1
+  - name: drafter
+    source: {type: http, url: https://example.com/a}
+    revision: v2
+`
+	if _, err := Parse(strings.NewReader(doc)); err != nil {
+		t.Fatalf("two revisions of one name: %v", err)
+	}
+}
+
+func TestValidateRejectsSlashInName(t *testing.T) {
+	doc := `
+models:
+  - name: nvidia/model
+    source: {type: http, url: https://example.com/a}
+    revision: v1
+`
+	if _, err := Parse(strings.NewReader(doc)); err == nil {
+		t.Fatalf("expected error for '/' in name, got nil")
 	}
 }
 

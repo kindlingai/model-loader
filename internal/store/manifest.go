@@ -36,13 +36,11 @@ type FileManifest struct {
 	SegmentSize   int64    `json:"segment_size,omitempty"`
 }
 
-// NumSegments returns how many segments this file is divided into, treating
-// a file with no segment hashes as a single segment spanning the whole file.
+// NumSegments returns how many segments this file is divided into. A
+// zero-length file has none: there is nothing to fetch or verify per segment,
+// only the whole-file hash of the empty content.
 func (f FileManifest) NumSegments() int {
-	if len(f.SegmentSHA256) > 0 {
-		return len(f.SegmentSHA256)
-	}
-	return 1
+	return len(f.SegmentSHA256)
 }
 
 // SegmentBounds returns the byte range [start, end) of segment i.

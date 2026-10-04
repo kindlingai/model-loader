@@ -172,6 +172,40 @@ func TestFetchFileFailsWhenNoFetcherHasRange(t *testing.T) {
 	}
 }
 
+// A zero-length file has no segments (the root hashes it to an empty
+// SegmentSHA256), so a peer must create it empty without asking any source
+// for a segment the root will never report as ready. See issue #1.
+func TestFetchFileZeroLength(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm := buildManifestFile("pkg/__init__.py", nil, store.DefaultSegmentSize)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	if err := st.SaveManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	rs := store.NewRevisionState(m)
+
+	fetcher := &fakeFetcher{}
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if fetcher.calls != 0 {
+		t.Fatalf("fetcher.calls = %d, want 0 for a zero-length file", fetcher.calls)
+	}
+	info, err := os.Stat(st.FilePath("m", "r1", "pkg/__init__.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("file size = %d, want 0", info.Size())
+	}
+	if !rs.FileState(fm).Complete {
+		t.Fatal("expected file state to be marked complete")
+	}
+}
+
 func TestFetchFileDetectsCorruption(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {

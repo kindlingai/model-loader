@@ -155,12 +155,14 @@ func run(args []string) error {
 	}
 
 	d := daemon.New(daemon.Config{
-		NodeID:                 nodeID,
-		Roles:                  roles,
-		Store:                  st,
-		Catalog:                cat,
-		Selection:              selection,
-		Sources:                source.New(nil),
+		NodeID:    nodeID,
+		Roles:     roles,
+		Store:     st,
+		Catalog:   cat,
+		Selection: selection,
+		// HF_TOKEN, as in huggingface_hub, authenticates gated or private
+		// Hugging Face repos. Only a root ever uses it.
+		Sources:                source.New(nil, strings.TrimSpace(os.Getenv("HF_TOKEN"))),
 		Discoverer:             disc,
 		MaxConcurrentTransfers: cfg.maxConcurrent,
 	})

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
@@ -28,7 +29,7 @@ func TestHTTPSourceResolveAndOpen(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	reg := New(srv.Client())
+	reg := New(srv.Client(), "")
 	model := catalog.Model{
 		Name:     "t",
 		Source:   catalog.Source{Type: catalog.SourceHTTP, URL: srv.URL},
@@ -65,7 +66,7 @@ func TestHTTPSourceResolveErrorsOnMissingManifest(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
 
-	reg := New(srv.Client())
+	reg := New(srv.Client(), "")
 	model := catalog.Model{
 		Source:   catalog.Source{Type: catalog.SourceHTTP, URL: srv.URL},
 		Revision: "v1",
@@ -86,7 +87,7 @@ func TestHuggingfaceSourceResolve(t *testing.T) {
 		io.WriteString(w, `[
 			{"type":"directory","path":"subdir"},
 			{"type":"file","path":"config.json","size":10},
-			{"type":"file","path":"model.safetensors","size":999,"lfs":{"oid":"abc123sha256","size":123456}}
+			{"type":"file","path":"model.safetensors","size":999,"lfs":{"oid":"`+testSHA+`","size":123456}}
 		]`)
 	})
 	srv := httptest.NewServer(mux)
@@ -117,13 +118,83 @@ func TestHuggingfaceSourceResolve(t *testing.T) {
 	for _, f := range resolved.Files {
 		if f.Path == "model.safetensors" {
 			sawLFS = true
-			if f.Size != 123456 || f.SHA256 != "abc123sha256" {
+			if f.Size != 123456 || f.SHA256 != testSHA {
 				t.Errorf("lfs file not resolved from lfs block: %+v", f)
 			}
 		}
 	}
 	if !sawLFS {
 		t.Fatalf("model.safetensors not found in resolved files")
+	}
+}
+
+const testSHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+// The token must reach huggingface.co for gated repos, but never the CDN
+// host the Hub redirects downloads to.
+func TestHuggingfaceSourceTokenStaysOnHub(t *testing.T) {
+	mux := http.NewServeMux()
+	wantAuth := func(r *http.Request, want string) {
+		t.Helper()
+		if got := r.Header.Get("Authorization"); got != want {
+			t.Errorf("%s %s: Authorization = %q, want %q", r.Host, r.URL.Path, got, want)
+		}
+	}
+	mux.HandleFunc("/api/models/org/gated/tree/rev", func(w http.ResponseWriter, r *http.Request) {
+		wantAuth(r, "Bearer hf_secret")
+		io.WriteString(w, `[{"type":"file","path":"w.bin","size":1,"lfs":{"oid":"`+testSHA+`","size":5}}]`)
+	})
+	mux.HandleFunc("/org/gated/resolve/rev/w.bin", func(w http.ResponseWriter, r *http.Request) {
+		wantAuth(r, "Bearer hf_secret")
+		http.Redirect(w, r, "https://cas-bridge.xethub.hf.co/signed/w.bin", http.StatusFound)
+	})
+	mux.HandleFunc("/signed/w.bin", func(w http.ResponseWriter, r *http.Request) {
+		wantAuth(r, "")
+		io.WriteString(w, "hello")
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	reg := New(&http.Client{Transport: rewriteHostTransport{target: srv.URL, base: http.DefaultTransport}}, "hf_secret")
+	model := catalog.Model{
+		Source:   catalog.Source{Type: catalog.SourceHuggingFace, Repo: "org/gated"},
+		Revision: "rev",
+	}
+	src, err := reg.For(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Resolve(context.Background(), model); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	rc, err := src.Open(context.Background(), model, "w.bin", 0, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer rc.Close()
+	if data, _ := io.ReadAll(rc); string(data) != "hello" {
+		t.Fatalf("got %q, want %q", data, "hello")
+	}
+}
+
+// Without access to a gated repo the Hub still lists its files but masks
+// each LFS sha256 with asterisks; Resolve must fail rather than download.
+func TestHuggingfaceSourceResolveRejectsMaskedSHA(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/models/org/gated/tree/rev", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `[{"type":"file","path":"w.bin","size":1,"lfs":{"oid":"`+strings.Repeat("*", 64)+`","size":5}}]`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	hf := &huggingfaceSource{client: &http.Client{Transport: rewriteHostTransport{target: srv.URL, base: http.DefaultTransport}}}
+	model := catalog.Model{
+		Source:   catalog.Source{Type: catalog.SourceHuggingFace, Repo: "org/gated"},
+		Revision: "rev",
+	}
+	_, err := hf.Resolve(context.Background(), model)
+	if err == nil || !strings.Contains(err.Error(), "HF_TOKEN") {
+		t.Fatalf("Resolve error = %v, want one pointing at HF_TOKEN", err)
 	}
 }
 

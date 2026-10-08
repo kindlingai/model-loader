@@ -5,7 +5,8 @@
 # Flags are passed via a shell wrapper rather than the binary reading the
 # environment itself, so the same catalog.yaml/binary work unmodified across
 # the k8s, compose, and spark-os deploy targets -- only this unit's
-# env-to-flag mapping is spark-os-specific.
+# env-to-flag mapping is spark-os-specific. The one exception is HF_TOKEN,
+# which the binary reads from its environment like huggingface_hub does.
 [Unit]
 Description=model-loader node daemon
 After=network.target NetworkManager.service

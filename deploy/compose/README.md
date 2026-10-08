@@ -10,6 +10,8 @@ set:
 - `MODEL_LOADER_PEERS` to a comma-separated `host:port` list of the other
   boxes (static discovery -- compose has no service-discovery DNS of its
   own).
+- `HF_TOKEN` on the root box, if the catalog has gated or private Hugging
+  Face repos.
 
 ```sh
 cp catalog.yaml catalog.yaml.local   # edit in your models

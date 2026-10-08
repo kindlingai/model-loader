@@ -47,13 +47,15 @@ type Source interface {
 }
 
 // New builds the Source implementation for a catalog model's source type.
-func New(client *http.Client) *Registry {
+// hfToken, if non-empty, authenticates Hugging Face requests (gated or
+// private repos).
+func New(client *http.Client, hfToken string) *Registry {
 	if client == nil {
 		client = defaultClient()
 	}
 	return &Registry{
 		http: &httpSource{client: client},
-		hf:   &huggingfaceSource{client: client},
+		hf:   &huggingfaceSource{client: client, token: hfToken},
 	}
 }
 

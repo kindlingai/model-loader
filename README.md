@@ -12,7 +12,9 @@ memory.
 Every node runs the same binary. `--mode` sets what it does:
 
 - **root** downloads catalog models from their source (Hugging Face or plain
-  HTTP) into its local store.
+  HTTP) into its local store. Set `HF_TOKEN` in its environment to fetch
+  gated or private Hugging Face repos; the token needs access granted to each
+  gated repo.
 - **peer** copies missing files from other nodes, either the root or another
   peer. It doesn't need internet access.
 - **both** does both. Use this on a single machine.

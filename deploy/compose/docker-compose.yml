@@ -12,6 +12,8 @@ services:
     environment:
       MODEL_LOADER_MODE: "${MODEL_LOADER_MODE:-both}"
       MODEL_LOADER_PEERS: "${MODEL_LOADER_PEERS:-}"
+      # Hugging Face token for gated or private repos; only a root uses it.
+      HF_TOKEN: "${HF_TOKEN:-}"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >

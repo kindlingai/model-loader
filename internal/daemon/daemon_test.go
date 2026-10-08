@@ -76,7 +76,7 @@ func TestDaemonWANOnlyDownloadReachesReady(t *testing.T) {
 		Store:      st,
 		Catalog:    &catalog.Catalog{Models: []catalog.Model{m}},
 		Selection:  allSelection(),
-		Sources:    source.New(nil),
+		Sources:    source.New(nil, ""),
 		Discoverer: discovery.NewStatic(nil),
 	})
 
@@ -155,7 +155,7 @@ func TestDaemonPeerOnlyPullsFromPeer(t *testing.T) {
 		Store:      st,
 		Catalog:    &catalog.Catalog{Models: []catalog.Model{m}},
 		Selection:  allSelection(),
-		Sources:    source.New(nil),
+		Sources:    source.New(nil, ""),
 		Discoverer: discovery.NewStatic([]string{ts.Listener.Addr().String()}),
 	})
 
@@ -189,7 +189,7 @@ func TestDaemonPeerOnlyWithNoSourceStaysPending(t *testing.T) {
 		Store:      st,
 		Catalog:    &catalog.Catalog{Models: []catalog.Model{m}},
 		Selection:  allSelection(),
-		Sources:    source.New(nil),
+		Sources:    source.New(nil, ""),
 		Discoverer: discovery.NewStatic(nil),
 	})
 
@@ -236,7 +236,7 @@ func TestDaemonAlreadyCompleteSkipsTransfer(t *testing.T) {
 		Store:     st,
 		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
 		Selection: allSelection(),
-		Sources:   source.New(nil),
+		Sources:   source.New(nil, ""),
 		// A Discoverer that always errors proves Reconcile never needed to
 		// consult peers or WAN for an already-complete model.
 		Discoverer: errorDiscoverer{},
@@ -313,7 +313,7 @@ func TestDaemonWANResumeKeepsFinishedFiles(t *testing.T) {
 	d := New(Config{
 		NodeID: "root-1", Roles: []string{"root"}, Store: st,
 		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
-		Selection: allSelection(), Sources: source.New(nil), Discoverer: discovery.NewStatic(nil),
+		Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
 	})
 	if err := d.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -365,7 +365,7 @@ func TestDaemonWANStallTimesOut(t *testing.T) {
 	d := New(Config{
 		NodeID: "root-1", Roles: []string{"root"}, Store: st,
 		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
-		Selection: allSelection(), Sources: source.New(nil), Discoverer: discovery.NewStatic(nil),
+		Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
 		StallTimeout: 200 * time.Millisecond,
 	})
 

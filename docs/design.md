@@ -114,7 +114,9 @@ answer:
 
 ## V1 scope
 
-- Sources: plain HTTP(S) and Hugging Face Hub resolve. S3/OCI later.
+- Sources: plain HTTP(S) and Hugging Face Hub resolve. A root reads
+  `HF_TOKEN` from its environment for gated or private Hub repos. S3/OCI
+  later.
 - Discovery: static list and k8s DNS. mentat and LAN broadcast are
   fast-follows once the core loop is proven.
 - No cross-revision dedup, no multi-source parallel fetch of one file.

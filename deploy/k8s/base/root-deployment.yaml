@@ -25,6 +25,12 @@ spec:
             - -discovery=k8s
             - -k8s-service=model-loader-headless
             - -k8s-port=7762
+          env:
+            # For gated or private Hugging Face repos. Optional: without the
+            # Secret the root still fetches public repos.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: model-loader-hf-token, key: token, optional: true }
           ports:
             - name: http
               containerPort: 7762

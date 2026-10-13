@@ -50,11 +50,11 @@ const uncacheEvery = store.DefaultSegmentSize
 
 // FetchFile downloads every not-yet-complete segment of fm into the store,
 // trying fetchers in order for each segment and falling back to the next
-// one on ErrRangeUnavailable. Each segment is verified against the
-// manifest as soon as it lands, and the whole file is verified once more
-// when every segment is done. rs is mutated and persisted to st as progress
-// is made, so a restart resumes from the last saved segment rather than
-// from scratch.
+// one when a fetcher doesn't have it yet or fails. Each segment is verified
+// against the manifest as soon as it lands, and the whole file is verified
+// once more when every segment is done. rs is mutated and persisted to st
+// as progress is made, so a restart resumes from the last saved segment
+// rather than from scratch.
 func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm store.FileManifest, rs *store.RevisionState, fetchers []Fetcher) error {
 	fileState := rs.FileState(fm)
 	if fileState.Complete {
@@ -70,6 +70,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	}
 	defer f.Close()
 
+	dead := make([]bool, len(fetchers))
 	var sinceSync int64
 	for i := 0; i < fm.NumSegments(); i++ {
 		if i < len(fileState.SegmentsDone) && fileState.SegmentsDone[i] {
@@ -78,7 +79,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		start, end := fm.SegmentBounds(i)
 		length := end - start
 
-		n, err := fetchSegment(ctx, f, fm, i, start, length, fetchers)
+		n, err := fetchSegment(ctx, f, fm, i, start, length, fetchers, dead)
 		if err != nil {
 			return fmt.Errorf("fetch %s segment %d: %w", fm.Path, i, err)
 		}
@@ -132,33 +133,42 @@ func syncAndUncache(f *os.File) error {
 }
 
 // fetchSegment tries each fetcher in order for one segment, returning the
-// first success. A fetcher reporting ErrRangeUnavailable is skipped in
-// favor of the next one; any other error is returned immediately since it
-// likely indicates a real problem (network failure, corrupted data) rather
-// than "this source just doesn't have it yet."
-func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, start, length int64, fetchers []Fetcher) (int64, error) {
+// first success. A fetcher reporting ErrRangeUnavailable is skipped for this
+// segment only. One that fails outright (a peer that went away mid-copy, a
+// dropped connection, data that fails verification) is marked in dead and
+// skipped for the rest of the file, so the copy fails over to the next peer
+// or the root instead of failing, and doesn't wait on a dead address again
+// for every segment.
+func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, start, length int64, fetchers []Fetcher, dead []bool) (int64, error) {
 	var lastErr error
-	for _, fetcher := range fetchers {
+	for k, fetcher := range fetchers {
+		if dead[k] {
+			continue
+		}
 		rc, err := fetcher.Open(ctx, fm.Path, start, length)
 		if err == ErrRangeUnavailable {
 			lastErr = err
 			continue
 		}
 		if err != nil {
-			return 0, err
+			dead[k], lastErr = true, err
+			continue
 		}
 
 		w := io.NewOffsetWriter(f, start)
 		copied, copyErr := io.Copy(w, rc)
 		closeErr := rc.Close()
 		if copyErr != nil {
-			return 0, copyErr
+			dead[k], lastErr = true, copyErr
+			continue
 		}
 		if closeErr != nil {
-			return 0, closeErr
+			dead[k], lastErr = true, closeErr
+			continue
 		}
 		if copied != length {
-			return 0, fmt.Errorf("short read: wanted %d bytes, got %d", length, copied)
+			dead[k], lastErr = true, fmt.Errorf("short read: wanted %d bytes, got %d", length, copied)
+			continue
 		}
 
 		verified, err := store.VerifySegment(f, fm, i)
@@ -166,13 +176,13 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 			return 0, err
 		}
 		if !verified {
-			lastErr = fmt.Errorf("segment failed hash verification")
+			dead[k], lastErr = true, fmt.Errorf("segment failed hash verification")
 			continue
 		}
 		return copied, nil
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no source had this segment ready")
+		lastErr = fmt.Errorf("every source failed earlier in this file")
 	}
 	return 0, lastErr
 }

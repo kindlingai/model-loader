@@ -106,23 +106,20 @@ func TestDaemonWANOnlyDownloadReachesReady(t *testing.T) {
 	}
 }
 
-func TestDaemonPeerOnlyPullsFromPeer(t *testing.T) {
-	content := []byte("already synced to one peer, waiting to be mirrored")
-
-	peerStore, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := &store.Manifest{Model: "demo", Revision: "r1", Files: []store.FileManifest{{Path: "a.bin", Size: int64(len(content))}}}
+// seedPeerModel puts a complete, verified copy of model name@r1, one file
+// "a.bin" holding content, into st, as if that node had finished syncing it.
+func seedPeerModel(t *testing.T, st *store.Store, name string, content []byte) {
+	t.Helper()
+	manifest := &store.Manifest{Model: name, Revision: "r1", Files: []store.FileManifest{{Path: "a.bin", Size: int64(len(content))}}}
 	if err := manifest.BuildSegmentHashes(func(relPath string) (io.ReadCloser, error) {
 		return io.NopCloser(bytesReaderAt(content)), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := peerStore.SaveManifest(manifest); err != nil {
+	if err := st.SaveManifest(manifest); err != nil {
 		t.Fatal(err)
 	}
-	f, err := peerStore.EnsureFile("demo", "r1", manifest.Files[0])
+	f, err := st.EnsureFile(name, "r1", manifest.Files[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,9 +134,19 @@ func TestDaemonPeerOnlyPullsFromPeer(t *testing.T) {
 	}
 	fs.Complete = true
 	rs.SetFileState(fs)
-	if err := peerStore.SaveState(rs); err != nil {
+	if err := st.SaveState(rs); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestDaemonPeerOnlyPullsFromPeer(t *testing.T) {
+	content := []byte("already synced to one peer, waiting to be mirrored")
+
+	peerStore, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPeerModel(t, peerStore, "demo", content)
 
 	peerSrv := server.New(peerStore, fakeStatus{server.StatusResponse{NodeID: "peer-1"}})
 	ts := httptest.NewServer(peerSrv)
@@ -175,6 +182,83 @@ func TestDaemonPeerOnlyPullsFromPeer(t *testing.T) {
 	}
 	if string(got) != string(content) {
 		t.Fatalf("file content = %q, want %q", got, content)
+	}
+}
+
+// A model whose fetch failed (its source peer restarted) must retry on the
+// next tick even while another model's transfer is still running, rather
+// than sit in error until every other model finishes. See issue #5.
+func TestDaemonRunRetriesFailedModelWhileAnotherIsBusy(t *testing.T) {
+	content := []byte("served by a peer that restarts once")
+	peerStore, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPeerModel(t, peerStore, "slow", content)
+	seedPeerModel(t, peerStore, "flaky", content)
+
+	peerSrv := server.New(peerStore, fakeStatus{server.StatusResponse{NodeID: "peer-1"}})
+	release := make(chan struct{})
+	var flakyCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/blob/slow/"):
+			select { // a long transfer that outlasts the test
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		case strings.HasPrefix(r.URL.Path, "/blob/flaky/") && flakyCalls.Add(1) == 1:
+			http.Error(w, "restarting", http.StatusBadGateway)
+			return
+		}
+		peerSrv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { close(release) })
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := catalog.Source{Type: catalog.SourceHTTP, URL: "http://unused.invalid"}
+	d := New(Config{
+		NodeID: "peer-2",
+		Roles:  []string{"peer"},
+		Store:  st,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{
+			{Name: "slow", Revision: "r1", Source: src},
+			{Name: "flaky", Revision: "r1", Source: src},
+		}},
+		Selection:  allSelection(),
+		Sources:    source.New(nil, ""),
+		Discoverer: discovery.NewStatic([]string{ts.Listener.Addr().String()}),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.Run(ctx, 10*time.Millisecond, nil); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		states := map[string]string{}
+		for _, ms := range d.Status().Models {
+			states[ms.Model] = ms.State
+		}
+		if states["flaky"] == server.StateReady {
+			if states["slow"] != server.StateDownloading {
+				t.Fatalf("slow = %q, want it still downloading", states["slow"])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("flaky never recovered: states %v, %d blob requests", states, flakyCalls.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if flakyCalls.Load() < 2 {
+		t.Fatalf("flaky blob requests = %d, want a failure and a retry", flakyCalls.Load())
 	}
 }
 

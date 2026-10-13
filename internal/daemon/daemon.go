@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"sync"
 	"time"
 
@@ -44,6 +45,12 @@ type Config struct {
 	Selection  *catalog.Selection
 	Sources    *source.Registry
 	Discoverer discovery.Discoverer
+
+	// SelectionPath, if set, is re-read at the start of every reconcile
+	// pass, so a selection file created or edited after startup takes
+	// effect without a restart. A missing file is an empty selection; one
+	// that fails to parse leaves Selection unchanged.
+	SelectionPath string
 
 	// Peers talks to other nodes' HTTP APIs. Defaults to a PeerClient
 	// wrapping http.DefaultClient.
@@ -101,7 +108,7 @@ func (d *Daemon) IsWANEligible() bool {
 func (d *Daemon) Status() server.StatusResponse {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	resp := server.StatusResponse{NodeID: d.cfg.NodeID, Roles: d.cfg.Roles}
+	resp := server.StatusResponse{NodeID: d.cfg.NodeID, Roles: d.cfg.Roles, Models: []server.ModelStatus{}}
 	for _, ms := range d.statuses {
 		resp.Models = append(resp.Models, ms)
 	}
@@ -148,7 +155,9 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 // cheap); actual file transfers are bounded by MaxConcurrentTransfers
 // regardless of how many models are in flight.
 func (d *Daemon) Reconcile(ctx context.Context) error {
+	selErr := d.reloadSelection()
 	wanted := d.cfg.Catalog.Wanted(d.cfg.Selection)
+	d.pruneStatuses(wanted)
 
 	var wg sync.WaitGroup
 	errs := make([]error, len(wanted))
@@ -163,7 +172,38 @@ func (d *Daemon) Reconcile(ctx context.Context) error {
 	}
 	wg.Wait()
 
-	return errors.Join(errs...)
+	return errors.Join(append(errs, selErr)...)
+}
+
+func (d *Daemon) reloadSelection() error {
+	if d.cfg.SelectionPath == "" {
+		return nil
+	}
+	sel, err := catalog.LoadSelection(d.cfg.SelectionPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		sel, err = &catalog.Selection{}, nil
+	}
+	if err != nil {
+		return err
+	}
+	d.cfg.Selection = sel
+	return nil
+}
+
+// pruneStatuses drops models the selection no longer wants, so /status
+// doesn't keep advertising them after the selection file changes.
+func (d *Daemon) pruneStatuses(wanted []catalog.Model) {
+	keep := make(map[string]bool, len(wanted))
+	for _, m := range wanted {
+		keep[statusKey(m.Name, m.Revision)] = true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k := range d.statuses {
+		if !keep[k] {
+			delete(d.statuses, k)
+		}
+	}
 }
 
 func (d *Daemon) reconcileModel(ctx context.Context, m catalog.Model) error {

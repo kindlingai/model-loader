@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"testing"
@@ -169,6 +170,47 @@ func TestFetchFileFailsWhenNoFetcherHasRange(t *testing.T) {
 	empty := &fakeFetcher{content: content, ready: 0}
 	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty}); err == nil {
 		t.Fatal("expected an error when no fetcher has the range")
+	}
+}
+
+// deadFetcher stands in for a peer whose pod went away: every Open fails
+// outright, the way dialing a deleted pod's IP does.
+type deadFetcher struct{ calls int }
+
+func (d *deadFetcher) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	d.calls++
+	return nil, errors.New("dial tcp 10.244.10.68:7762: connect: no route to host")
+}
+
+// A source that fails outright must not fail the file while another source
+// has the segment, and must not be dialed again for every later segment.
+// See issue #5.
+func TestFetchFileFailsOverFromDeadSource(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("0123456789abcdef")
+	fm := buildManifestFile("a.bin", content, 4)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	if err := st.SaveManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	rs := store.NewRevisionState(m)
+
+	dead := &deadFetcher{}
+	root := &fakeFetcher{content: content, ready: int64(len(content))}
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{dead, root}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if dead.calls != 1 {
+		t.Fatalf("dead.calls = %d, want 1", dead.calls)
+	}
+	if root.calls != fm.NumSegments() {
+		t.Fatalf("root.calls = %d, want %d", root.calls, fm.NumSegments())
+	}
+	if !rs.FileState(fm).Complete {
+		t.Fatalf("expected file state to be marked complete")
 	}
 }
 

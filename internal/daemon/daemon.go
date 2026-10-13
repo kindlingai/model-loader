@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"sync"
 	"time"
 
@@ -44,6 +45,12 @@ type Config struct {
 	Selection  *catalog.Selection
 	Sources    *source.Registry
 	Discoverer discovery.Discoverer
+
+	// SelectionPath, if set, is re-read at the start of every reconcile
+	// pass, so a selection file created or edited after startup takes
+	// effect without a restart. A missing file is an empty selection; one
+	// that fails to parse leaves Selection unchanged.
+	SelectionPath string
 
 	// Peers talks to other nodes' HTTP APIs. Defaults to a PeerClient
 	// wrapping http.DefaultClient.
@@ -101,7 +108,7 @@ func (d *Daemon) IsWANEligible() bool {
 func (d *Daemon) Status() server.StatusResponse {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	resp := server.StatusResponse{NodeID: d.cfg.NodeID, Roles: d.cfg.Roles}
+	resp := server.StatusResponse{NodeID: d.cfg.NodeID, Roles: d.cfg.Roles, Models: []server.ModelStatus{}}
 	for _, ms := range d.statuses {
 		resp.Models = append(resp.Models, ms)
 	}
@@ -117,27 +124,42 @@ func (d *Daemon) setStatus(ms server.ModelStatus) {
 	d.mu.Unlock()
 }
 
-// Run reconciles immediately, then again every interval, until ctx is
-// canceled. A failed reconcile pass is logged by returning it from the
-// per-tick call but does not stop the loop -- a transient WAN or peer
-// failure for one model shouldn't take the whole node out of service.
+// Run reconciles every wanted model immediately, then again every interval,
+// until ctx is canceled. Each tick starts every model that isn't still busy
+// from an earlier tick, so a model whose fetch failed (say, its source peer
+// restarted) retries with freshly discovered peers on the next tick instead
+// of waiting for every other model's transfer to finish. A failure is
+// passed to onErr, which may be called concurrently, and does not stop the
+// loop -- a transient WAN or peer failure for one model shouldn't take the
+// whole node out of service.
 func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(error)) {
 	if onErr == nil {
 		onErr = func(error) {}
 	}
-	if err := d.Reconcile(ctx); err != nil {
-		onErr(err)
-	}
+	var busy sync.Map
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		for _, m := range d.cfg.Catalog.Wanted(d.cfg.Selection) {
+			key := statusKey(m.Name, m.Revision)
+			if _, running := busy.LoadOrStore(key, true); running {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer busy.Delete(key)
+				if err := d.reconcileModel(ctx, m); err != nil {
+					onErr(fmt.Errorf("model %s@%s: %w", m.Name, m.Revision, err))
+				}
+			}()
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := d.Reconcile(ctx); err != nil {
-				onErr(err)
-			}
 		}
 	}
 }
@@ -148,7 +170,9 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 // cheap); actual file transfers are bounded by MaxConcurrentTransfers
 // regardless of how many models are in flight.
 func (d *Daemon) Reconcile(ctx context.Context) error {
+	selErr := d.reloadSelection()
 	wanted := d.cfg.Catalog.Wanted(d.cfg.Selection)
+	d.pruneStatuses(wanted)
 
 	var wg sync.WaitGroup
 	errs := make([]error, len(wanted))
@@ -163,7 +187,38 @@ func (d *Daemon) Reconcile(ctx context.Context) error {
 	}
 	wg.Wait()
 
-	return errors.Join(errs...)
+	return errors.Join(append(errs, selErr)...)
+}
+
+func (d *Daemon) reloadSelection() error {
+	if d.cfg.SelectionPath == "" {
+		return nil
+	}
+	sel, err := catalog.LoadSelection(d.cfg.SelectionPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		sel, err = &catalog.Selection{}, nil
+	}
+	if err != nil {
+		return err
+	}
+	d.cfg.Selection = sel
+	return nil
+}
+
+// pruneStatuses drops models the selection no longer wants, so /status
+// doesn't keep advertising them after the selection file changes.
+func (d *Daemon) pruneStatuses(wanted []catalog.Model) {
+	keep := make(map[string]bool, len(wanted))
+	for _, m := range wanted {
+		keep[statusKey(m.Name, m.Revision)] = true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k := range d.statuses {
+		if !keep[k] {
+			delete(d.statuses, k)
+		}
+	}
 }
 
 func (d *Daemon) reconcileModel(ctx context.Context, m catalog.Model) error {

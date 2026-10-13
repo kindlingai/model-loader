@@ -117,27 +117,42 @@ func (d *Daemon) setStatus(ms server.ModelStatus) {
 	d.mu.Unlock()
 }
 
-// Run reconciles immediately, then again every interval, until ctx is
-// canceled. A failed reconcile pass is logged by returning it from the
-// per-tick call but does not stop the loop -- a transient WAN or peer
-// failure for one model shouldn't take the whole node out of service.
+// Run reconciles every wanted model immediately, then again every interval,
+// until ctx is canceled. Each tick starts every model that isn't still busy
+// from an earlier tick, so a model whose fetch failed (say, its source peer
+// restarted) retries with freshly discovered peers on the next tick instead
+// of waiting for every other model's transfer to finish. A failure is
+// passed to onErr, which may be called concurrently, and does not stop the
+// loop -- a transient WAN or peer failure for one model shouldn't take the
+// whole node out of service.
 func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(error)) {
 	if onErr == nil {
 		onErr = func(error) {}
 	}
-	if err := d.Reconcile(ctx); err != nil {
-		onErr(err)
-	}
+	var busy sync.Map
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		for _, m := range d.cfg.Catalog.Wanted(d.cfg.Selection) {
+			key := statusKey(m.Name, m.Revision)
+			if _, running := busy.LoadOrStore(key, true); running {
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer busy.Delete(key)
+				if err := d.reconcileModel(ctx, m); err != nil {
+					onErr(fmt.Errorf("model %s@%s: %w", m.Name, m.Revision, err))
+				}
+			}()
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := d.Reconcile(ctx); err != nil {
-				onErr(err)
-			}
 		}
 	}
 }

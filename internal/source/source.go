@@ -6,6 +6,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,10 @@ import (
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 )
+
+// ErrRangeIgnored is returned by Source.Open when the origin answers a
+// request for part of a file with the whole file.
+var ErrRangeIgnored = errors.New("origin ignored the Range header")
 
 // File is one file as described by an origin, before any bytes have been
 // fetched.

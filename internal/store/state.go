@@ -65,6 +65,23 @@ type RevisionState struct {
 	Files      []FileState `json:"files"`
 	UpdatedAt  time.Time   `json:"updated_at"`
 	LastSource string      `json:"last_source,omitempty"`
+	// Origin is a root's progress downloading the revision from its origin,
+	// before it has a manifest. It is dropped once the manifest is saved.
+	Origin []OriginFile `json:"origin,omitempty"`
+}
+
+// OriginFile is a root's progress downloading one file from its origin. The
+// first BytesDone bytes are on disk and synced, SegmentSHA256 holds their
+// segment hashes, and SHA256State is the whole-file hash over them, so a
+// restart resumes both the download and the hashing at BytesDone. SHA256 is
+// the origin's digest, so progress against a file the origin has since
+// replaced is discarded; once Complete, it is the digest of what was
+// downloaded, and FileManifest is the file's manifest entry.
+type OriginFile struct {
+	FileManifest
+	BytesDone   int64  `json:"bytes_done"`
+	SHA256State []byte `json:"sha256_state,omitempty"`
+	Complete    bool   `json:"complete"`
 }
 
 // Complete reports whether every file in the revision is complete.

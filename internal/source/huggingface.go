@@ -97,7 +97,8 @@ func (s *huggingfaceSource) Open(ctx context.Context, m catalog.Model, path stri
 	if err != nil {
 		return nil, err
 	}
-	if offset > 0 || length > 0 {
+	ranged := offset > 0 || length > 0
+	if ranged {
 		req.Header.Set("Range", rangeHeader(offset, length))
 	}
 	resp, err := s.client.Do(req)
@@ -106,6 +107,10 @@ func (s *huggingfaceSource) Open(ctx context.Context, m catalog.Model, path stri
 	}
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
+		if ranged && resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("huggingface source: GET %s: %w", u, ErrRangeIgnored)
+		}
 		return resp.Body, nil
 	default:
 		resp.Body.Close()

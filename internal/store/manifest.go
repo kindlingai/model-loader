@@ -84,9 +84,7 @@ func (m *Manifest) Find(path string) (FileManifest, bool) {
 }
 
 // BuildSegmentHashes computes SegmentSHA256 for every file by reading it
-// from disk at root. It is used when publishing a manifest for files this
-// node fetched itself (e.g. in root mode, after a WAN download completes).
-// When openFile returns an *os.File, each segment is dropped from page cache
+// from disk at root. When openFile returns an *os.File, each segment is dropped from page cache
 // as soon as it is hashed, so hashing a multi-hundred-GB model keeps at most
 // one segment resident.
 func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadCloser, error)) error {
@@ -113,6 +111,16 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 		f.SHA256 = whole
 	}
 	return nil
+}
+
+// HashFile computes the segment hashes and whole-file hash of f's first
+// size bytes, as BuildSegmentHashes does, dropping each segment from page
+// cache once hashed and calling progress with the bytes hashed so far.
+func HashFile(f *os.File, size int64, progress func(int64)) (segments []string, whole string, err error) {
+	return hashSegments(f, size, DefaultSegmentSize, func(off, n int64) error {
+		progress(off + n)
+		return Uncache(f, off, n)
+	})
 }
 
 // hashSegments reads size bytes from r, hashing each segSize segment and the

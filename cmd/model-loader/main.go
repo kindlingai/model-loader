@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -63,7 +64,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.mode, "mode", "", "node role: root, peer, or both (required)")
 	fs.StringVar(&cfg.storeDir, "store", "/var/lib/model-loader", "local content store directory")
 	fs.StringVar(&cfg.catalogPath, "catalog", "", "path to the fleet-wide catalog.yaml (required)")
-	fs.StringVar(&cfg.selPath, "selection", "", "path to this node's selection.yaml (default: everything in the catalog)")
+	fs.StringVar(&cfg.selPath, "selection", "", "path to this node's selection.yaml, re-read every reconcile; a missing file selects nothing (default: everything in the catalog)")
 	fs.StringVar(&cfg.listen, "listen", fmt.Sprintf(":%d", defaultPort), "address to serve the HTTP API on")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "this node's identifier (default: hostname)")
 	fs.StringVar(&cfg.discoveryKind, "discovery", "static", "peer discovery backend: static or k8s")
@@ -139,6 +140,12 @@ func run(args []string) error {
 	selection := &catalog.Selection{Wanted: []string{"*"}}
 	if cfg.selPath != "" {
 		selection, err = catalog.LoadSelection(cfg.selPath)
+		if errors.Is(err, fs.ErrNotExist) {
+			// A node with no models picked yet is valid, not a crash; the
+			// daemon re-reads the file every reconcile.
+			log.Printf("model-loader: warning: %v; selecting no models until it exists", err)
+			selection, err = &catalog.Selection{}, nil
+		}
 		if err != nil {
 			return err
 		}
@@ -155,11 +162,12 @@ func run(args []string) error {
 	}
 
 	d := daemon.New(daemon.Config{
-		NodeID:    nodeID,
-		Roles:     roles,
-		Store:     st,
-		Catalog:   cat,
-		Selection: selection,
+		NodeID:        nodeID,
+		Roles:         roles,
+		Store:         st,
+		Catalog:       cat,
+		Selection:     selection,
+		SelectionPath: cfg.selPath,
 		// HF_TOKEN, as in huggingface_hub, authenticates gated or private
 		// Hugging Face repos. Only a root ever uses it.
 		Sources:                source.New(nil, strings.TrimSpace(os.Getenv("HF_TOKEN"))),

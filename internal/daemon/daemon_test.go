@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,6 +202,55 @@ func TestDaemonPeerOnlyWithNoSourceStaysPending(t *testing.T) {
 	if len(resp.Models) != 1 || resp.Models[0].State != server.StatePending {
 		t.Fatalf("status = %+v, want one pending model", resp.Models)
 	}
+}
+
+func TestDaemonReloadsSelectionFile(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	selPath := filepath.Join(t.TempDir(), "node.yaml")
+	m := catalog.Model{Name: "demo", Revision: "r1", Source: catalog.Source{Type: catalog.SourceHTTP, URL: "http://unused.invalid"}}
+	d := New(Config{
+		NodeID:        "peer-1",
+		Roles:         []string{"peer"},
+		Store:         st,
+		Catalog:       &catalog.Catalog{Models: []catalog.Model{m}},
+		Selection:     &catalog.Selection{},
+		SelectionPath: selPath,
+		Sources:       source.New(nil, ""),
+		Discoverer:    discovery.NewStatic(nil),
+	})
+	reconcile := func(wantModels int) {
+		t.Helper()
+		if err := d.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if got := d.Status().Models; got == nil || len(got) != wantModels {
+			t.Fatalf("status models = %#v, want %d (non-nil)", got, wantModels)
+		}
+	}
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(selPath, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reconcile(0) // missing file: empty selection, not an error.
+	write("wanted: [demo]\n")
+	reconcile(1)
+
+	write("wanted: [\n")
+	if err := d.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile with a malformed selection: want an error")
+	}
+	if got := len(d.Status().Models); got != 1 {
+		t.Fatalf("malformed selection should keep the last good one; status models = %d", got)
+	}
+
+	write("wanted: []\n")
+	reconcile(0) // deselected models drop out of /status.
 }
 
 func TestDaemonAlreadyCompleteSkipsTransfer(t *testing.T) {

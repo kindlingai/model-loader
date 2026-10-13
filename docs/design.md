@@ -39,6 +39,8 @@ catalog itself, only the model data the catalog describes.
 Each node additionally has a small local selection of which catalog entries
 it actually wants to materialize (`wanted: ["*"]` or an explicit list), so a
 node with a smaller disk doesn't have to hold the whole fleet's catalog.
+The selection file is re-read on every reconcile, and a missing one selects
+nothing: a node no one has picked models for yet still serves `/status`.
 
 ## Store
 

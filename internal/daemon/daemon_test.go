@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -380,6 +383,156 @@ func TestDaemonWANStallTimesOut(t *testing.T) {
 	ms := d.Status().Models[0]
 	if ms.State != server.StatePending || !strings.Contains(ms.Error, errStalled.Error()) {
 		t.Fatalf("status = %q (%s), want pending with %q", ms.State, ms.Error, errStalled)
+	}
+}
+
+// newRangeWANServer serves content as "a.bin" from a plain HTTP source whose
+// manifest lists digest, recording each request's Range header. serve writes
+// the response to the nth request for the file, counting from 1.
+func newRangeWANServer(t *testing.T, content []byte, digest string, serve func(n int, w http.ResponseWriter, r *http.Request)) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var ranges []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+			{"path": "a.bin", "size": len(content), "sha256": digest},
+		}})
+	})
+	mux.HandleFunc("/a.bin", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		n := len(ranges)
+		mu.Unlock()
+		serve(n, w, r)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), ranges...)
+	}
+}
+
+// twoSegments is content spanning two segments, so a download can be cut off
+// after the first one is saved.
+func twoSegments() []byte {
+	content := make([]byte, store.DefaultSegmentSize+1000)
+	for i := range content {
+		content[i] = byte(i * 7)
+	}
+	return content
+}
+
+// A root restarted partway through a file asks the origin only for what is
+// missing, and builds the same manifest as hashing the whole file would. An
+// origin that can't serve a range gets the file from the start instead.
+func TestDaemonWANResumesCutOffFile(t *testing.T) {
+	content := twoSegments()
+	sum := sha256.Sum256(content)
+	want := &store.Manifest{Files: []store.FileManifest{{Path: "a.bin", Size: int64(len(content))}}}
+	if err := want.BuildSegmentHashes(func(string) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(content)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resumeAt := "bytes=" + strconv.FormatInt(store.DefaultSegmentSize, 10) + "-"
+
+	for _, tc := range []struct {
+		name       string
+		honorRange bool
+		wantRanges []string
+	}{
+		{"origin serves ranges", true, []string{"", resumeAt}},
+		{"origin ignores ranges", false, []string{"", resumeAt, ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, ranges := newRangeWANServer(t, content, hex.EncodeToString(sum[:]), func(n int, w http.ResponseWriter, r *http.Request) {
+				switch {
+				case n == 1: // cut off partway through the second segment
+					w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+					_, _ = w.Write(content[:store.DefaultSegmentSize+100])
+				case tc.honorRange:
+					http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(content))
+				default:
+					_, _ = w.Write(content)
+				}
+			})
+			m := wanModel("demo", ts.URL)
+			st, err := store.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := New(Config{
+				NodeID: "root-1", Roles: []string{"root"}, Store: st,
+				Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
+				Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
+			})
+
+			if err := d.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if ms := d.Status().Models[0]; ms.State != server.StatePending {
+				t.Fatalf("after the cut-off: state = %q, want pending", ms.State)
+			}
+			if err := d.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if ms := d.Status().Models[0]; ms.State != server.StateReady {
+				t.Fatalf("state = %q, want ready (err: %s)", ms.State, ms.Error)
+			}
+
+			if got := ranges(); !slices.Equal(got, tc.wantRanges) {
+				t.Fatalf("Range headers = %q, want %q", got, tc.wantRanges)
+			}
+			got, err := os.ReadFile(st.FilePath("demo", "r1", "a.bin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, content) {
+				t.Fatal("a.bin does not match the origin's content")
+			}
+			mf, err := st.LoadManifest("demo", "r1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(mf.Files, want.Files) {
+				t.Fatalf("manifest files = %+v, want %+v", mf.Files, want.Files)
+			}
+		})
+	}
+}
+
+// A file that doesn't match the origin's digest is downloaded again from the
+// start, not resumed from its last saved segment.
+func TestDaemonWANDigestMismatchStartsOver(t *testing.T) {
+	content := twoSegments()
+	other := sha256.Sum256([]byte("what the origin says the file is"))
+	ts, ranges := newRangeWANServer(t, content, hex.EncodeToString(other[:]), func(n int, w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(content))
+	})
+	m := wanModel("demo", ts.URL)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(Config{
+		NodeID: "root-1", Roles: []string{"root"}, Store: st,
+		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
+		Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
+	})
+
+	for range 2 {
+		if err := d.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if ms := d.Status().Models[0]; ms.State != server.StatePending || !strings.Contains(ms.Error, "does not match") {
+			t.Fatalf("status = %q (%s), want pending with a digest mismatch", ms.State, ms.Error)
+		}
+	}
+	if got := ranges(); !slices.Equal(got, []string{"", ""}) {
+		t.Fatalf("Range headers = %q, want two downloads from the start", got)
 	}
 }
 

@@ -55,6 +55,8 @@ type config struct {
 	staticPeers   string
 	k8sService    string
 	k8sPort       int
+	mentatURL     string
+	mentatPort    int
 
 	reconcileInterval time.Duration
 	maxConcurrent     int
@@ -73,8 +75,10 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.selPath, "selection", "", "path to this node's selection.yaml, re-read every reconcile; a missing file selects nothing (default: everything in the catalog)")
 	fs.StringVar(&cfg.listen, "listen", fmt.Sprintf(":%d", defaultPort), "address to serve the HTTP API on")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "this node's identifier (default: hostname)")
-	fs.StringVar(&cfg.discoveryKind, "discovery", "static", "peer discovery backend: static or k8s")
-	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list, for -discovery=static")
+	fs.StringVar(&cfg.discoveryKind, "discovery", "static", "peer discovery backend: static, k8s, or mentat (the local mentatd's peer table, on kindling-spark-os)")
+	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list, for -discovery=static; with -discovery=mentat, more peers to add, such as a NAS that runs no mentatd")
+	fs.StringVar(&cfg.mentatURL, "mentat-url", discovery.DefaultMentatURL, "the local mentatd's HTTP side port, for -discovery=mentat")
+	fs.IntVar(&cfg.mentatPort, "mentat-port", defaultPort, "port model-loader listens on on every box, for -discovery=mentat")
 	fs.StringVar(&cfg.k8sService, "k8s-service", "", "headless Service DNS name, for -discovery=k8s")
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
@@ -99,9 +103,14 @@ func parseFlags(args []string) (*config, error) {
 		errs = append(errs, errors.New("-catalog is required"))
 	}
 	switch cfg.discoveryKind {
-	case "static", "k8s":
+	case "static", "k8s", "mentat":
 	default:
-		errs = append(errs, fmt.Errorf("-discovery: unknown backend %q (want static or k8s)", cfg.discoveryKind))
+		errs = append(errs, fmt.Errorf("-discovery: unknown backend %q (want static, k8s or mentat)", cfg.discoveryKind))
+	}
+	if cfg.discoveryKind == "mentat" {
+		if _, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
+			errs = append(errs, fmt.Errorf("-mentat-url, -mentat-port: %w", err))
+		}
 	}
 	if cfg.discoveryKind == "k8s" && cfg.k8sService == "" {
 		errs = append(errs, errors.New("-k8s-service is required when -discovery=k8s"))
@@ -262,6 +271,19 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
 	switch cfg.discoveryKind {
 	case "k8s":
 		return discovery.NewK8sDNS(cfg.k8sService, cfg.k8sPort), nil
+	case "mentat":
+		m, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(cfg.staticPeers) == "" {
+			return m, nil
+		}
+		static, err := buildDiscoverer(&config{staticPeers: cfg.staticPeers})
+		if err != nil {
+			return nil, err
+		}
+		return discovery.NewMulti(m, static), nil
 	default:
 		var addrs []string
 		for _, a := range strings.Split(cfg.staticPeers, ",") {

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/discovery"
@@ -107,5 +111,46 @@ func TestBuildDiscovererK8s(t *testing.T) {
 	}
 	if _, ok := d.(*discovery.K8sDNS); !ok {
 		t.Fatalf("got %T, want *discovery.K8sDNS", d)
+	}
+}
+
+// On kindling-spark-os, peers come from the local mentatd with no static
+// list; -peers adds more, such as a NAS with no mentatd.
+func TestBuildDiscovererMentat(t *testing.T) {
+	mentatd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"node_id": "a", "peers": {"b": {"node_ip": "10.0.0.2", "alive": true}}}`))
+	}))
+	defer mentatd.Close()
+	cfg, err := parseFlags([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "mentat", "-mentat-url", mentatd.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for peers, want := range map[string][]string{
+		"":              {"10.0.0.2:7762"},
+		"nas.lan:7762":  {"10.0.0.2:7762", "nas.lan:7762"},
+		"10.0.0.2:7762": {"10.0.0.2:7762"},
+	} {
+		cfg.staticPeers = peers
+		d, err := buildDiscoverer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := d.Peers(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var addrs []string
+		for _, p := range got {
+			addrs = append(addrs, p.Addr)
+		}
+		if !reflect.DeepEqual(addrs, want) {
+			t.Fatalf("-peers %q: Peers = %v, want %v", peers, addrs, want)
+		}
+	}
+	for _, bad := range [][]string{{"-mentat-port", "0"}, {"-mentat-url", "http://"}, {"-mentat-url", ""}, {"-mentat-url", "127.0.0.1:6380"}} {
+		args := append([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "mentat", "-peers", "nas.lan:7762"}, bad...)
+		if _, err := parseFlags(args); err == nil {
+			t.Fatalf("%v accepted", bad)
+		}
 	}
 }

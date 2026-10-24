@@ -290,9 +290,19 @@ answer:
   everywhere, zero dependencies. Default for docker compose.
 - **k8s** — a headless Service's DNS answers list every pod. Default for
   Kubernetes.
-- **mentat** (planned) — on kindling-spark-os, query the local `mentatd`'s
-  peer table instead of reinventing discovery; that daemon already solves
-  LAN peer discovery there.
+- **mentat** — on kindling-spark-os, read the local `mentatd`'s peer table
+  (`GET /status` on its HTTP side port, `-mentat-url`, default
+  `http://127.0.0.1:6380`) instead of reinventing discovery; that daemon
+  already solves LAN peer discovery there. Every box mentatd holds alive is
+  a peer, at `-mentat-port` on the first of its addresses that takes a
+  connection there: its `link_ip` (the address mentatd's working link to
+  it uses), its `node_ip`, then its `addrs`. The choice is kept for 30 s. Every box is taken to run model-loader
+  on the same port; reading each box's port from a record it publishes
+  through mentat waits on kindlingai/mentat#4. `-peers` adds boxes that run
+  no mentatd, such as a NAS root. Callers that overlap share one `/status`
+  fetch, and its answer serves for a second after it arrives, so a box
+  mentatd finds dead drops out within a second plus a fetch's time (at
+  most 5 s).
 
 ## RAM minimization
 
@@ -316,8 +326,8 @@ answer:
 - Sources: plain HTTP(S) and Hugging Face Hub resolve. A root reads
   `HF_TOKEN` from its environment for gated or private Hub repos. S3/OCI
   later.
-- Discovery: static list and k8s DNS. mentat and LAN broadcast are
-  fast-follows once the core loop is proven.
+- Discovery: static list, k8s DNS, and mentat. LAN broadcast is a
+  fast-follow.
 - No cross-revision dedup.
 
 ## Deployment targets

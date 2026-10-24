@@ -36,6 +36,7 @@ type fakeOrigin struct {
 	manifests atomic.Int32 // manifest.json requests
 	conns     atomic.Int32 // connections opened
 	delay     time.Duration
+	digest    func(name string, sum string) string // rewrites a file's sha256 in manifest.json
 }
 
 func newFakeOrigin(t *testing.T, files map[string][]byte) *fakeOrigin {
@@ -59,14 +60,18 @@ func (o *fakeOrigin) serve(w http.ResponseWriter, r *http.Request) {
 		type file struct {
 			Path   string `json:"path"`
 			Size   int64  `json:"size"`
-			SHA256 string `json:"sha256"`
+			SHA256 string `json:"sha256,omitempty"`
 		}
 		var hm struct {
 			Files []file `json:"files"`
 		}
 		for _, name := range sortedKeys(o.files) {
 			sum := sha256.Sum256(o.files[name])
-			hm.Files = append(hm.Files, file{name, int64(len(o.files[name])), hex.EncodeToString(sum[:])})
+			d := hex.EncodeToString(sum[:])
+			if o.digest != nil {
+				d = o.digest(name, d)
+			}
+			hm.Files = append(hm.Files, file{name, int64(len(o.files[name])), d})
 		}
 		_ = json.NewEncoder(w).Encode(hm)
 		return
@@ -121,9 +126,12 @@ type pullFleet struct {
 	rootTS *httptest.Server
 }
 
-func newPullFleet(t *testing.T, files map[string][]byte, rootSel *catalog.Selection) *pullFleet {
+func newPullFleet(t *testing.T, files map[string][]byte, rootSel *catalog.Selection, opts ...func(*fakeOrigin)) *pullFleet {
 	t.Helper()
 	f := &pullFleet{t: t, origin: newFakeOrigin(t, files)}
+	for _, o := range opts {
+		o(f.origin)
+	}
 	f.model = catalog.Model{Name: "glm", Revision: "r1", Source: catalog.Source{Type: catalog.SourceHTTP, URL: f.origin.ts.URL}}
 	var err error
 	if f.rootSt, err = store.Open(t.TempDir()); err != nil {
@@ -152,7 +160,7 @@ func (f *pullFleet) peer(sel *catalog.Selection) (*Daemon, *store.Store) {
 		f.t.Fatal(err)
 	}
 	return New(Config{
-		NodeID: "spark", Roles: []string{"peer"}, Store: st,
+		NodeID: "spark", Roles: []string{"peer"}, Store: st, SegmentSize: 10,
 		Catalog: &catalog.Catalog{Models: []catalog.Model{f.model}}, Selection: sel,
 		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic([]string{f.rootTS.Listener.Addr().String()}),
 	}), st
@@ -348,5 +356,205 @@ func TestRootPartialSelectionPullsOnlyItsPart(t *testing.T) {
 	}
 	if ms := f.root.Status().Models; len(ms) != 1 || ms[0].State != server.StatePartial {
 		t.Fatalf("root status = %+v, want partial", ms)
+	}
+}
+
+func blobGet(t *testing.T, addr, path string, start, end int64, checks string) int {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/blob/glm/r1/"+path, nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end-1))
+	if checks != "" {
+		req.Header.Set(server.HeaderRangeXXH64, checks)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// A file whose whole-file sha256 fails after every segment came from the
+// origin is not served on the next request: its segments are dropped and
+// fetched again.
+func TestPullThroughWholeFileFailureNotServed(t *testing.T) {
+	content := pattern(20, 'w')
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil, func(o *fakeOrigin) {
+		o.digest = func(string, string) string { return strings.Repeat("0", 64) }
+	})
+	addr := f.rootTS.Listener.Addr().String()
+	f.root.Manifest(context.Background(), "glm", "r1")
+	if code := blobGet(t, addr, "w.bin", 0, 20, ""); code != http.StatusBadGateway {
+		t.Fatalf("first GET = %d, want 502", code)
+	}
+	before := f.origin.ranges.Load()
+	if code := blobGet(t, addr, "w.bin", 0, 20, ""); code != http.StatusBadGateway {
+		t.Fatalf("second GET = %d, want 502: bytes that failed the whole-file check were served", code)
+	}
+	if f.origin.ranges.Load() == before {
+		t.Fatal("no new origin fetch after the whole-file failure")
+	}
+}
+
+// A checksum given after its range was fetched without one is checked
+// against the held bytes; a wrong one is not hidden by the held segments.
+func TestNewChecksumForHeldRange(t *testing.T) {
+	content := pattern(100, 'n')
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
+	peer, st := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 12, Length: 6}))
+	if err := peer.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := peer.cfg
+	cfg.Selection = rangeSel("w.bin", catalog.ByteRange{Offset: 12, Length: 6, XXH64: "0123456789abcdef"})
+	again := New(cfg)
+	if err := again.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile = nil with a wrong checksum for a held range")
+	}
+	if ms := again.Status().Models; len(ms) == 1 && ms[0].State == server.StatePartial {
+		t.Fatalf("status = %+v: reports the wanted part held", ms)
+	}
+	_ = st
+}
+
+// A checksum that spans two segments reaches the root, which fetches both
+// and checks it before it serves either.
+func TestSpanningChecksumReachesRoot(t *testing.T) {
+	content := pattern(100, 's')
+	good := xxh64.Format(xxh64.Sum64(content[25:35]))
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
+	peer, st := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 25, Length: 10, XXH64: good}))
+	if err := peer.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	want := []bool{false, false, true, true, false, false, false, false, false, false}
+	checkHeld(t, f.rootSt, "w.bin", content, want, store.TrustRequester)
+	checkHeld(t, st, "w.bin", content, want, store.TrustRequester)
+
+	before := f.origin.ranges.Load()
+	bad, _ := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 55, Length: 10, XXH64: "0123456789abcdef"}))
+	if err := bad.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile = nil with a wrong spanning checksum")
+	}
+	rootMF, _ := f.rootSt.LoadManifest("glm", "r1")
+	rs, _ := f.rootSt.LoadState(rootMF)
+	if fs := rs.FileState(rootMF.Files[0]); fs.SegmentsDone[5] || fs.SegmentsDone[6] {
+		t.Fatalf("root holds segments a spanning checksum failed: %v", fs.SegmentsDone)
+	}
+	if got := f.origin.ranges.Load() - before; got < 4 {
+		t.Fatalf("root fetched %d ranges for the bad check, want both segments twice", got)
+	}
+}
+
+// A peer whose manifest came from a pull-through root (no segment hashes)
+// can copy from a NAS whose manifest has them.
+func TestLazyManifestPeerUsesHashedNAS(t *testing.T) {
+	content := pattern(30, 'h')
+	files := map[string][]byte{"w.bin": content}
+	f := newPullFleet(t, files, nil)
+	lazyMF, err := f.root.Manifest(context.Background(), "glm", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nasStore, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, nasStore, "glm", 10, files, "w.bin")
+	nas := httptest.NewServer(server.New(nasStore, fakeStatus{server.StatusResponse{NodeID: "nas2", Roles: []string{"peer"}}}))
+	t.Cleanup(nas.Close)
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveManifest(lazyMF); err != nil {
+		t.Fatal(err)
+	}
+	peer := New(Config{
+		NodeID: "spark", Roles: []string{"peer"}, Store: st,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{f.model}}, Selection: allSelection(),
+		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic([]string{nas.Listener.Addr().String()}),
+	})
+	if err := peer.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if ms := peer.Status().Models; len(ms) != 1 || ms[0].State != server.StateReady {
+		t.Fatalf("status = %+v, want ready", ms)
+	}
+	if f.origin.bytes.Load() != 0 {
+		t.Fatal("origin was used")
+	}
+}
+
+// An empty file the origin gives no digest for completes.
+func TestPullThroughEmptyFileNoDigest(t *testing.T) {
+	f := newPullFleet(t, map[string][]byte{"empty.txt": {}, "w.bin": pattern(10, 'e')}, nil, func(o *fakeOrigin) {
+		o.digest = func(string, string) string { return "" }
+	})
+	peer, st := f.peer(&catalog.Selection{Partial: []catalog.Pieces{{Model: "glm"}}})
+	if err := peer.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	mf, _ := st.LoadManifest("glm", "r1")
+	rs, _ := st.LoadState(mf)
+	for _, fm := range mf.Files {
+		if !rs.FileState(fm).Complete {
+			t.Fatalf("%s not complete", fm.Path)
+		}
+	}
+}
+
+// A root filling a pull takes a segment from a LAN node that holds it
+// before the origin.
+func TestPullThroughPrefersLAN(t *testing.T) {
+	content := pattern(100, 'l')
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
+	first, _ := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 40, Length: 5}))
+	if err := first.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	served := f.origin.bytes.Load()
+
+	// A second root, knowing only the first, for a peer of its own.
+	st2, _ := store.Open(t.TempDir())
+	root2 := New(Config{
+		NodeID: "nas2", Roles: []string{"root"}, Store: st2,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{f.model}}, Selection: &catalog.Selection{},
+		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic([]string{f.rootTS.Listener.Addr().String()}),
+		SegmentSize: 10,
+	})
+	srv2 := server.New(st2, root2)
+	srv2.SetPuller(root2)
+	ts2 := httptest.NewServer(srv2)
+	t.Cleanup(ts2.Close)
+	if _, err := root2.Manifest(context.Background(), "glm", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	if code := blobGet(t, ts2.Listener.Addr().String(), "w.bin", 40, 50, ""); code != http.StatusPartialContent {
+		t.Fatalf("GET from the second root = %d", code)
+	}
+	if got := f.origin.bytes.Load(); got != served {
+		t.Fatalf("origin served %d more bytes for a segment a LAN root holds", got-served)
+	}
+}
+
+// Once a pull-through file is whole and matches the origin's digest, its
+// bytes are the origin's: a wrong consumer checksum does not drop them or
+// cause more origin traffic.
+func TestCompletedLazyFileTrustsOrigin(t *testing.T) {
+	content := pattern(40, 't')
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
+	whole, _ := f.peer(&catalog.Selection{Partial: []catalog.Pieces{{Model: "glm"}}})
+	if err := whole.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	served := f.origin.bytes.Load()
+	bad, _ := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 5, Length: 3, XXH64: "0123456789abcdef"}))
+	if err := bad.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if f.origin.bytes.Load() != served {
+		t.Fatal("origin refetched bytes that matched its own digest")
 	}
 }

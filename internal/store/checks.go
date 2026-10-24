@@ -18,6 +18,16 @@ type RangeCheck struct {
 	XXH64  uint64
 }
 
+// Key identifies c, as "offset+length=xxh64".
+func (c RangeCheck) Key() string {
+	return fmt.Sprintf("%d+%d=%s", c.Offset, c.Length, xxh64.Format(c.XXH64))
+}
+
+// Overlaps reports whether c shares a byte with [start, end).
+func (c RangeCheck) Overlaps(start, end int64) bool {
+	return c.Offset < end && c.Offset+c.Length > start
+}
+
 // Segments returns the indices of the segments of fm that c covers.
 func (c RangeCheck) Segments(fm FileManifest) (first, last int) {
 	return fm.SegmentIndex(c.Offset), fm.SegmentIndex(c.Offset + c.Length - 1)
@@ -43,7 +53,7 @@ func CheckRange(f *os.File, c RangeCheck) (bool, error) {
 func FormatChecks(checks []RangeCheck) string {
 	parts := make([]string, len(checks))
 	for i, c := range checks {
-		parts[i] = fmt.Sprintf("%d+%d=%s", c.Offset, c.Length, xxh64.Format(c.XXH64))
+		parts[i] = c.Key()
 	}
 	return strings.Join(parts, ",")
 }

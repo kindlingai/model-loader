@@ -98,7 +98,8 @@ origin, stores them, and serves them.
   once. The source HTTP client keeps connections alive, so range GETs reuse
   them instead of each opening a connection (kindlingai/gr8#147).
 - A root that holds a file (a NAS with the full release) serves it with no
-  WAN traffic.
+  WAN traffic. A root takes a segment it does not hold from a LAN node that
+  holds it before it goes to the origin.
 
 Each held segment records how it was verified (its trust mode):
 
@@ -115,8 +116,16 @@ Each held segment records how it was verified (its trust mode):
   range. A range that does not match is dropped and fetched from the origin
   once more; failing again, the request fails.
 
-A file with no origin digest and no segment hashes is complete once every
-segment is held, as nothing more is known to check it against.
+Once every segment of a file is held it is checked against the origin's
+sha256. If it fails, every segment not verified against the manifest is
+dropped and fetched again. If it matches, every segment becomes
+`manifest`: the bytes are the origin's, and a consumer checksum that does
+not match them is not applied. A file with no origin digest and no segment
+hashes is complete once every segment is held, as nothing more is known to
+check it against.
+
+A consumer checksum given after its range was fetched is checked against
+the held bytes on the next pass, once; one that fails drops what it covers.
 
 ## Store
 

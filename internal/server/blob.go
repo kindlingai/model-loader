@@ -58,7 +58,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 
 	// A root pulls what it does not hold from the origin, and checks a
 	// consumer's checksums before it serves a range it fetched from there.
-	if s.puller != nil && fm.Size > 0 && (len(checks) > 0 || !rangeIsReady(fileState.ReadyRanges(fm), start, end+1)) {
+	if s.puller != nil && r.Header.Get(HeaderNoPull) == "" && fm.Size > 0 && (len(checks) > 0 || !rangeIsReady(fileState.ReadyRanges(fm), start, end+1)) {
 		if err := s.puller.Pull(r.Context(), model, revision, relPath, start, end+1, checks); err != nil {
 			if errors.Is(err, ErrNotPullable) {
 				rangeNotSatisfiable(w, fm.Size)
@@ -78,13 +78,17 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		rangeNotSatisfiable(w, fm.Size)
 		return
 	}
-	if !fm.Hashed() && fm.NumSegments() > 0 {
-		// Say what this node holds for the segment, so the requester can
-		// verify a segment the manifest has no hash for.
+	if fm.NumSegments() > 0 {
+		// Say what this node holds for the segment, so a requester whose
+		// manifest has no hash for it can verify it. This node's manifest
+		// may have hashes (a root holding the full release) where the
+		// requester's, from a pull-through root, does not.
 		if i := fm.SegmentIndex(start); i == fm.SegmentIndex(end) {
 			if s0, e0 := fm.SegmentBounds(i); s0 == start && e0 == end+1 {
-				w.Header().Set(HeaderSegmentSHA256, fileState.SegmentHash(fm, i))
-				w.Header().Set(HeaderSegmentTrust, fileState.TrustOf(i))
+				if sum := fileState.SegmentHash(fm, i); sum != "" {
+					w.Header().Set(HeaderSegmentSHA256, sum)
+					w.Header().Set(HeaderSegmentTrust, fileState.TrustOf(i))
+				}
 			}
 		}
 	}

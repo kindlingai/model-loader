@@ -290,10 +290,10 @@ func HashSegment(f *os.File, fm FileManifest, i int) (string, error) {
 // correctness, used once every segment is believed done. Pages are dropped
 // from page cache chunk by chunk as they are hashed.
 func VerifyWholeFile(f *os.File, fm FileManifest) (bool, error) {
-	if fm.SHA256 == "" && !fm.Hashed() {
-		// A file the origin gave no digest for, held without segment
-		// hashes: every segment was checked as it landed, and there is
-		// nothing more to check it against.
+	if fm.SHA256 == "" {
+		// A file the origin gave no digest for (only in a manifest a root
+		// published for pull-through): every segment was checked as it
+		// landed, and there is nothing more to check it against.
 		info, err := f.Stat()
 		return err == nil && info.Size() == fm.Size, err
 	}

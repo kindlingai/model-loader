@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -98,6 +99,7 @@ type Daemon struct {
 
 	pullMu    sync.Mutex
 	pulls     map[string]*pullCall // see once
+	pullSrcs  map[string]cachedSources
 	pullSlots chan struct{}
 }
 
@@ -123,6 +125,7 @@ func New(cfg Config) *Daemon {
 		verified:   make(map[string]bool),
 		states:     make(map[string]*store.RevisionState),
 		pulls:      make(map[string]*pullCall),
+		pullSrcs:   make(map[string]cachedSources),
 		pullSlots:  make(chan struct{}, cfg.PullWorkers),
 	}
 }
@@ -332,6 +335,12 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			log.Printf("model-loader: %s@%s: re-verify dropped %d segments that no longer match the manifest", m.Name, m.Revision, dropped)
 		}
 	}
+	// A consumer checksum given after its range was fetched is checked
+	// against the held bytes now; one that fails drops what it covers, so
+	// the need is no longer satisfied and that is fetched again.
+	if err := d.applyPendingChecks(manifest, need, rs); err != nil {
+		log.Printf("model-loader: %s@%s: %v", m.Name, m.Revision, err)
+	}
 	if rs.Complete() || need.Satisfied(manifest, rs) {
 		d.setStatus(progress(w, manifest, need, rs, server.StateReady))
 		return nil
@@ -389,4 +398,33 @@ func (d *Daemon) markVisited(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.verified[key] = true
+}
+
+// applyPendingChecks checks every consumer checksum in need that covers
+// only held segments and has not matched before, and saves rs.
+func (d *Daemon) applyPendingChecks(m *store.Manifest, need *want.Need, rs *store.RevisionState) error {
+	var errs []error
+	changed := false
+	for _, fm := range m.Files {
+		fn := need.Files[fm.Path]
+		if fn == nil || len(transfer.PendingChecks(fm, rs, fn.Checks)) == 0 {
+			continue
+		}
+		changed = true
+		f, err := os.Open(d.cfg.Store.FilePath(m.Model, m.Revision, fm.Path))
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := transfer.ApplyChecks(f, fm, rs, fn.Checks); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", fm.Path, err))
+		}
+		f.Close()
+	}
+	if changed {
+		if err := d.cfg.Store.SaveState(rs); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }

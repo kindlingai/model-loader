@@ -93,6 +93,14 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	return &m, nil
 }
 
+type noPullKey struct{}
+
+// WithNoPull marks ctx so that blob requests made with it ask the node to
+// serve only what it holds (see server.HeaderNoPull).
+func WithNoPull(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noPullKey{}, true)
+}
+
 // maxSegmentsBody bounds a peer's /segments (and /status) answer. A revision with ten
 // thousand files of a hundred segment runs each fits well inside it.
 const maxSegmentsBody = 16 << 20
@@ -151,6 +159,9 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 	}
 	if len(checks) > 0 {
 		req.Header.Set(server.HeaderRangeXXH64, store.FormatChecks(checks))
+	}
+	if ctx.Value(noPullKey{}) != nil {
+		req.Header.Set(server.HeaderNoPull, "1")
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {

@@ -75,6 +75,10 @@ type sources struct {
 	// /status reports the revision ready: it holds every segment.
 	whole []bool
 	peers int
+	// holdersOnly leaves out of each segment's order the LAN nodes that
+	// do not hold it: a root filling a pull asks them with
+	// server.HeaderNoPull, so they could only answer 416.
+	holdersOnly bool
 }
 
 // availabilityQueries bounds how many peers the node asks at once, across
@@ -177,8 +181,10 @@ func (s *sources) order(path string) func(i int) []int {
 		out = appendRotated(out, peerHolders, i)
 		out = appendRotated(out, rootHolders, i)
 		out = append(out, unknown...)
-		out = append(out, roots...)
-		out = append(out, others...)
+		if !s.holdersOnly {
+			out = append(out, roots...)
+			out = append(out, others...)
+		}
 		for k := s.peers; k < len(s.fetchers); k++ {
 			out = append(out, k)
 		}

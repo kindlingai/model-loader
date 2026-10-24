@@ -22,6 +22,11 @@ const (
 	// HeaderSegmentTrust goes with HeaderSegmentSHA256: how the node
 	// verified the segment, one of the store.Trust constants.
 	HeaderSegmentTrust = "X-Segment-Trust"
+	// HeaderNoPull, on a blob request, asks a root to serve only what it
+	// holds and not to fetch from its origin. A root filling its own
+	// pull-through from LAN nodes sends it, so two roots never wait on
+	// each other's pulls.
+	HeaderNoPull = "X-No-Pull"
 )
 
 // ErrNotPullable means a Puller will not fetch that model or range: it is

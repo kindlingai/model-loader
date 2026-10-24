@@ -35,6 +35,20 @@ type FileState struct {
 	// Trust[i] is how segment i was verified, one of the Trust constants.
 	// Nil, or an empty entry, means TrustManifest.
 	Trust []string `json:"trust,omitempty"`
+	// Checked lists the consumer checksums (RangeCheck.Key) that matched
+	// the bytes held, so each is checked once, not on every pass.
+	Checked []string `json:"checked,omitempty"`
+}
+
+// HasChecked reports whether c matched the held bytes before.
+func (fs FileState) HasChecked(c RangeCheck) bool {
+	k := c.Key()
+	for _, x := range fs.Checked {
+		if x == k {
+			return true
+		}
+	}
+	return false
 }
 
 // TrustOf returns how segment i was verified, or "" if it is not held.
@@ -71,6 +85,9 @@ func (fs FileState) clone() FileState {
 	}
 	if fs.Trust != nil {
 		fs.Trust = append([]string(nil), fs.Trust...)
+	}
+	if fs.Checked != nil {
+		fs.Checked = append([]string(nil), fs.Checked...)
 	}
 	return fs
 }
@@ -154,13 +171,14 @@ func (r Range) Contains(start, end int64) bool {
 // revision between everything that fetches into it. Read or change Files
 // directly only on a RevisionState no other goroutine can see yet.
 type RevisionState struct {
-	mu         sync.Mutex  // guards every field
-	saveMu     sync.Mutex  // serializes Store.SaveState, so the newest wins
-	Model      string      `json:"model"`
-	Revision   string      `json:"revision"`
-	Files      []FileState `json:"files"`
-	UpdatedAt  time.Time   `json:"updated_at"`
-	LastSource string      `json:"last_source,omitempty"`
+	mu         sync.Mutex             // guards every field
+	saveMu     sync.Mutex             // serializes Store.SaveState, so the newest wins
+	locks      map[string]*sync.Mutex // see LockFile
+	Model      string                 `json:"model"`
+	Revision   string                 `json:"revision"`
+	Files      []FileState            `json:"files"`
+	UpdatedAt  time.Time              `json:"updated_at"`
+	LastSource string                 `json:"last_source,omitempty"`
 	// Origin is a root's progress downloading the revision from its origin,
 	// before it has a manifest. It is dropped once the manifest is saved.
 	Origin []OriginFile `json:"origin,omitempty"`
@@ -279,11 +297,40 @@ func (rs *RevisionState) MarkSegment(fm FileManifest, i int, sum, trust string) 
 	})
 }
 
+// LockFile locks the file at path against other checks of its held bytes:
+// a whole-file check and a consumer checksum check of the same file must
+// not interleave, or one could mark complete what the other just dropped.
+// It returns the unlock.
+func (rs *RevisionState) LockFile(path string) func() {
+	rs.mu.Lock()
+	if rs.locks == nil {
+		rs.locks = make(map[string]*sync.Mutex)
+	}
+	l := rs.locks[path]
+	if l == nil {
+		l = &sync.Mutex{}
+		rs.locks[path] = l
+	}
+	rs.mu.Unlock()
+	l.Lock()
+	return l.Unlock
+}
+
+// AddChecked records that c matched the held bytes of fm.
+func (rs *RevisionState) AddChecked(fm FileManifest, c RangeCheck) {
+	rs.update(fm, func(fs *FileState) {
+		if !fs.HasChecked(c) {
+			fs.Checked = append(fs.Checked, c.Key())
+		}
+	})
+}
+
 // DropSegment records segment i of fm as not held, and the file as not
-// complete.
+// complete. Checks that matched are forgotten, as the bytes will change.
 func (rs *RevisionState) DropSegment(fm FileManifest, i int) {
 	rs.update(fm, func(fs *FileState) {
 		fs.SegmentsDone[i], fs.Complete = false, false
+		fs.Checked = nil
 		if i < len(fs.SegmentSHA256) {
 			fs.SegmentSHA256[i] = ""
 		}
@@ -308,8 +355,27 @@ func (rs *RevisionState) SetTrust(fm FileManifest, i int, trust string) {
 
 // SetComplete marks fm complete: every segment held, and the whole file
 // checked.
-func (rs *RevisionState) SetComplete(fm FileManifest) {
-	rs.update(fm, func(fs *FileState) { fs.Complete = true })
+//
+// A file whose manifest entry has no segment hashes was verified against
+// the origin's whole-file sha256 by then, so its segments' trust becomes
+// TrustManifest: they are the origin's bytes, and a consumer checksum that
+// does not match them is the consumer's mistake, not damage. It reports
+// false, changing nothing, if a segment was dropped since the caller
+// looked.
+func (rs *RevisionState) SetComplete(fm FileManifest) bool {
+	ok := false
+	rs.update(fm, func(fs *FileState) {
+		for _, d := range fs.SegmentsDone {
+			if !d {
+				return
+			}
+		}
+		ok, fs.Complete = true, true
+		if !fm.Hashed() && fm.SHA256 != "" {
+			fs.Trust = nil // every entry TrustManifest
+		}
+	})
+	return ok
 }
 
 // snapshot returns a deep copy of rs to save, stamped now.

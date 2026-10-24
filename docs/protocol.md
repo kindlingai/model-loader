@@ -109,10 +109,16 @@ Request header:
 
 - `X-Range-XXH64: offset+length=xxh64,...`: a consumer's XXH64 (seed 0, 16
   hex digits) for ranges inside the requested one. A root checks each
-  against the bytes before it serves them. At most 4096 entries.
+  against the bytes before it serves them. A check that spans more than
+  the requested range still applies: the root fetches every segment it
+  spans first. At most 4096 entries, each at most 1 GiB.
+- `X-No-Pull: 1`: serve only what this node holds; do not fetch from the
+  origin. A root sends it when it fills its own pull from LAN nodes, so
+  two roots never wait on each other's pulls.
 
-Response headers, for a request of exactly one segment of a file that has
-no `segment_sha256` in the manifest:
+Response headers, for a request of exactly one segment that this node
+holds a sha256 for (the requester's manifest may have no `segment_sha256`
+for it, as one from a pull-through root has none):
 
 - `X-Segment-SHA256`: the sha256 this node holds for the segment. The
   requester checks the bytes against it.

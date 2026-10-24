@@ -193,7 +193,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 				var sum, trust string
 				if err == nil {
 					start, end := fm.SegmentBounds(i)
-					sum, trust, err = fetchSegment(ctx, f, fm, i, fetchers, order(i), checksInside(opts.Checks, start, end), dead, &mu)
+					sum, trust, err = fetchSegment(ctx, f, fm, i, fetchers, order(i), checksOverlapping(opts.Checks, start, end), dead, &mu)
 					f.Close()
 				}
 				if opts.Slots != nil {
@@ -227,16 +227,25 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if err := syncAndUncache(f); err != nil {
 		return fmt.Errorf("fetch %s: %w", fm.Path, err)
 	}
-	if err := ApplyChecks(f, fm, rs, opts.Checks); err != nil {
-		_ = st.SaveState(rs)
+	err = ApplyChecks(f, fm, rs, opts.Checks)
+	if serr := st.SaveState(rs); err == nil && serr != nil {
+		err = serr
+	}
+	if err != nil {
 		return fmt.Errorf("fetch %s: %w", fm.Path, err)
 	}
 	return FinishFile(st, f, fm, rs)
 }
 
 // FinishFile verifies fm whole and marks it complete once every segment is
-// held. A file with segments still missing is left partial.
+// held. A file with segments still missing is left partial. If the whole
+// file fails its check, every segment not verified against manifest
+// segment hashes is dropped, so it is fetched again rather than served;
+// segments the manifest verified are kept, as fetching them again cannot
+// change them.
 func FinishFile(st *store.Store, f *os.File, fm store.FileManifest, rs *store.RevisionState) error {
+	unlock := rs.LockFile(fm.Path)
+	defer unlock()
 	fs := rs.FileState(fm)
 	if fs.Complete || len(fs.SegmentsDone) != fm.NumSegments() || !allDone(fs.SegmentsDone) {
 		return nil
@@ -246,23 +255,30 @@ func FinishFile(st *store.Store, f *os.File, fm store.FileManifest, rs *store.Re
 		return fmt.Errorf("fetch %s: verify whole file: %w", fm.Path, err)
 	}
 	if !ok {
+		for i := range fs.SegmentsDone {
+			if fs.TrustOf(i) != store.TrustManifest || !fm.Hashed() {
+				rs.DropSegment(fm, i)
+			}
+		}
+		_ = st.SaveState(rs)
 		return fmt.Errorf("fetch %s: whole-file verification failed after every segment passed", fm.Path)
 	}
-	rs.SetComplete(fm)
+	if !rs.SetComplete(fm) {
+		return nil // a segment was dropped meanwhile; it is fetched again.
+	}
 	return st.SaveState(rs)
 }
 
-// ApplyChecks checks each of checks whose segments of fm are all held,
-// unless every one of those segments was verified against the manifest
-// (then the bytes are the origin's, and a mismatch is the consumer's
-// mistake). A range that matches upgrades its segments' trust to
-// store.TrustRequester. One that does not drops its segments that were
-// not verified against the manifest, so they are fetched again, and
-// ApplyChecks returns an error naming it. rs is not saved.
-func ApplyChecks(f *os.File, fm store.FileManifest, rs *store.RevisionState, checks []store.RangeCheck) error {
-	var errs []error
+// PendingChecks returns those of checks that ApplyChecks would check now:
+// every segment they cover is held, not every one of those was verified
+// against the manifest, and they have not matched before.
+func PendingChecks(fm store.FileManifest, rs *store.RevisionState, checks []store.RangeCheck) []store.RangeCheck {
+	fs := rs.FileState(fm)
+	var out []store.RangeCheck
 	for _, c := range checks {
-		fs := rs.FileState(fm)
+		if fs.HasChecked(c) {
+			continue
+		}
 		first, last := c.Segments(fm)
 		held, manifest := true, true
 		for i := first; i <= last; i++ {
@@ -270,13 +286,31 @@ func ApplyChecks(f *os.File, fm store.FileManifest, rs *store.RevisionState, che
 			held = held && t != ""
 			manifest = manifest && t == store.TrustManifest
 		}
-		if !held || manifest {
-			continue
+		if held && !manifest {
+			out = append(out, c)
 		}
+	}
+	return out
+}
+
+// ApplyChecks checks each of checks that PendingChecks returns. When every
+// segment a check covers was verified against the manifest, the bytes are
+// the origin's and a mismatch is the consumer's mistake, so it is not
+// checked. A range that matches is recorded, and its segments' trust goes
+// up to store.TrustRequester. One that does not drops its segments that
+// were not verified against the manifest, so they are fetched again, and
+// ApplyChecks returns an error naming it. rs is not saved.
+func ApplyChecks(f *os.File, fm store.FileManifest, rs *store.RevisionState, checks []store.RangeCheck) error {
+	unlock := rs.LockFile(fm.Path)
+	defer unlock()
+	var errs []error
+	for _, c := range PendingChecks(fm, rs, checks) {
 		ok, err := store.CheckRange(f, c)
 		if err != nil {
 			return err
 		}
+		fs := rs.FileState(fm)
+		first, last := c.Segments(fm)
 		for i := first; i <= last; i++ {
 			switch {
 			case fs.TrustOf(i) == store.TrustManifest:
@@ -286,18 +320,23 @@ func ApplyChecks(f *os.File, fm store.FileManifest, rs *store.RevisionState, che
 				rs.DropSegment(fm, i)
 			}
 		}
-		if !ok {
+		if ok {
+			rs.AddChecked(fm, c)
+		} else {
 			errs = append(errs, fmt.Errorf("range offset %d length %d does not match its xxh64 %s", c.Offset, c.Length, xxh64.Format(c.XXH64)))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// checksInside returns the checks that lie within [start, end).
-func checksInside(checks []store.RangeCheck, start, end int64) []store.RangeCheck {
+// checksOverlapping returns the checks that share a byte with
+// [start, end). A source that takes checks fetches every segment they span
+// and checks them before it answers, so a check spanning segments is
+// verified at the root too.
+func checksOverlapping(checks []store.RangeCheck, start, end int64) []store.RangeCheck {
 	var out []store.RangeCheck
 	for _, c := range checks {
-		if c.Inside(start, end) {
+		if c.Overlaps(start, end) {
 			out = append(out, c)
 		}
 	}

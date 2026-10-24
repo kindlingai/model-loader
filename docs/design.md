@@ -439,7 +439,8 @@ Each target gives gr8 the same two things:
   so the same read-only mount carries it (a read-only mount does not stop
   a process opening a socket). The socket is mode 0660, and model-loader
   runs in group 1000, gr8's, so gr8 can open it and other users cannot.
-  The API has no authentication, so it is never on a TCP port.
+  The deploys keep it off TCP, where it needs `MODEL_LOADER_LOCAL_TOKEN`
+  (docs/protocol.md, "Local request API").
 
 gr8 starts once `model-loader -check unix:PATH` passes, that is once the
 socket answers a request. A TCP check of `-listen` would not show that: the

@@ -401,3 +401,38 @@ func TestFetchFileAllHeldChecksWholeWithoutSources(t *testing.T) {
 		t.Fatal("file not marked complete")
 	}
 }
+
+// overSender sends one byte more than asked for.
+type overSender struct{ content []byte }
+
+func (o overSender) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(append(append([]byte(nil), o.content[offset:offset+length]...), 'X'))), nil
+}
+
+// A source that sends more than the segment must not write past it into a
+// held neighbouring segment, and is dropped for the next source.
+func TestFetchFileSourceSendsTooMuch(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("0123456789abcdefghijklmnopqrst")
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	good := &fakeFetcher{content: content, ready: int64(len(content))}
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{good}, []bool{false, true, false}); err != nil {
+		t.Fatal(err)
+	}
+	good.calls = 0
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{overSender{content}, good}, []bool{true, false, false}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	got, _ := os.ReadFile(st.FilePath("m", "r1", "w.bin"))
+	if !bytes.Equal(got[:20], content[:20]) {
+		t.Fatalf("held segment 1 overwritten: %q", got[:20])
+	}
+	if good.calls != 1 {
+		t.Fatalf("good source called %d times, want 1 after the bad one was dropped", good.calls)
+	}
+}

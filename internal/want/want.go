@@ -104,7 +104,11 @@ func Resolve(m *store.Manifest, w Want) (*Need, error) {
 					return nil, fmt.Errorf("%s: %s: range offset %d length %d runs past the file's %d bytes",
 						Key(m.Model, m.Revision), fm.Path, r.Offset, r.Length, fm.Size)
 				}
-				for i := fm.SegmentIndex(r.Offset); i <= fm.SegmentIndex(r.Offset+r.Length-1); i++ {
+				first, last := fm.SegmentIndex(r.Offset), fm.SegmentIndex(r.Offset+r.Length-1)
+				if first < 0 || last >= len(fn.Segments) {
+					return nil, fmt.Errorf("%s: %s: range offset %d length %d is outside the file's segments", Key(m.Model, m.Revision), fm.Path, r.Offset, r.Length)
+				}
+				for i := first; i <= last; i++ {
 					fn.Segments[i] = true
 				}
 			}
@@ -193,10 +197,19 @@ func (n *Need) Satisfied(m *store.Manifest, rs *store.RevisionState) bool {
 		if fn.Whole {
 			return false
 		}
-		for i, need := range fn.Segments {
-			if need && (i >= len(fs.SegmentsDone) || !fs.SegmentsDone[i]) {
+		all := len(fs.SegmentsDone) == fm.NumSegments()
+		for i := range fn.Segments {
+			held := i < len(fs.SegmentsDone) && fs.SegmentsDone[i]
+			if fn.Segments[i] && !held {
 				return false
 			}
+			all = all && held
+		}
+		if all {
+			// Every segment is held, so the file must pass its whole-file
+			// check before it counts; a failed or unfinished check is not
+			// hidden behind the segments that are held.
+			return false
 		}
 	}
 	return true

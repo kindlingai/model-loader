@@ -183,3 +183,31 @@ func TestFromSelection(t *testing.T) {
 		t.Fatalf("an unknown entry must not drop the others: %+v", ws)
 	}
 }
+
+// A ranged file with every segment held but its whole-file check not
+// passed is not satisfied, so a failed check is not hidden on the next pass.
+func TestNeedSatisfiedRangedFileAllHeld(t *testing.T) {
+	m := testManifest()
+	n, err := Resolve(m, Want{Pieces: []catalog.Pieces{{Model: "glm",
+		Ranges: []catalog.FileRanges{{Path: "dense/vision-0.safetensors", Ranges: []catalog.ByteRange{{Offset: 0, Length: 1}}}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := store.NewRevisionState(m)
+	fs := rs.FileState(m.Files[2])
+	fs.SegmentsDone[0] = true
+	rs.SetFileState(fs)
+	if !n.Satisfied(m, rs) {
+		t.Fatal("not Satisfied with the one needed segment held")
+	}
+	fs.SegmentsDone[1] = true
+	rs.SetFileState(fs)
+	if n.Satisfied(m, rs) {
+		t.Fatal("Satisfied with every segment held but no whole-file check")
+	}
+	fs.Complete = true
+	rs.SetFileState(fs)
+	if !n.Satisfied(m, rs) {
+		t.Fatal("not Satisfied once complete")
+	}
+}

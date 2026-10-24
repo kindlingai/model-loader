@@ -189,9 +189,15 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 			continue
 		}
 
+		// Write at most the segment's own bytes, so a source that sends
+		// too much cannot overwrite a neighbouring segment that is held.
 		w := io.NewOffsetWriter(f, start)
-		copied, copyErr := io.Copy(w, rc)
+		copied, copyErr := io.Copy(w, io.LimitReader(rc, length))
+		extra, _ := rc.Read(make([]byte, 1))
 		closeErr := rc.Close()
+		if copyErr == nil && extra > 0 {
+			copyErr = fmt.Errorf("source sent more than the %d bytes asked for", length)
+		}
 		if copyErr != nil {
 			dead[k], lastErr = true, copyErr
 			continue

@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -165,11 +166,15 @@ func VerifySegment(f *os.File, fm FileManifest, i int) (bool, error) {
 }
 
 // Reverify hashes every segment rs records as done against m, and marks
-// any that no longer match (or whose file is gone) as not done, along with
-// its file's completeness, so the next fetch gets it again. It saves rs and
-// returns how many segments it dropped.
+// any that no longer match (or whose file is gone or cannot be opened) as
+// not done, along with its file's completeness, so the next fetch gets it
+// again. A file that is not exactly its manifest size is put back to that
+// size and is no longer complete, so it is checked whole again once every
+// segment is held. It saves rs, even when it fails part way, so nothing it
+// found bad stays marked held, and returns how many segments it dropped.
 func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 	dropped := 0
+	var errs []error
 	for _, fm := range m.Files {
 		fs := rs.FileState(fm)
 		held := fs.Complete
@@ -179,9 +184,20 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 		if !held {
 			continue
 		}
-		f, err := os.Open(s.FilePath(m.Model, m.Revision, fm.Path))
-		if err != nil && !os.IsNotExist(err) {
-			return dropped, err
+		path := s.FilePath(m.Model, m.Revision, fm.Path)
+		f, err := os.Open(path)
+		if err != nil {
+			f = nil // gone or unreadable: nothing in it can be trusted.
+		}
+		if f != nil {
+			if info, err := f.Stat(); err != nil || info.Size() != fm.Size {
+				fs.Complete = false
+				if err == nil {
+					if err := os.Truncate(path, fm.Size); err != nil {
+						errs = append(errs, fmt.Errorf("%s: restore size: %w", fm.Path, err))
+					}
+				}
+			}
 		}
 		for i, done := range fs.SegmentsDone {
 			if !done {
@@ -210,7 +226,10 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 		}
 		rs.SetFileState(fs)
 	}
-	return dropped, s.SaveState(rs)
+	if err := s.SaveState(rs); err != nil {
+		errs = append(errs, err)
+	}
+	return dropped, errors.Join(errs...)
 }
 
 // VerifyWholeFile reports whether the file is exactly fm.Size bytes and

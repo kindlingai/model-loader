@@ -306,3 +306,105 @@ func TestManifestValidate(t *testing.T) {
 		t.Error("duplicate path: Validate = nil, want an error")
 	}
 }
+
+// Sizes near MaxInt64 must not overflow the segment count into a manifest
+// that passes Validate with no segments.
+func TestManifestValidateOverflow(t *testing.T) {
+	const max = int64(^uint64(0) >> 1)
+	m := &Manifest{Files: []FileManifest{{Path: "a", Size: max, SegmentSize: max}}}
+	if err := m.Validate(); err == nil {
+		t.Fatal("Validate = nil for a huge file with no segment hashes")
+	}
+}
+
+func seedHeld(t *testing.T, s *Store, files map[string][]byte, order ...string) (*Manifest, *RevisionState) {
+	t.Helper()
+	m := &Manifest{Model: "m", Revision: "r1"}
+	for _, p := range order {
+		m.Files = append(m.Files, FileManifest{Path: p, Size: int64(len(files[p])), SegmentSize: 10})
+	}
+	if err := m.BuildSegmentHashes(func(p string) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(files[p])), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rs := NewRevisionState(m)
+	for _, fm := range m.Files {
+		f, err := s.EnsureFile("m", "r1", fm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.WriteAt(files[fm.Path], 0)
+		f.Close()
+		fs := rs.FileState(fm)
+		for i := range fs.SegmentsDone {
+			fs.SegmentsDone[i] = true
+		}
+		fs.Complete = true
+		rs.SetFileState(fs)
+	}
+	return m, rs
+}
+
+// A file that cannot be opened must not stop Reverify from saving what it
+// found bad in the files before it.
+func TestReverifySavesBeforeLaterFailure(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, rs := seedHeld(t, s, map[string][]byte{"a.bin": bytes.Repeat([]byte("a"), 20), "b.bin": bytes.Repeat([]byte("b"), 20)}, "a.bin", "b.bin")
+	f, _ := os.OpenFile(s.FilePath("m", "r1", "a.bin"), os.O_RDWR, 0)
+	f.WriteAt([]byte("X"), 3)
+	f.Close()
+	bp := s.FilePath("m", "r1", "b.bin")
+	os.Remove(bp)
+	if err := os.Symlink(bp, bp); err != nil { // a loop: open fails, not with ENOENT
+		t.Fatal(err)
+	}
+	if _, err := s.Reverify(m, rs); err != nil {
+		t.Fatalf("Reverify: %v", err)
+	}
+	got, _ := s.LoadState(m)
+	if fs := got.FileState(m.Files[0]); fs.Complete || fs.SegmentsDone[0] {
+		t.Fatalf("a.bin state %+v: the corrupt segment is still held", fs)
+	}
+	if fs := got.FileState(m.Files[1]); fs.Complete || fs.SegmentsDone[0] || fs.SegmentsDone[1] {
+		t.Fatalf("b.bin state %+v: an unreadable file is still held", fs)
+	}
+}
+
+// A file that grew or shrank on disk is no longer complete, and is put back
+// to its manifest size.
+func TestReverifyFileSizeChanged(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, rs := seedHeld(t, s, map[string][]byte{"a.bin": bytes.Repeat([]byte("a"), 30)}, "a.bin")
+	p := s.FilePath("m", "r1", "a.bin")
+	f, _ := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+	f.Write([]byte("extra"))
+	f.Close()
+	if _, err := s.Reverify(m, rs); err != nil {
+		t.Fatal(err)
+	}
+	if fs := rs.FileState(m.Files[0]); fs.Complete {
+		t.Fatal("a grown file is still complete")
+	}
+	if info, _ := os.Stat(p); info.Size() != 30 {
+		t.Fatalf("size = %d, want 30", info.Size())
+	}
+
+	os.Truncate(p, 10)
+	if _, err := s.Reverify(m, rs); err != nil {
+		t.Fatal(err)
+	}
+	fs := rs.FileState(m.Files[0])
+	if !fs.SegmentsDone[0] || fs.SegmentsDone[1] || fs.SegmentsDone[2] {
+		t.Fatalf("segments = %v, want only segment 0 kept after truncation", fs.SegmentsDone)
+	}
+	if info, _ := os.Stat(p); info.Size() != 30 {
+		t.Fatalf("size = %d, want 30 (sparse, full size)", info.Size())
+	}
+}

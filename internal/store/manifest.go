@@ -97,7 +97,7 @@ func (m *Manifest) Validate() error {
 			if f.SegmentSize <= 0 {
 				return fmt.Errorf("manifest %s@%s: %s: no segment size", m.Model, m.Revision, f.Path)
 			}
-			want = int((f.Size + f.SegmentSize - 1) / f.SegmentSize)
+			want = int(1 + (f.Size-1)/f.SegmentSize) // no overflow near MaxInt64
 		}
 		if len(f.SegmentSHA256) != want {
 			return fmt.Errorf("manifest %s@%s: %s: %d segment hashes, want %d", m.Model, m.Revision, f.Path, len(f.SegmentSHA256), want)

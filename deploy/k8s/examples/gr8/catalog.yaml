@@ -7,3 +7,9 @@ models:
       type: huggingface
       repo: kindlingai/glm-5.3-exlr8-k2-k3-k4
     revision: main
+    # The width files in 64 KiB segments, so a box holds a rank's expert
+    # halves at about 1.3x their size, not every width file whole
+    # (docs/design.md, "Small segments"). The root reads this when it makes
+    # the manifest; set it before the revision's first fetch.
+    segment_sizes:
+      - {path: "experts/*.k?.safetensors", size: 65536}

@@ -137,6 +137,14 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 		}
 		written[i].Store(fm.Size)
 		manifest.Files[i] = of.FileManifest
+		if size := m.SegmentSizeFor(fm.Path); size > 0 && size != store.DefaultSegmentSize {
+			// A file of small segments has no segment hashes in the
+			// manifest: millions of them would make it hundreds of MB.
+			// It is verified whole here; a peer checks each segment
+			// against the sha256 this node vouches for (see
+			// server.HeaderSegmentSHA256), as for pull-through.
+			manifest.Files[i].SegmentSize, manifest.Files[i].SegmentSHA256 = size, nil
+		}
 		done += fm.Size
 		report(0)
 	}
@@ -189,7 +197,7 @@ func (d *Daemon) originProgress(m catalog.Model, rs *store.RevisionState, fm sto
 		if err != nil {
 			return nil, err
 		}
-		segments, whole, err := store.HashFile(f, fm.Size, progress)
+		segments, whole, err := store.HashFile(f, fm.Size, store.DefaultSegmentSize, progress)
 		f.Close()
 		if err != nil {
 			return nil, err

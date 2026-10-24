@@ -90,6 +90,12 @@ func (d *Daemon) revState(m *store.Manifest) (*store.RevisionState, error) {
 	return rs, nil
 }
 
+// RevisionState implements server.StateSource: the server reads what is
+// held from the state this node keeps in memory, not the state file.
+func (d *Daemon) RevisionState(m *store.Manifest) (*store.RevisionState, error) {
+	return d.revState(m)
+}
+
 // catalogModel finds name@revision in the catalog.
 func (d *Daemon) catalogModel(name, revision string) (catalog.Model, bool) {
 	for _, m := range d.cfg.Catalog.Models {
@@ -159,7 +165,7 @@ func (d *Daemon) publishLazyManifest(ctx context.Context, m catalog.Model) (*sto
 	}
 	mf := &store.Manifest{Model: m.Name, Revision: m.Revision, Commit: resolved.Commit}
 	for _, rf := range resolved.Files {
-		fm := store.FileManifest{Path: rf.Path, Size: rf.Size, SHA256: rf.SHA256, SegmentSize: d.segmentSize()}
+		fm := store.FileManifest{Path: rf.Path, Size: rf.Size, SHA256: rf.SHA256, SegmentSize: d.segmentSizeFor(m, rf.Path)}
 		if fm.Size == 0 && fm.SHA256 == "" {
 			fm.SHA256 = emptySHA256 // nothing to fetch; its digest is known.
 		}
@@ -187,6 +193,15 @@ func (d *Daemon) segmentSize() int64 {
 		return d.cfg.SegmentSize
 	}
 	return store.DefaultSegmentSize
+}
+
+// segmentSizeFor is the segment size this root gives the file at path of
+// m in a manifest it makes: the catalog's rule for it, else the default.
+func (d *Daemon) segmentSizeFor(m catalog.Model, path string) int64 {
+	if size := m.SegmentSizeFor(path); size > 0 {
+		return size
+	}
+	return d.segmentSize()
 }
 
 // Pull implements server.Puller: it fetches the segments of path that
@@ -239,13 +254,7 @@ func (d *Daemon) Pull(ctx context.Context, name, revision, path string, start, e
 	// in use until it is over, so making room for it cannot evict one of
 	// them.
 	defer d.useSegments(m.Name, m.Revision, fm, segs)()
-	var needs []spaceNeed
-	for i, s := range segs {
-		if s && rs.SegmentTrust(fm, i) == "" {
-			needs = append(needs, segmentNeed(mf, rs, fm, i, d.blockSize()))
-		}
-	}
-	release, err := d.makeRoom(ctx, needs)
+	release, err := d.makeRoom(ctx, segmentNeeds(mf, rs, fm, segs, d.blockSize()))
 	if err != nil {
 		return err
 	}
@@ -341,30 +350,38 @@ func (d *Daemon) originSources(m catalog.Model) *sources {
 }
 
 // pullSegments fetches the segments segs marks that rs does not hold, with
-// at most Config.PullWorkers of this call's segments in flight, and at
-// most that many across the node fetching at once; one fetch per segment
-// however many callers want it.
+// at most Config.PullWorkers of this call's chunks in flight, and at most
+// that many across the node fetching at once; one fetch per chunk however
+// many callers want it. A chunk (see store.ChunkSize) is one segment for a
+// file of 64 MiB segments; for a file of smaller ones, each fetch takes
+// the chunk's missing segments that segs marks in as few ranges as the
+// sources allow (see transfer.FetchFile).
 func (d *Daemon) pullSegments(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, segs []bool, srcs *sources) error {
 	fs := rs.FileState(fm)
 	queue := make(chan int)
 	var wg sync.WaitGroup
-	errs := make([]error, len(segs))
+	errs := make([]error, fm.NumChunks())
 	for range d.cfg.PullWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range queue {
-				errs[i] = d.pullSegment(ctx, m, fm, rs, i, srcs)
+			for c := range queue {
+				errs[c] = d.pullChunk(ctx, m, fm, rs, c, segs, srcs)
 			}
 		}()
 	}
 loop:
-	for i, want := range segs {
-		if !want || fs.TrustOf(i) != "" {
+	for c := range fm.NumChunks() {
+		first, end := fm.ChunkBounds(c)
+		missing := false
+		for i := first; i < end && !missing; i++ {
+			missing = segs[i] && fs.TrustOf(i) == ""
+		}
+		if !missing {
 			continue
 		}
 		select {
-		case queue <- i:
+		case queue <- c:
 		case <-ctx.Done():
 			break loop
 		}
@@ -377,29 +394,60 @@ loop:
 	return errors.Join(errs...)
 }
 
-func (d *Daemon) pullSegment(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, i int, srcs *sources) error {
-	key := fmt.Sprintf("segment %s %s %d", want.Key(m.Name, m.Revision), fm.Path, i)
-	_, err := d.once(ctx, key, func() (any, error) {
-		if rs.SegmentTrust(fm, i) != "" {
-			return nil, nil // another call fetched it just now.
+// pullChunk fetches the segments of chunk c of fm that segs marks and rs
+// does not hold. Callers that want the same chunk at once share one fetch;
+// one that wants segments the fetch did not take fetches again for them.
+func (d *Daemon) pullChunk(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, c int, segs []bool, srcs *sources) error {
+	first, end := fm.ChunkBounds(c)
+	missing := func() []bool {
+		var need []bool
+		for i := first; i < end; i++ {
+			if segs[i] && rs.SegmentTrust(fm, i) == "" {
+				if need == nil {
+					need = make([]bool, fm.NumSegments())
+				}
+				need[i] = true
+			}
 		}
-		// Wait for a slot, at the caller's priority (the first caller's,
-		// for a segment many want), as long as the caller does; once the fetch has
-		// started it finishes even if the caller goes away, as others may
-		// be waiting on it (see pullTimeout).
-		if err := d.pullLimit.Acquire(ctx, server.Priority(ctx)); err != nil {
-			return nil, err
+		return need
+	}
+	for attempt := 0; ; attempt++ {
+		need := missing()
+		if need == nil {
+			return nil
 		}
-		defer d.pullLimit.Release()
-		pctx, cancel := context.WithTimeout(transfer.WithNoPull(context.WithoutCancel(ctx)), pullTimeout)
-		defer cancel()
-		defer d.writing(m.Name, m.Revision, fm)()
-		need := make([]bool, fm.NumSegments())
-		need[i] = true
-		return nil, transfer.FetchFile(pctx, d.cfg.Store, m.Name, m.Revision, fm, rs,
-			srcs.fetchers, transfer.Options{Need: need, Order: srcs.order(fm.Path)})
-	})
-	return err
+		if attempt == 2 {
+			// Another caller's fetch of the chunk took other segments,
+			// twice: fetch these without it.
+			return d.pullFetch(ctx, m, fm, rs, need, srcs)
+		}
+		key := fmt.Sprintf("segment %s %s %d", want.Key(m.Name, m.Revision), fm.Path, c)
+		if _, err := d.once(ctx, key, func() (any, error) {
+			return nil, d.pullFetch(ctx, m, fm, rs, missing(), srcs)
+		}); err != nil {
+			return err
+		}
+	}
+}
+
+// pullFetch fetches the segments need marks, at the caller's priority.
+func (d *Daemon) pullFetch(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, need []bool, srcs *sources) error {
+	if need == nil {
+		return nil // another call fetched them just now.
+	}
+	// Wait for a slot, at the caller's priority (the first caller's, for
+	// a chunk many want), as long as the caller does; once the fetch has
+	// started it finishes even if the caller goes away, as others may be
+	// waiting on it (see pullTimeout).
+	if err := d.pullLimit.Acquire(ctx, server.Priority(ctx)); err != nil {
+		return err
+	}
+	defer d.pullLimit.Release()
+	pctx, cancel := context.WithTimeout(transfer.WithNoPull(context.WithoutCancel(ctx)), pullTimeout)
+	defer cancel()
+	defer d.writing(m.Name, m.Revision, fm)()
+	return transfer.FetchFile(pctx, d.cfg.Store, m.Name, m.Revision, fm, rs,
+		srcs.fetchers, transfer.Options{Need: need, Order: srcs.order(fm.Path)})
 }
 
 // lazy reports whether mf has a file with no segment hashes: a manifest a

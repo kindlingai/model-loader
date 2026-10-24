@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Store is the local on-disk content store rooted at a directory:
@@ -47,6 +49,20 @@ func (s *Store) manifestPath(model, revision string) string {
 func (s *Store) statePath(model, revision string) string {
 	return filepath.Join(s.root, "state", model, revision+".json")
 }
+
+// hashesDir is where a revision's segment hash side files are (see
+// WriteSegmentHashes). The ".d" keeps a revision with a slash in its name
+// ("refs/pr/1") apart from the files of another ("refs").
+func (s *Store) hashesDir(model, revision string) string {
+	return filepath.Join(s.root, "hashes", model, revision+".d")
+}
+
+func (s *Store) hashesPath(model, revision, relPath string) string {
+	return filepath.Join(s.hashesDir(model, revision), filepath.FromSlash(relPath)+".sha256")
+}
+
+// Dir returns the directory the store is rooted at.
+func (s *Store) Dir() string { return s.root }
 
 // ModelDir returns the directory a revision's files are materialized under.
 func (s *Store) ModelDir(model, revision string) string {
@@ -92,11 +108,40 @@ func (s *Store) HasManifest(model, revision string) bool {
 func (s *Store) SaveState(rs *RevisionState) error {
 	rs.saveMu.Lock()
 	defer rs.saveMu.Unlock()
-	snap := rs.snapshot()
+	return s.saveLocked(rs)
+}
+
+// stateSaveEvery is how often SaveStateSoon writes a revision's state.
+const stateSaveEvery = time.Second
+
+// SaveStateSoon saves rs as SaveState does, unless it was saved less than
+// a second ago and the last save succeeded: a fetch of many small
+// segments marks one held every few milliseconds, and the state of a
+// revision with millions of segments takes longer than that to write.
+// Until the next save the state on disk holds less than rs, never more,
+// so a consumer reading the store and a restart see fewer segments held,
+// not bytes that are not there. The caller saves with SaveState when it
+// is done.
+func (s *Store) SaveStateSoon(rs *RevisionState) error {
+	rs.saveMu.Lock()
+	defer rs.saveMu.Unlock()
+	if time.Since(rs.lastSave) < stateSaveEvery && s.StateSaved(rs.Model, rs.Revision) {
+		return nil
+	}
+	return s.saveLocked(rs)
+}
+
+// saveLocked is SaveState. rs.saveMu is held.
+func (s *Store) saveLocked(rs *RevisionState) error {
+	snap, small := rs.snapshot()
 	path := s.statePath(snap.Model, snap.Revision)
 	err := os.MkdirAll(filepath.Dir(path), 0o755)
 	if err == nil {
-		err = marshalJSONAtomic(path, snap)
+		// Compact when there may be many held ranges.
+		err = writeJSONAtomic(path, snap, !small)
+	}
+	if err == nil {
+		rs.lastSave = time.Now()
 	}
 	if err != nil {
 		if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
@@ -132,7 +177,80 @@ func (s *Store) LoadState(m *Manifest) (*RevisionState, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Each file's segments as m has them: a file of small segments lists
+	// only what it holds.
+	for i := range rs.Files {
+		if fm, ok := m.Find(rs.Files[i].Path); ok {
+			rs.Files[i].fit(fm)
+		}
+	}
 	return rs, nil
+}
+
+// WriteSegmentHashes records the sha256 of segments first, first+1, ...
+// of fm, a file of small segments (FileManifest.Small), in its side file
+// <store>/hashes/<model>/<revision>.d/<path>.sha256: 32 bytes per segment
+// at its index, zero for one not recorded. They are synced before it
+// returns, so the segments may be marked held then. This is model-loader's
+// own file, not part of the store contract.
+func (s *Store) WriteSegmentHashes(model, revision string, fm FileManifest, first int, sums [][sha256.Size]byte) error {
+	if len(sums) == 0 {
+		return nil
+	}
+	path := s.hashesPath(model, revision, fm.Path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, 0, len(sums)*sha256.Size)
+	for _, h := range sums {
+		buf = append(buf, h[:]...)
+	}
+	_, err = f.WriteAt(buf, int64(first)*sha256.Size)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// SegmentSums returns the sha256 WriteSegmentHashes recorded for
+// segments first to first+n-1 of fm, in hex; "" for one not recorded.
+func (s *Store) SegmentSums(model, revision string, fm FileManifest, first, n int) []string {
+	out := make([]string, n)
+	f, err := os.Open(s.hashesPath(model, revision, fm.Path))
+	if err != nil {
+		return out
+	}
+	defer f.Close()
+	buf := make([]byte, n*sha256.Size)
+	got, _ := f.ReadAt(buf, int64(first)*sha256.Size)
+	var zero [sha256.Size]byte
+	for i := 0; i < n && (i+1)*sha256.Size <= got; i++ {
+		h := buf[i*sha256.Size : (i+1)*sha256.Size]
+		if !bytes.Equal(h, zero[:]) {
+			out[i] = hex.EncodeToString(h)
+		}
+	}
+	return out
+}
+
+// SegmentHashOf returns the sha256 segment i of fm must match: the
+// manifest's, the one in its state, or, for a file of small segments, the
+// one in its side file. "" if none is known.
+func (s *Store) SegmentHashOf(model, revision string, fm FileManifest, fs FileState, i int) string {
+	if h := fs.SegmentHash(fm, i); h != "" || fm.Hashed() {
+		return h
+	}
+	if fm.Small() {
+		return s.SegmentSums(model, revision, fm, i, 1)[0]
+	}
+	return ""
 }
 
 // EnsureFile makes sure the destination file for fm exists (creating parent
@@ -227,6 +345,10 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 	var errs []error
 	for _, fm := range m.Files {
 		fs := rs.FileState(fm)
+		var sums []string // a file of small segments: its side file, read once.
+		if fm.Small() && !fm.Hashed() {
+			sums = s.SegmentSums(m.Model, m.Revision, fm, 0, fm.NumSegments())
+		}
 		held := fs.Complete
 		for _, done := range fs.SegmentsDone {
 			held = held || done
@@ -256,7 +378,17 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 				continue
 			}
 			ok := false
-			if want := fs.SegmentHash(fm, i); f != nil && want != "" {
+			want := fs.SegmentHash(fm, i)
+			if sums != nil {
+				want = sums[i]
+			}
+			if want == "" && fs.Complete && fm.SHA256 != "" && f != nil {
+				// Verified whole, and no segment hash recorded (a root's
+				// whole download of a file of small segments): the
+				// whole-file check below speaks for it.
+				continue
+			}
+			if f != nil && want != "" {
 				sum, err := HashSegment(f, fm, i)
 				ok = err == nil && sum == want // an error is a short file: the segment is gone.
 			}
@@ -265,7 +397,13 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 				dropped++
 			}
 		}
-		if fs.Complete && (f == nil || (fm.NumSegments() == 0 && !wholeFileOK(f, fm))) {
+		if fs.Complete && (f == nil || ((fm.NumSegments() == 0 || (sums != nil && hasEmpty(sums))) && !wholeFileOK(f, fm))) {
+			if sums != nil && f != nil {
+				for i := range fm.NumSegments() {
+					rs.DropSegment(fm, i)
+					dropped++
+				}
+			}
 			rs.update(fm, func(fs *FileState) { fs.Complete = false })
 		}
 		if f != nil {
@@ -276,6 +414,15 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 		errs = append(errs, err)
 	}
 	return dropped, errors.Join(errs...)
+}
+
+func hasEmpty(sums []string) bool {
+	for _, h := range sums {
+		if h == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func wholeFileOK(f *os.File, fm FileManifest) bool {
@@ -292,6 +439,23 @@ func HashSegment(f *os.File, fm FileManifest, i int) (string, error) {
 		return "", fmt.Errorf("%s segment %d: %w", fm.Path, i, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// HashSegments returns the sha256 of segments first to first+n-1 of fm
+// as they are on disk, streaming each through the hash (no segment is
+// held in memory) and dropping its pages from page cache afterwards.
+func HashSegments(f *os.File, fm FileManifest, first, n int) ([][sha256.Size]byte, error) {
+	out := make([][sha256.Size]byte, n)
+	h := sha256.New()
+	for k := range n {
+		start, end := fm.SegmentBounds(first + k)
+		h.Reset()
+		if err := hashUncached(f, start, end-start, h); err != nil {
+			return nil, fmt.Errorf("%s segment %d: %w", fm.Path, first+k, err)
+		}
+		h.Sum(out[k][:0])
+	}
+	return out, nil
 }
 
 // VerifyWholeFile reports whether the file is exactly fm.Size bytes and

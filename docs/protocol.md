@@ -86,7 +86,9 @@ the origin fetches that commit. It is a hex git commit id or empty.
 A root publishes a manifest for pull-through the first time one is asked
 for, for a catalog model it does not want whole. Its files have
 `segment_size` but no `segment_sha256`. Each segment is then verified as
-described under `/blob`.
+described under `/blob`. A file the catalog gives small segments (see
+"Small segments" in `docs/design.md`) has no `segment_sha256` in any
+manifest, and its segments are verified the same way.
 
 ## `GET /segments/{model}/{revision}`
 
@@ -149,14 +151,17 @@ Request header:
   asking node. A root pulling through gives a free pull slot to the
   highest waiting priority first. Default 0.
 
-Response headers, for a request of exactly one segment that this node
-holds a sha256 for (the requester's manifest may have no `segment_sha256`
-for it, as one from a pull-through root has none):
+Response headers, for a request of whole segments, at most 256, that
+this node holds a sha256 for every one of (the requester's manifest may
+have no `segment_sha256` for them, as one from a pull-through root has
+none, and a file of small segments never has):
 
-- `X-Segment-SHA256`: the sha256 this node holds for the segment. The
-  requester checks the bytes against it.
-- `X-Segment-Trust`: how this node verified it: `manifest`, `origin` or
-  `requester`.
+- `X-Segment-SHA256`: the sha256 this node holds for each segment,
+  comma-separated, in order. The requester checks the bytes of each
+  against it. A node older than small segments sends this only for a
+  request of one segment.
+- `X-Segment-Trust`: how this node verified each, in the same order:
+  `manifest`, `origin` or `requester`.
 
 ## Local request API
 

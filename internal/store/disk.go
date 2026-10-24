@@ -101,6 +101,13 @@ func (s *Store) RemoveRevision(model, revision string, paths []string) error {
 		}
 		s.pruneDirs(filepath.Dir(s.FilePath(model, revision, p)))
 	}
+	for _, p := range paths {
+		hp := s.hashesPath(model, revision, p)
+		if err := os.Remove(hp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+		s.pruneDirs(filepath.Dir(hp))
+	}
 	for _, p := range []string{s.statePath(model, revision), s.manifestPath(model, revision)} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
@@ -114,7 +121,7 @@ func (s *Store) RemoveRevision(model, revision string, paths []string) error {
 // store's top directories.
 func (s *Store) pruneDirs(dir string) {
 	stop := map[string]bool{s.root: true}
-	for _, sub := range []string{"manifests", "models", "state"} {
+	for _, sub := range []string{"manifests", "models", "state", "hashes"} {
 		stop[filepath.Join(s.root, sub)] = true
 	}
 	for !stop[dir] && strings.HasPrefix(dir, s.root+string(filepath.Separator)) {
@@ -142,6 +149,12 @@ func (s *Store) BlockSize() int64 {
 // nothing serves the bytes once they are gone, and makes sure nothing is
 // writing the file.
 func (s *Store) FreeSegment(model, revision string, fm FileManifest, i int, lastHeld bool) error {
+	return s.FreeSegments(model, revision, fm, [][2]int{{i, i + 1}}, lastHeld)
+}
+
+// FreeSegments is FreeSegment for every segment in runs, half-open
+// ranges of segment indices, punching one hole per range.
+func (s *Store) FreeSegments(model, revision string, fm FileManifest, runs [][2]int, lastHeld bool) error {
 	path := s.FilePath(model, revision, fm.Path)
 	if lastHeld {
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -157,8 +170,18 @@ func (s *Store) FreeSegment(model, revision string, fm FileManifest, i int, last
 		return err
 	}
 	defer f.Close()
-	start, end := fm.SegmentBounds(i)
-	return punchHole(f, start, end-start)
+	var errs []error
+	for _, r := range runs {
+		if r[0] >= r[1] {
+			continue
+		}
+		start, _ := fm.SegmentBounds(r[0])
+		_, end := fm.SegmentBounds(r[1] - 1)
+		if err := punchHole(f, start, end-start); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // openRegularRW opens path for writing without following a symlink, and

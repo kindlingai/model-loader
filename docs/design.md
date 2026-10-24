@@ -71,8 +71,9 @@ partial:
   entry names every file but its excludes. A file in `ranges` is never
   excluded.
 - A model that `wanted` matches is held whole, whatever `partial` says.
-- A byte range rounds out to whole 64 MiB segments, so the manifest's
-  segment hashes verify every byte the node holds.
+- A byte range rounds out to whole segments, so a segment hash verifies
+  every byte the node holds. Segments are 64 MiB unless the catalog
+  gives a file smaller ones (see "Small segments").
 - A file the node holds only in part is a sparse file at its full size.
   Every held segment is at its original offset, so a reader can use the
   absolute offsets from the file's own index. Bytes outside held segments
@@ -81,6 +82,70 @@ partial:
   once every one of its segments is held.
 - `-verify-on-start` re-hashes every held segment of each model once when
   the process starts, and fetches again any segment that no longer matches.
+
+### Small segments
+
+A range rounds out to whole segments, and 64 MiB is far more than gr8's
+expert halves (0.2-0.8 MB). The half rule interleaves the ranks, so
+every 64 MiB of a width file holds halves of every rank, and a rank's
+halves would hold every width file in full. A catalog entry can give
+some files smaller segments:
+
+```yaml
+models:
+  - name: glm-5.3-exlr8
+    source: {type: huggingface, repo: kindlingai/glm-5.3-exlr8-k2-k3-k4}
+    revision: main
+    segment_sizes:
+      - {path: "experts/*.k?.safetensors", size: 65536}
+```
+
+- The first rule whose glob (as in `partial`) matches a file's path sets
+  its segment size: a multiple of 4 KiB from 4 KiB to 64 MiB. Other
+  files have 64 MiB segments.
+- Only a root reads the rules, when it makes the manifest; every other
+  node takes `segment_size` from the manifest. So every catalog in the
+  fleet need not agree, but a root's rules must not change for a revision
+  once its manifest is published: pin a new revision instead.
+- A file of small segments has no `segment_sha256` in the manifest (the
+  release's 821 GB of width files in 64 KiB segments would be 12 million
+  of them). Its segments are verified as pull-through ones are: a root
+  records the sha256 of each it fetched over TLS from the origin, and a
+  peer checks each it copies against the sha256 its source sends with it.
+  The whole file is checked against the origin's sha256 once every
+  segment is held, as before. A root that downloads such a file whole
+  checks it whole, and vouches for a segment by hashing it when asked.
+- With 64 KiB segments a request for one rank's halves holds about 1.3x
+  their bytes (a half is not aligned to segments, so each holds part of
+  a segment at each end).
+
+What is per segment and what is not, so a state file stays small at that
+scale:
+
+- In memory a node keeps one byte per segment for held, and one for trust
+  once any segment of the file is not `manifest`: 25 MB for 12 million
+  segments.
+- On disk the state lists held segments as runs (`held`, see "Store
+  contract for consumers") and trust as runs (`trust_runs`). One rank's
+  halves of the whole release are about 30 MB of state, which loads in
+  under a second.
+- The sha256 of each small segment is in a side file,
+  `<store>/hashes/<model>/<revision>.d/<path>.sha256`: 32 bytes per
+  segment at its index, written and synced before the segment is marked
+  held. It is model-loader's own, not part of the store contract.
+- Use times, eviction, disk reservations and in-use marks are per chunk
+  of 64 MiB, not per segment. Eviction removes the held segments of a
+  chunk that nothing pins together; a pinned segment in it stays.
+- Consecutive segments of one chunk, from the same sources, are fetched
+  as one range of at most 256 segments. A source vouches for each with
+  one sha256 per segment (see `X-Segment-SHA256` in
+  `docs/protocol.md`). A source that vouches for none (an older node)
+  is asked for the run again segment by segment.
+- A file of small segments saves its state at most once a second while
+  its segments land, and once at the end. The state on disk holds fewer
+  segments than the node does in between, never more.
+- A blob request reads what is held from the state the node keeps in
+  memory, not the state file.
 
 ### Pull-through
 
@@ -173,6 +238,7 @@ On-disk layout:
 <store>/manifests/<model>/<revision>.json
 <store>/models/<model>/<revision>/<relative-path>
 <store>/state/<model>/<revision>.json   # per-file progress: what is held
+<store>/hashes/<model>/<revision>.d/    # sha256 of small segments, per file
 <store>/requests/<name>.json            # saved local requests
 ```
 
@@ -194,9 +260,13 @@ Paths:
   /manifest`, see `docs/protocol.md`). Its `files` list every file of the
   revision, held or not, with `path`, `size` and `segment_size`.
 - `<store>/state/<model>/<revision>.json` says what is held. Its `files`
-  have, per file `path`: `complete`, `segments_done` (one bool per
-  segment) and `whole_failed`. A manifest file the state does not list is
-  not held.
+  have, per file `path`: `complete`, `held` and `whole_failed`. `held`
+  lists the held segments as half-open index ranges, sorted:
+  `[[0, 4], [9, 10]]` holds segments 0-3 and 9. A manifest file the
+  state does not list is not held. A file of 64 MiB segments also has
+  `segments_done`, one bool per segment, as before this field existed;
+  it says the same as `held`. A file of smaller segments does not have
+  it: read `held`.
 
 Manifest and state are replaced by a rename once written, so a reader
 never sees half of one.
@@ -221,9 +291,9 @@ Complete:
   then reports it `ready`.
 - A range `[offset, offset+length)` of a file is verified on disk when the
   file is complete, or when it is not `whole_failed`, every segment from
-  `offset / segment_size` to `(offset+length-1) / segment_size` has
-  `segments_done` true, and not every segment of the file does (a file with
-  every segment held is not used until its whole-file check passes). A
+  `offset / segment_size` to `(offset+length-1) / segment_size` is in
+  `held`, and not every segment of the file is (a file with every segment
+  held is not used until its whole-file check passes). A
   partial request (or `partial` entry) is ready when every one of its
   ranges and whole files is; `GET /requests/{name}` reports the same, and
   also checks the request's `xxh64`s, which a consumer reading offline
@@ -272,7 +342,7 @@ frees space until it fits: first bytes no held segment covers, in files
 nothing is writing or serving (what a failed transfer left; a segment
 counts as not held only if the saved state agrees), then held segments,
 least recently used first (a segment is used when it is fetched or served
-to a peer). Freed space is measured again, not assumed. If the fetch cannot
+to a peer; a file of small segments counts use per 64 MiB chunk). Freed space is measured again, not assumed. If the fetch cannot
 fit after freeing everything it may, the model is in error with the
 reason, and is tried again at the next tick. A root pulling through for a
 peer makes room the same way, and the segments the pull needs (its range

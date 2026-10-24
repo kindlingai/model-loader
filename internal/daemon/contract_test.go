@@ -87,10 +87,20 @@ type consumerManifest struct {
 }
 
 type consumerFile struct {
-	Path         string `json:"path"`
-	Complete     bool   `json:"complete"`
-	SegmentsDone []bool `json:"segments_done"`
-	WholeFailed  bool   `json:"whole_failed"`
+	Path        string   `json:"path"`
+	Complete    bool     `json:"complete"`
+	Held        [][2]int `json:"held"`
+	WholeFailed bool     `json:"whole_failed"`
+}
+
+// has reports whether segment i is held.
+func (f consumerFile) has(i int64) bool {
+	for _, r := range f.Held {
+		if i >= int64(r[0]) && i < int64(r[1]) {
+			return true
+		}
+	}
+	return false
 }
 
 func consumerRead(t *testing.T, storeDir, model, revision string) (consumerManifest, map[string]consumerFile) {
@@ -141,15 +151,12 @@ func consumerVerified(mf consumerManifest, files map[string]consumerFile, path s
 		if fs.Complete {
 			return true
 		}
-		all := true
-		for i := range fs.SegmentsDone {
-			all = all && fs.SegmentsDone[i]
-		}
-		if all && int64(len(fs.SegmentsDone))*f.SegmentSize >= f.Size {
+		segs := (f.Size + f.SegmentSize - 1) / f.SegmentSize
+		if len(fs.Held) == 1 && fs.Held[0][0] == 0 && int64(fs.Held[0][1]) >= segs {
 			return false // every segment held: waiting on its whole-file check.
 		}
 		for i := off / f.SegmentSize; i <= (off+n-1)/f.SegmentSize; i++ {
-			if i >= int64(len(fs.SegmentsDone)) || !fs.SegmentsDone[i] {
+			if !fs.has(i) {
 				return false
 			}
 		}

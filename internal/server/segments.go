@@ -13,6 +13,9 @@ import (
 type SegmentsResponse struct {
 	Model    string `json:"model"`
 	Revision string `json:"revision"`
+	// NodeID is the answering node's ID, as in /status. Eviction uses it
+	// to decide which of two holders keeps a segment (see docs/design.md).
+	NodeID string `json:"node_id,omitempty"`
 	// Roles are the node's roles, as in /status, so a node choosing
 	// sources can prefer a peer to a root with one request.
 	Roles []string                `json:"roles"`
@@ -89,7 +92,8 @@ func HeldRanges(done []bool) [][2]int {
 
 func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	model, revision := r.PathValue("model"), r.PathValue("revision")
-	resp := SegmentsResponse{Model: model, Revision: revision, Roles: s.status.Status().Roles, Files: map[string]FileSegments{}}
+	st := s.status.Status()
+	resp := SegmentsResponse{Model: model, Revision: revision, NodeID: st.NodeID, Roles: st.Roles, Files: map[string]FileSegments{}}
 	m, err := s.store.LoadManifest(model, revision)
 	if err != nil {
 		// No manifest: this node holds nothing of it. That is an answer,

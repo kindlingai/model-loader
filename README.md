@@ -61,7 +61,7 @@ Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes:
 ```
 cmd/model-loader/   CLI entrypoint
 internal/catalog/   desired-state parsing (catalog.yaml)
-internal/store/     local content store, manifests, integrity
+internal/store/     local content store, manifests, integrity, disk budget
 internal/source/    download sources (http, huggingface)
 internal/transfer/  resumable range-fetch engine
 internal/want/      what a node must hold: selection to needed segments

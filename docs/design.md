@@ -175,6 +175,46 @@ On-disk layout:
 <store>/state/<model>/<revision>.json   # per-file download progress, not for consumers
 ```
 
+### Disk budget and eviction
+
+GLM-5.3 and GLM-5.3-Flash together are close to the SSD size of a box.
+Spread over the boxes, with each deleting what it does not need, both fit.
+`-disk-budget` (bytes such as `3T`, or a share of the store's filesystem
+such as `85%`) sets the most the store may hold. Without one nothing is
+evicted or removed.
+
+Before a fetch, the node makes room: if the bytes it holds plus what every
+fetch in flight still has to fetch would go over the budget, it evicts
+segments, least recently used first (a segment is used when it is fetched
+or served to a peer), until the fetch fits. If it cannot fit after evicting
+everything it may, the model is in error with the reason, and is tried
+again at the next tick. A root pulling through for a peer makes room the
+same way. At every tick the node also evicts down to the budget (it may
+have been lowered) and counts what it could evict, for `/status`.
+
+A segment may be evicted only when all of these hold:
+
+- Nothing on this node wants it: no request and no selection entry names
+  it. Those pieces are pinned. If the selection cannot be worked out,
+  nothing is evicted.
+- It is not being served to a peer at that moment.
+- The fleet keeps a copy. A node that can fetch the model from its origin
+  (a root) may always evict, since the origin has it. A peer may evict only
+  a segment that a root holds, or that a peer with a lower node ID holds.
+  So of the peers holding a segment no root holds, the one with the lowest
+  ID never evicts it, and two peers evicting at once cannot both drop the
+  last copy. Each peer's `/segments` says what it holds; a peer that does
+  not answer is taken to hold nothing.
+
+An evicted segment's blocks go back to the filesystem (a hole punched in
+the file, on Linux); a file with nothing left held is removed. Eviction
+forgets only the consumer checksums over the evicted segment, so a request
+for another range of the file stays ready.
+
+Revisions the catalog no longer names are removed whole, files, state and
+manifest, at the next tick: no selection or request can name them, so
+nothing can want them.
+
 ## Network protocol
 
 Every node, root or peer, runs the same small HTTP server (see

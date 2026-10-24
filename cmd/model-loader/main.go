@@ -61,6 +61,7 @@ type config struct {
 	pullWorkers       int
 	verifyOnStart     bool
 	localListen       string
+	diskBudget        string
 }
 
 func parseFlags(args []string) (*config, error) {
@@ -80,6 +81,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous segment transfers")
 	fs.IntVar(&cfg.pullWorkers, "pull-workers", 4, "root only: maximum segments fetched from origins at once for pull-through")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
+	fs.StringVar(&cfg.diskBudget, "disk-budget", "", "most the store may hold, as bytes (500G, 2T) or a percentage of its filesystem (80%); fetches evict unwanted segments the fleet keeps copies of to stay under it. Empty: no budget, nothing evicted")
 	fs.StringVar(&cfg.localListen, "local-listen", "unix:model-loader.sock", "where to serve the local request API: unix:PATH (relative to -store) or host:port; empty to turn it off")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -164,6 +166,11 @@ func run(args []string) error {
 		return err
 	}
 
+	budget, err := store.ParseBudget(cfg.diskBudget, cfg.storeDir)
+	if err != nil {
+		return err
+	}
+
 	reqs, err := request.Open(filepath.Join(cfg.storeDir, "requests"))
 	if err != nil {
 		if reqs == nil {
@@ -192,6 +199,7 @@ func run(args []string) error {
 		PullWorkers:            cfg.pullWorkers,
 		VerifyOnStart:          cfg.verifyOnStart,
 		Requests:               reqs,
+		DiskBudget:             budget,
 	})
 
 	srv := server.New(st, d)

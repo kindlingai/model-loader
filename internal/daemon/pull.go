@@ -221,6 +221,24 @@ func (d *Daemon) Pull(ctx context.Context, name, revision, path string, start, e
 		mark(c.Offset, c.Offset+c.Length)
 		used = append(used, c)
 	}
+	rs, err := d.revState(mf)
+	if err != nil {
+		return err
+	}
+	release, err := d.makeRoom(ctx, func() int64 {
+		var n int64
+		for i, s := range segs {
+			if s && rs.SegmentTrust(fm, i) == "" {
+				start, end := fm.SegmentBounds(i)
+				n += end - start
+			}
+		}
+		return n
+	})
+	if err != nil {
+		return err
+	}
+	defer release()
 	return d.pullFile(ctx, m, mf, fm, segs, used)
 }
 

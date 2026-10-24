@@ -14,9 +14,12 @@ import (
 
 // ModelStatus is one catalog entry's state as reported by /status.
 type ModelStatus struct {
-	Model      string    `json:"model"`
-	Revision   string    `json:"revision"`
-	State      string    `json:"state"` // pending|downloading|ready|error
+	Model    string `json:"model"`
+	Revision string `json:"revision"`
+	State    string `json:"state"` // pending|downloading|partial|ready|error
+	// Selection is "partial" when this node wants only part of the
+	// revision. BytesTotal and BytesDone then count the wanted part.
+	Selection  string    `json:"selection,omitempty"`
 	BytesTotal int64     `json:"bytes_total"`
 	BytesDone  int64     `json:"bytes_done"`
 	Source     string    `json:"source,omitempty"`
@@ -29,7 +32,13 @@ const (
 	StateDownloading = "downloading"
 	StateReady       = "ready"
 	StateError       = "error"
+	// StatePartial means every piece a partial selection names is held and
+	// verified, but not the whole revision.
+	StatePartial = "partial"
 )
+
+// SelectionPartial marks a ModelStatus for a partial selection.
+const SelectionPartial = "partial"
 
 // StatusResponse is the full body of GET /status.
 type StatusResponse struct {

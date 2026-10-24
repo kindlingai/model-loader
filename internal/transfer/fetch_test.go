@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/store"
@@ -70,7 +71,7 @@ func TestFetchFileSingleFetcher(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	fetcher := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 
@@ -102,7 +103,7 @@ func TestFetchFileFallsBackOnRangeUnavailable(t *testing.T) {
 
 	empty := &fakeFetcher{content: content, ready: 0}
 	full := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty, full}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty, full}, nil); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if empty.calls == 0 {
@@ -146,7 +147,7 @@ func TestFetchFileResumesWithoutRefetchingDoneSegments(t *testing.T) {
 	rs.SetFileState(fs)
 
 	fetcher := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if fetcher.calls != fm.NumSegments()-1 {
@@ -168,7 +169,7 @@ func TestFetchFileFailsWhenNoFetcherHasRange(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	empty := &fakeFetcher{content: content, ready: 0}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty}); err == nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty}, nil); err == nil {
 		t.Fatal("expected an error when no fetcher has the range")
 	}
 }
@@ -200,7 +201,7 @@ func TestFetchFileFailsOverFromDeadSource(t *testing.T) {
 
 	dead := &deadFetcher{}
 	root := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{dead, root}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{dead, root}, nil); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if dead.calls != 1 {
@@ -230,7 +231,7 @@ func TestFetchFileZeroLength(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	fetcher := &fakeFetcher{}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if fetcher.calls != 0 {
@@ -262,7 +263,7 @@ func TestFetchFileDetectsCorruption(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	corrupt := &fakeFetcher{content: []byte("goodbye worl"), ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{corrupt}); err == nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{corrupt}, nil); err == nil {
 		t.Fatal("expected an error when the fetched bytes fail hash verification")
 	}
 }
@@ -282,7 +283,91 @@ func TestFetchFileAlreadyComplete(t *testing.T) {
 
 	// No fetchers at all: FetchFile must return immediately without trying
 	// to open anything, since the file is already marked complete.
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, nil); err != nil {
 		t.Fatalf("FetchFile on already-complete file: %v", err)
+	}
+}
+
+// A partial fetch of non-adjacent segments leaves a sparse file at full
+// size with each fetched segment at its own offset, and the rest unwritten.
+// Fetching more segments later resumes without refetching what is held,
+// and the file is checked whole and marked complete only once every
+// segment is held.
+func TestFetchFilePartialNonAdjacentSegments(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := make([]byte, 50)
+	for i := range content {
+		content[i] = byte('a' + i%26)
+	}
+	fm := buildManifestFile("w.bin", content, 10) // five segments
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	fetcher := &fakeFetcher{content: content, ready: int64(len(content))}
+
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, []bool{true, false, false, true, false}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("fetcher called %d times, want 2 (one per needed segment)", fetcher.calls)
+	}
+	got, err := os.ReadFile(st.FilePath("m", "r1", "w.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(content) {
+		t.Fatalf("file is %d bytes, want the full %d", len(got), len(content))
+	}
+	for i := range got {
+		inHeld := i < 10 || (i >= 30 && i < 40)
+		if inHeld && got[i] != content[i] {
+			t.Fatalf("byte %d = %q, want %q", i, got[i], content[i])
+		}
+		if !inHeld && got[i] != 0 {
+			t.Fatalf("byte %d = %q, want a hole (0)", i, got[i])
+		}
+	}
+	fs := rs.FileState(fm)
+	if fs.Complete || !reflect.DeepEqual(fs.SegmentsDone, []bool{true, false, false, true, false}) {
+		t.Fatalf("state = %+v, want segments 0 and 3 done, not complete", fs)
+	}
+
+	// A restart: state comes back from disk, and the rest is needed now.
+	rs, err = st.LoadState(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetcher.calls = 0
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
+		t.Fatalf("FetchFile (rest): %v", err)
+	}
+	if fetcher.calls != 3 {
+		t.Fatalf("fetcher called %d times on resume, want 3 (only the missing segments)", fetcher.calls)
+	}
+	if !rs.FileState(fm).Complete {
+		t.Fatal("file not complete once every segment is held")
+	}
+	if got, _ := os.ReadFile(st.FilePath("m", "r1", "w.bin")); !bytes.Equal(got, content) {
+		t.Fatal("file content mismatch after resume")
+	}
+}
+
+// A need that is already held fetches nothing, even with no sources.
+func TestFetchFilePartialAlreadyHeld(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("z"), 30)
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	fs := rs.FileState(fm)
+	fs.SegmentsDone[1] = true
+	rs.SetFileState(fs)
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, []bool{false, true, false}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
 	}
 }

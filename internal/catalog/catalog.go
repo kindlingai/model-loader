@@ -124,7 +124,21 @@ func (c *Catalog) Validate() error {
 // materialize. The catalog is fleet-wide; disk is not, so a node opts in to
 // a subset (or "*" for all of it).
 type Selection struct {
+	// Wanted names whole models by name glob.
 	Wanted []string `yaml:"wanted"`
+	// Partial names parts of models. A model Wanted also matches is held
+	// whole.
+	Partial []Pieces `yaml:"partial,omitempty"`
+}
+
+// Validate checks every partial entry.
+func (s *Selection) Validate() error {
+	for i, p := range s.Partial {
+		if err := p.Validate(); err != nil {
+			return fmt.Errorf("selection: partial entry %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // LoadSelection reads a node's local selection file.
@@ -139,6 +153,9 @@ func LoadSelection(path string) (*Selection, error) {
 	var s Selection
 	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("parse selection: %w", err)
+	}
+	if err := s.Validate(); err != nil {
+		return nil, err
 	}
 	return &s, nil
 }

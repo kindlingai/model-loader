@@ -26,11 +26,17 @@ Returns this node's view of every catalog entry it is tracking.
 }
 ```
 
-`state` is one of `pending`, `downloading`, `ready`, `error`. A consumer
-waiting for a model to be usable polls this endpoint (or the equivalent
-init-container pattern) for `state == "ready"` on the revision it needs,
-the same contract home-ops's `wait-model` init containers use today against
-`catalog-status.json` — just reachable over HTTP instead of a shared mount.
+`state` is one of `pending`, `downloading`, `partial`, `ready`, `error`. A
+consumer waiting for a model to be usable polls this endpoint (or the
+equivalent init-container pattern) for `state == "ready"` on the revision it
+needs, the same contract home-ops's `wait-model` init containers use today
+against `catalog-status.json` — just reachable over HTTP instead of a shared
+mount.
+
+A model the node's selection names only in part has `"selection":
+"partial"`. Its `bytes_total` and `bytes_done` count the wanted segments,
+not the whole revision. Once every wanted piece is held and verified its
+`state` is `partial`, not `ready`: `ready` always means the whole revision.
 
 ## `GET /manifest/{model}/{revision}`
 

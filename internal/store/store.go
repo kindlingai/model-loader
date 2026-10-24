@@ -164,6 +164,55 @@ func VerifySegment(f *os.File, fm FileManifest, i int) (bool, error) {
 	return hex.EncodeToString(h.Sum(nil)) == fm.SegmentSHA256[i], nil
 }
 
+// Reverify hashes every segment rs records as done against m, and marks
+// any that no longer match (or whose file is gone) as not done, along with
+// its file's completeness, so the next fetch gets it again. It saves rs and
+// returns how many segments it dropped.
+func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
+	dropped := 0
+	for _, fm := range m.Files {
+		fs := rs.FileState(fm)
+		held := fs.Complete
+		for _, done := range fs.SegmentsDone {
+			held = held || done
+		}
+		if !held {
+			continue
+		}
+		f, err := os.Open(s.FilePath(m.Model, m.Revision, fm.Path))
+		if err != nil && !os.IsNotExist(err) {
+			return dropped, err
+		}
+		for i, done := range fs.SegmentsDone {
+			if !done {
+				continue
+			}
+			ok := false
+			if f != nil {
+				if ok, err = VerifySegment(f, fm, i); err != nil {
+					ok = false // a short file: the segment is gone.
+				}
+			}
+			if !ok {
+				fs.SegmentsDone[i], fs.Complete = false, false
+				dropped++
+			}
+		}
+		if f != nil && fs.Complete && fm.NumSegments() == 0 {
+			if ok, err := VerifyWholeFile(f, fm); err != nil || !ok {
+				fs.Complete = false
+			}
+		}
+		if f == nil {
+			fs.Complete = false
+		} else {
+			f.Close()
+		}
+		rs.SetFileState(fs)
+	}
+	return dropped, s.SaveState(rs)
+}
+
 // VerifyWholeFile reports whether the file is exactly fm.Size bytes and
 // matches the manifest's whole-file hash. It is the final authority on
 // correctness, used once every segment is believed done. Pages are dropped

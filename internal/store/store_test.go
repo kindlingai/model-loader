@@ -224,3 +224,60 @@ func TestEnsureFileTruncatesToSize(t *testing.T) {
 		t.Fatalf("size = %d, want 4096", info.Size())
 	}
 }
+
+// Reverify drops a held segment whose bytes on disk no longer match, and
+// keeps the rest.
+func TestReverifyDropsCorruptSegment(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("q"), 30)
+	m := &Manifest{Model: "m", Revision: "r1", Files: []FileManifest{{Path: "w.bin", Size: 30, SegmentSize: 10}}}
+	if err := m.BuildSegmentHashes(func(string) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(content)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if m.Files[0].NumSegments() != 3 {
+		t.Fatalf("NumSegments = %d, want 3 (BuildSegmentHashes keeps a preset SegmentSize)", m.Files[0].NumSegments())
+	}
+	f, err := s.EnsureFile("m", "r1", m.Files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(content, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("X"), 15); err != nil { // corrupt segment 1
+		t.Fatal(err)
+	}
+	f.Close()
+	rs := NewRevisionState(m)
+	fs := rs.FileState(m.Files[0])
+	fs.SegmentsDone = []bool{true, true, true}
+	fs.Complete = true
+	rs.SetFileState(fs)
+
+	dropped, err := s.Reverify(m, rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1", dropped)
+	}
+	got, err := s.LoadState(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs := got.FileState(m.Files[0]); fs.Complete || fs.SegmentsDone[0] != true || fs.SegmentsDone[1] != false || fs.SegmentsDone[2] != true {
+		t.Fatalf("saved state = %+v, want only segment 1 dropped and not complete", fs)
+	}
+
+	if err := os.Remove(s.FilePath("m", "r1", "w.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if dropped, err := s.Reverify(m, got); err != nil || dropped != 2 {
+		t.Fatalf("Reverify of a deleted file = %d, %v; want 2 dropped", dropped, err)
+	}
+}

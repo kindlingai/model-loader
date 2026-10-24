@@ -57,6 +57,14 @@ func (f FileManifest) SegmentBounds(i int) (start, end int64) {
 	return start, end
 }
 
+// SegmentIndex returns the segment that holds byte off.
+func (f FileManifest) SegmentIndex(off int64) int {
+	if f.SegmentSize <= 0 {
+		return 0
+	}
+	return int(off / f.SegmentSize)
+}
+
 // Manifest describes every file in a model revision.
 type Manifest struct {
 	Model    string         `json:"model"`
@@ -84,9 +92,11 @@ func (m *Manifest) Find(path string) (FileManifest, bool) {
 }
 
 // BuildSegmentHashes computes SegmentSHA256 for every file by reading it
-// from disk at root. When openFile returns an *os.File, each segment is dropped from page cache
-// as soon as it is hashed, so hashing a multi-hundred-GB model keeps at most
-// one segment resident.
+// from disk at root, in segments of each file's SegmentSize, or
+// DefaultSegmentSize where that is not set. When openFile returns an
+// *os.File, each segment is dropped from page cache as soon as it is
+// hashed, so hashing a multi-hundred-GB model keeps at most one segment
+// resident.
 func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadCloser, error)) error {
 	for i := range m.Files {
 		f := &m.Files[i]
@@ -98,7 +108,10 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 		if file, ok := rc.(*os.File); ok {
 			hashed = func(off, n int64) error { return Uncache(file, off, n) }
 		}
-		hashes, whole, err := hashSegments(rc, f.Size, DefaultSegmentSize, hashed)
+		if f.SegmentSize <= 0 {
+			f.SegmentSize = DefaultSegmentSize
+		}
+		hashes, whole, err := hashSegments(rc, f.Size, f.SegmentSize, hashed)
 		closeErr := rc.Close()
 		if err != nil {
 			return fmt.Errorf("hash %s: %w", f.Path, err)
@@ -106,7 +119,6 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 		if closeErr != nil {
 			return fmt.Errorf("close %s: %w", f.Path, closeErr)
 		}
-		f.SegmentSize = DefaultSegmentSize
 		f.SegmentSHA256 = hashes
 		f.SHA256 = whole
 	}

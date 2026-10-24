@@ -64,6 +64,7 @@ internal/catalog/   desired-state parsing (catalog.yaml)
 internal/store/     local content store, manifests, integrity
 internal/source/    download sources (http, huggingface)
 internal/transfer/  resumable range-fetch engine
+internal/want/      what a node must hold: selection to needed segments
 internal/discovery/ peer discovery backends (static, k8s DNS)
 internal/server/    LAN-facing HTTP server (status/manifest/blob)
 internal/daemon/    reconcile loop tying it together

@@ -294,14 +294,15 @@ answer:
   (`GET /status` on its HTTP side port, `-mentat-url`, default
   `http://127.0.0.1:6380`) instead of reinventing discovery; that daemon
   already solves LAN peer discovery there. Every box mentatd holds alive is
-  a peer, at `-mentat-port` on its `link_ip` (the address mentatd's
-  working link to it uses, so this box can reach it), else its `node_ip`,
-  else the first IP in its `addrs`. Every box is taken to run model-loader
+  a peer, at `-mentat-port` on the first of its addresses that takes a
+  connection there: its `link_ip` (the address mentatd's working link to
+  it uses), its `node_ip`, then its `addrs`. The choice is kept for 30 s. Every box is taken to run model-loader
   on the same port; reading each box's port from a record it publishes
   through mentat waits on kindlingai/mentat#4. `-peers` adds boxes that run
   no mentatd, such as a NAS root. Callers that overlap share one `/status`
-  fetch, and its answer serves for a second, so a box mentatd finds dead
-  drops out within about a second.
+  fetch, and its answer serves for a second after it arrives, so a box
+  mentatd finds dead drops out within a second plus a fetch's time (at
+  most 5 s).
 
 ## RAM minimization
 

@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -25,7 +26,7 @@ const mentatStatusJSON = `{
     "cccccccccc": {"node_ip": "10.0.0.3", "link_ip": "10.0.0.3", "alive": true, "stale": true, "http_port": 6380, "groups": null},
     "bbbbbbbbbb": {"node_ip": "172.16.0.2", "link_ip": "10.0.0.2", "addrs": ["172.16.0.2", "10.0.0.2"], "alive": true, "stale": false, "probes": {}},
     "dddddddddd": {"node_ip": "10.0.0.4", "link_ip": "10.0.0.4", "alive": false, "dead_since_ms": 1},
-    "eeeeeeeeee": {"node_ip": "", "link_ip": "", "addrs": ["not-an-ip", "10.0.0.5"], "alive": true},
+    "eeeeeeeeee": {"node_ip": "", "link_ip": "", "addrs": ["not a host", "10.0.0.5"], "alive": true},
     "ffffffffff": {"node_ip": "fd00::6", "link_ip": "", "alive": true},
     "gggggggggg": {"node_ip": "", "link_ip": "", "addrs": [], "alive": true},
     "hhhhhhhhhh": {"node_ip": "10.0.0.8", "link_ip": "10.0.0.2", "alive": true},
@@ -49,13 +50,61 @@ func fakeMentatd(t *testing.T, status int, body string) string {
 	return ts.URL
 }
 
+// newMentat returns a Mentat for url whose probes connect to nothing, so
+// each box is at its first candidate.
 func newMentat(t *testing.T, url string) *Mentat {
 	t.Helper()
 	m, err := NewMentat(url, 7762)
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.dial = dialOnly(nil)
 	return m
+}
+
+// dialOnly returns a dial that connects only to the addresses in ok, and
+// counts the attempts in tries.
+func dialOnly(ok map[string]bool) func(string, string, time.Duration) (net.Conn, error) {
+	return func(_, addr string, _ time.Duration) (net.Conn, error) {
+		if ok[addr] {
+			a, b := net.Pipe()
+			b.Close()
+			return a, nil
+		}
+		return nil, errors.New("refused")
+	}
+}
+
+// A box mentatd reaches over one address but that runs model-loader on
+// another is reached at the first candidate that takes a connection:
+// link_ip, node_ip, then addrs. The choice is kept for probeTTL, unless
+// the candidates change.
+func TestMentatFallback(t *testing.T) {
+	body := `{"node_id": "a", "peers": {"x": {"link_ip": "[fd00::9]", "node_ip": "10.9.9.9", "addrs": ["spark-9", "10.9.9.10", "::ffff:10.9.9.9"], "alive": true}}}`
+	m := newMentat(t, fakeMentatd(t, http.StatusOK, body))
+	var tries atomic.Int32
+	reach := dialOnly(map[string]bool{"10.9.9.10:7762": true})
+	m.dial = func(n, addr string, d time.Duration) (net.Conn, error) {
+		tries.Add(1)
+		return reach(n, addr, d)
+	}
+	want := []Peer{{Addr: "10.9.9.10:7762"}}
+	for range 2 {
+		got, err := m.Peers(context.Background())
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("Peers = %v, %v; want %v", got, err, want)
+		}
+		m.mu.Lock()
+		m.at = time.Time{} // fetch again; the probe stays
+		m.mu.Unlock()
+	}
+	// fd00::9, 10.9.9.9 and spark-9 refused, 10.9.9.10 taken; once.
+	if n := tries.Load(); n != 4 {
+		t.Fatalf("%d connection attempts, want 4", n)
+	}
+	if got := (mentatPeer{LinkIP: "[fd00::9]", NodeIP: "::ffff:10.9.9.9", Addrs: []string{"10.9.9.9", "bad host", "0.0.0.0", "spark-9"}}).candidates(); !reflect.DeepEqual(got, []string{"fd00::9", "10.9.9.9", "spark-9"}) {
+		t.Fatalf("candidates = %v", got)
+	}
 }
 
 func TestMentatPeers(t *testing.T) {
@@ -105,7 +154,8 @@ func TestMentatAlone(t *testing.T) {
 }
 
 func TestNewMentatRejects(t *testing.T) {
-	for _, u := range []string{"", "127.0.0.1:6380", "ftp://127.0.0.1", "http://", "http:///status", "http://h/?x=1", "::"} {
+	for _, u := range []string{"", "127.0.0.1:6380", "ftp://127.0.0.1", "http://", "http:///status", "http://h/?x=1", "::",
+		"http://127.0.0.1:65536", "http://127.0.0.1:0", "http://h:6380?", "http://u@h:6380", "http://h#x"} {
 		if _, err := NewMentat(u, 7762); err == nil {
 			t.Errorf("NewMentat(%q) accepted", u)
 		}
@@ -115,8 +165,15 @@ func TestNewMentatRejects(t *testing.T) {
 			t.Errorf("NewMentat port %d accepted", port)
 		}
 	}
-	if _, err := NewMentat("https://[fd00::1]:6380/", 7762); err != nil {
-		t.Errorf("NewMentat with an IPv6 host: %v", err)
+	for in, want := range map[string]string{
+		"https://[fd00::1]:6380/": "https://[fd00::1]:6380/status",
+		"http://h:6380/base/":     "http://h:6380/base/status",
+		"http://h":                "http://h/status",
+	} {
+		m, err := NewMentat(in, 7762)
+		if err != nil || m.statusURL != want {
+			t.Errorf("NewMentat(%q): %v, status URL %v; want %s", in, err, m, want)
+		}
 	}
 }
 

@@ -112,9 +112,8 @@ or range outside the manifest, is ignored, as is any answer over 16 MiB.
 Here the node holds segments 0-3 and 9 of a 12-segment file. `node_id` and
 `roles` are the node's, as in `/status`; eviction uses both to decide which
 node keeps a segment. `cataloged` says whether the node's catalog names the
-revision; a node removes a revision its catalog dropped only once every
-peer says `false` here (see "Disk budget and eviction" in
-`docs/design.md`). A fetching node asks every peer once per reconcile pass
+revision: a root's copy lets a peer evict its own only while it is `true`
+(see "Disk budget and eviction" in `docs/design.md`). A fetching node asks every peer once per reconcile pass
 and prefers plain peers that hold a segment to roots that hold it.
 
 ## `GET /blob/{model}/{revision}/{path}`

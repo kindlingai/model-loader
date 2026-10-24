@@ -105,9 +105,11 @@ type Daemon struct {
 	diskMu   sync.Mutex              // serializes making room and evicting
 	reserved map[string]*reservation // room held for fetches; diskMu guards
 	pinMu    sync.Mutex              // orders request changes and eviction
-	useMu    sync.Mutex              // guards serving
-	serving  map[string]int          // segments being served; see useKey
-	onPass   func()                  // tests: called as each Run pass starts
+	bsOnce   sync.Once               // see blockSize
+	bs       int64
+	useMu    sync.Mutex     // guards serving
+	serving  map[string]int // segments being served; see useKey
+	onPass   func()         // tests: called as each Run pass starts
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
@@ -411,7 +413,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		if fn := need.Files[fm.Path]; fn != nil {
 			for i, n := range fn.Segments {
 				if n && rs.SegmentTrust(fm, i) == "" {
-					needs = append(needs, segmentNeed(manifest, rs, fm, i))
+					needs = append(needs, segmentNeed(manifest, rs, fm, i, d.blockSize()))
 				}
 			}
 		}

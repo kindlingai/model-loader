@@ -46,10 +46,19 @@ import (
 //     never evicts it, so two peers evicting at once cannot both drop the
 //     last copy. A peer that does not answer is taken to hold nothing.
 //
-// A revision the catalog no longer names is removed whole, once nothing
-// on this node names it (a saved request or a selection entry may still),
-// and every peer says its own catalog no longer names it either: a node
-// whose catalog still does may be counting on this node's copy.
+// A revision the catalog no longer names, and that no saved request or
+// selection entry here names either, is retired: at every tick its
+// segments are evicted, whatever the budget, by the same fleet rule
+// except that no node can fetch it again, roots included. So a node drops
+// a retired segment only if a node with a lower ID holds it, and the
+// lowest-ID holder keeps one copy until it is removed by hand: another
+// node's catalog may still name it, and with discovery that may miss
+// nodes, no node can tell that every catalog in the fleet dropped it.
+// Once nothing of it is held here, its files, state and manifest go.
+//
+// For the same reason a root's copy counts for a peer only while the
+// root's catalog names the revision (cataloged in /segments): a root that
+// dropped it from its catalog can no longer fetch it again.
 //
 // Without a budget nothing is evicted or removed.
 
@@ -68,17 +77,31 @@ type spaceNeed struct {
 }
 
 // segmentNeed is the room segment i of fm needs until it is held.
-func segmentNeed(mf *store.Manifest, rs *store.RevisionState, fm store.FileManifest, i int) spaceNeed {
+// It is counted in the filesystem blocks the segment touches, bs bytes
+// each, as the store's use is.
+func segmentNeed(mf *store.Manifest, rs *store.RevisionState, fm store.FileManifest, i int, bs int64) spaceNeed {
 	start, end := fm.SegmentBounds(i)
+	blocks := roundUp(end, bs) - start/bs*bs
 	return spaceNeed{
 		key: useKey(mf.Model, mf.Revision, fm.Path, i),
 		remaining: func() int64 {
 			if rs.SegmentTrust(fm, i) != "" {
 				return 0
 			}
-			return end - start
+			return blocks
 		},
 	}
+}
+
+// roundUp rounds n up to a multiple of bs.
+func roundUp(n, bs int64) int64 {
+	return (n + bs - 1) / bs * bs
+}
+
+// blockSize returns the store's filesystem block size, looked up once.
+func (d *Daemon) blockSize() int64 {
+	d.bsOnce.Do(func() { d.bs = d.cfg.Store.BlockSize() })
+	return d.bs
 }
 
 // victim is a held segment eviction may remove.
@@ -101,11 +124,13 @@ func (d *Daemon) makeRoom(ctx context.Context, needs []spaceNeed) (func(), error
 	}
 	d.diskMu.Lock()
 	defer d.diskMu.Unlock()
+	joined := true
 	for _, n := range needs {
 		r := d.reserved[n.key]
 		if r == nil {
 			r = &reservation{remaining: n.remaining}
 			d.reserved[n.key] = r
+			joined = false
 		}
 		r.refs++
 	}
@@ -117,6 +142,18 @@ func (d *Daemon) makeRoom(ctx context.Context, needs []spaceNeed) (func(), error
 				}
 			}
 		}
+	}
+	done := func() {
+		d.diskMu.Lock()
+		defer d.diskMu.Unlock()
+		release()
+	}
+	if joined {
+		// Every segment is being fetched already, and was let in: the
+		// bytes it wrote so far are in the store's use and its whole
+		// length is still reserved, so checking again would count them
+		// twice.
+		return done, nil
 	}
 	used, need, err := d.measureLocked()
 	if err == nil && used+need > d.cfg.DiskBudget {
@@ -132,11 +169,7 @@ func (d *Daemon) makeRoom(ctx context.Context, needs []spaceNeed) (func(), error
 		release()
 		return nil, fmt.Errorf("disk budget: %d bytes on disk and %d to fetch, over the budget of %d bytes; nothing more may be evicted", used, need, d.cfg.DiskBudget)
 	}
-	return func() {
-		d.diskMu.Lock()
-		defer d.diskMu.Unlock()
-		release()
-	}, nil
+	return done, nil
 }
 
 // measureLocked returns the store's use and what every reservation still
@@ -194,7 +227,11 @@ func (d *Daemon) freeLocked(ctx context.Context) {
 
 // reclaimLocked frees, in every file nothing is writing, the space under
 // segments not held: what a transfer wrote before it failed, or a hole
-// punch that failed before. d.diskMu is held.
+// punch that failed before. A segment counts as not held only if neither
+// the state in memory nor the one saved says it is: one whose drop was
+// not saved would be held again after a restart. A segment being served
+// is left alone, as the reader may have its bytes still to send.
+// d.diskMu is held.
 func (d *Daemon) reclaimLocked() {
 	refs, err := d.cfg.Store.Revisions()
 	if err != nil {
@@ -209,15 +246,19 @@ func (d *Daemon) reclaimLocked() {
 		if err != nil {
 			continue
 		}
+		saved, err := d.cfg.Store.LoadState(mf)
+		if err != nil {
+			continue
+		}
 		for _, fm := range mf.Files {
 			if d.cfg.Store.FileAllocated(mf.Model, mf.Revision, fm.Path) == 0 {
 				continue
 			}
 			d.useMu.Lock()
 			if d.serving[useKey(mf.Model, mf.Revision, fm.Path, fileUse)] == 0 {
-				done := rs.FileState(fm).SegmentsDone
 				for i := range fm.NumSegments() {
-					if i >= len(done) || !done[i] {
+					if rs.SegmentTrust(fm, i) == "" && saved.SegmentTrust(fm, i) == "" &&
+						d.serving[useKey(mf.Model, mf.Revision, fm.Path, i)] == 0 {
 						_ = d.cfg.Store.FreeSegment(mf.Model, mf.Revision, fm, i, false)
 					}
 				}
@@ -227,15 +268,15 @@ func (d *Daemon) reclaimLocked() {
 	}
 }
 
-// diskPass runs at every reconcile tick: with a budget, it removes the
-// revisions nothing names any more, frees space down to the budget (it
+// diskPass runs at every reconcile tick: with a budget, it evicts what
+// it may of retired revisions, frees space down to the budget (it
 // may have been lowered), and counts what could be evicted, for /status.
 func (d *Daemon) diskPass(ctx context.Context) {
-	if d.cfg.DiskBudget > 0 {
-		d.removeOld(ctx)
-	}
 	d.diskMu.Lock()
 	defer d.diskMu.Unlock()
+	if d.cfg.DiskBudget > 0 {
+		d.retireLocked(ctx)
+	}
 	if d.cfg.DiskBudget > 0 && !d.fitsLocked() {
 		d.freeLocked(ctx)
 	}
@@ -440,8 +481,9 @@ func (d *Daemon) askPeers(ctx context.Context, model, revision string, mf *store
 }
 
 // fleetKeeps returns whether another node keeps a copy of segment i of a
-// file, so this node may drop its own: a root holds it, or a peer with a
-// lower node ID does.
+// file, so this node may drop its own: a root whose catalog names the
+// revision (so it can fetch it again) holds it, or a node with a lower ID
+// does.
 func (d *Daemon) fleetKeeps(answers []*server.SegmentsResponse) func(path string, i int) bool {
 	return func(path string, i int) bool {
 		for _, a := range answers {
@@ -452,7 +494,24 @@ func (d *Daemon) fleetKeeps(answers []*server.SegmentsResponse) func(path string
 			if !ok || !fs.Has(i) {
 				continue
 			}
-			if a.IsRoot() || (a.NodeID != "" && a.NodeID < d.cfg.NodeID) {
+			if (a.IsRoot() && (a.Cataloged == nil || *a.Cataloged)) || (a.NodeID != "" && a.NodeID < d.cfg.NodeID) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// lowerHolds returns whether a node with a lower ID than this one holds
+// segment i of a file: the rule for retired revisions, which no node can
+// fetch again.
+func (d *Daemon) lowerHolds(answers []*server.SegmentsResponse) func(path string, i int) bool {
+	return func(path string, i int) bool {
+		for _, a := range answers {
+			if a == nil || a.NodeID == "" || a.NodeID >= d.cfg.NodeID {
+				continue
+			}
+			if fs, ok := a.Files[path]; ok && fs.Has(i) {
 				return true
 			}
 		}
@@ -488,35 +547,68 @@ func (d *Daemon) evict(v victim) (bool, error) {
 	return true, d.cfg.Store.FreeSegment(v.mf.Model, v.mf.Revision, v.fm, v.i, last)
 }
 
-// removeOld removes every revision the catalog does not name, once
-// nothing on this node names it either and every peer says its catalog
-// does not name it.
-func (d *Daemon) removeOld(ctx context.Context) {
+// retireLocked evicts what it may of every retired revision (see the
+// top of this file), and removes one once nothing of it is held here.
+// d.diskMu is held.
+func (d *Daemon) retireLocked(ctx context.Context) {
 	refs, err := d.cfg.Store.Revisions()
 	if err != nil {
 		log.Printf("model-loader: list revisions: %v", err)
 		return
 	}
 	for _, ref := range refs {
-		if _, ok := d.catalogModel(ref.Model, ref.Revision); ok || d.namedLocally(ref) {
+		if d.Cataloged(ref.Model, ref.Revision) || d.namedLocally(ref) {
 			continue
 		}
-		if !d.fleetRetired(d.askPeers(ctx, ref.Model, ref.Revision, nil)) {
+		mf, err := d.cfg.Store.LoadManifest(ref.Model, ref.Revision)
+		if err != nil {
+			continue // a download that never finished; see below.
+		}
+		rs, err := d.revState(mf)
+		if err != nil {
 			continue
 		}
-		d.pinMu.Lock()
-		d.useMu.Lock()
-		if !d.namedLocally(ref) && !d.revisionInUseLocked(ref) {
-			if err := d.cfg.Store.RemoveRevision(ref.Model, ref.Revision); err != nil {
-				log.Printf("model-loader: remove old revision %s@%s: %v", ref.Model, ref.Revision, err)
-			} else {
-				log.Printf("model-loader: removed %s@%s: no catalog in the fleet names it", ref.Model, ref.Revision)
-				d.stateMu.Lock()
-				delete(d.states, want.Key(ref.Model, ref.Revision))
-				d.stateMu.Unlock()
+		lower := d.lowerHolds(d.askPeers(ctx, ref.Model, ref.Revision, mf))
+		d.pinMu.Lock() // see freeLocked
+		if d.namedLocally(ref) {
+			d.pinMu.Unlock()
+			continue
+		}
+		held := false
+		for _, fm := range mf.Files {
+			for i, h := range rs.FileState(fm).SegmentsDone {
+				if !h || i >= fm.NumSegments() {
+					continue
+				}
+				v := victim{mf: mf, rs: rs, fm: fm, i: i}
+				dropped := false
+				if lower(fm.Path, i) {
+					var err error
+					if dropped, err = d.evict(v); err != nil {
+						log.Printf("model-loader: evict retired %s@%s %s segment %d: %v", ref.Model, ref.Revision, fm.Path, i, err)
+					}
+				}
+				held = held || !dropped
 			}
 		}
-		d.useMu.Unlock()
+		if !held {
+			d.useMu.Lock()
+			if !d.revisionInUseLocked(ref) {
+				var paths []string
+				for _, fm := range mf.Files {
+					paths = append(paths, fm.Path)
+				}
+				if err := d.cfg.Store.RemoveRevision(ref.Model, ref.Revision, paths); err != nil {
+					log.Printf("model-loader: remove retired %s@%s: %v", ref.Model, ref.Revision, err)
+				} else {
+					log.Printf("model-loader: removed retired %s@%s: nothing of it is held here", ref.Model, ref.Revision)
+					d.stateMu.Lock()
+					delete(d.states, want.Key(ref.Model, ref.Revision))
+					d.stateMu.Unlock()
+				}
+			}
+			d.useMu.Unlock()
+		}
 		d.pinMu.Unlock()
 	}
 }
@@ -538,10 +630,8 @@ func (d *Daemon) namedLocally(ref store.RevisionRef) bool {
 	if sel == nil {
 		return false
 	}
-	for _, name := range sel.Wanted {
-		if name == ref.Model {
-			return true
-		}
+	if sel.Matches(ref.Model) {
+		return true
 	}
 	for _, p := range sel.Partial {
 		if p.Model == ref.Model && (p.Revision == "" || p.Revision == ref.Revision) {

@@ -232,7 +232,7 @@ func (d *Daemon) Pull(ctx context.Context, name, revision, path string, start, e
 	var needs []spaceNeed
 	for i, s := range segs {
 		if s && rs.SegmentTrust(fm, i) == "" {
-			needs = append(needs, segmentNeed(mf, rs, fm, i))
+			needs = append(needs, segmentNeed(mf, rs, fm, i, d.blockSize()))
 		}
 	}
 	release, err := d.makeRoom(ctx, needs)

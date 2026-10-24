@@ -17,8 +17,9 @@ type SegmentsResponse struct {
 	// to decide which of two holders keeps a segment (see docs/design.md).
 	NodeID string `json:"node_id,omitempty"`
 	// Cataloged says whether the answering node's catalog names the
-	// revision; nil from a node too old to say. A node removes a revision
-	// its catalog dropped only once every peer says false here.
+	// revision; nil from a node too old to say. A root's copy lets a peer
+	// evict its own only while this is not false: a root whose catalog
+	// dropped the revision cannot fetch it again.
 	Cataloged *bool `json:"cataloged,omitempty"`
 	// Roles are the node's roles, as in /status, so a node choosing
 	// sources can prefer a peer to a root with one request.

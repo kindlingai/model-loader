@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -100,10 +101,29 @@ func TestEvictSegment(t *testing.T) {
 	if refs, _ := st.Revisions(); len(refs) != 1 || refs[0] != (RevisionRef{"m", "refs/pr/1"}) {
 		t.Fatalf("Revisions = %v", refs)
 	}
-	if err := st.RemoveRevision(m.Model, m.Revision); err != nil {
+	// Removing revision "refs" leaves "refs/pr/1", under its directory.
+	outer := &Manifest{Model: "m", Revision: "refs", Files: []FileManifest{{Path: "o", Size: 1, SegmentSize: seg}}}
+	st.SaveManifest(outer)
+	of, _ := st.EnsureFile("m", "refs", outer.Files[0])
+	of.Close()
+	inner, _ := st.EnsureFile(m.Model, m.Revision, fm)
+	inner.Close()
+	if err := st.RemoveRevision("m", "refs", []string{"o"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(st.FilePath(m.Model, m.Revision, "f")); err != nil {
+		t.Fatalf("removing m@refs removed m@refs/pr/1: %v", err)
+	}
+	if refs, _ := st.Revisions(); len(refs) != 1 || refs[0].Revision != "refs/pr/1" {
+		t.Fatalf("Revisions = %v, want only refs/pr/1", refs)
+	}
+	if err := st.RemoveRevision(m.Model, m.Revision, []string{"f"}); err != nil {
 		t.Fatal(err)
 	}
 	if refs, _ := st.Revisions(); len(refs) != 0 {
 		t.Fatalf("Revisions after remove = %v", refs)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(st.root, "models")); len(entries) != 0 {
+		t.Fatalf("directories left under models: %v", entries)
 	}
 }

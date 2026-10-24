@@ -188,11 +188,15 @@ filesystem allocated to them. So it counts what is really on disk, bytes a
 failed transfer wrote included, and holds across restarts.
 
 Before a fetch, the node reserves room for every segment it still has to
-fetch (fetches of the same segment share one reservation; a root's
-download from its origin reserves the whole revision before it writes).
+fetch, counted in the filesystem blocks it touches. Fetches of the same
+segment share one reservation, and one that joins a fetch already let in
+is not checked again. A root's download from its origin reserves what of
+the revision is not on disk yet before it writes; a file whose progress
+does not hold is started over, and its old bytes freed, first.
 If the store's use plus every reservation would go over the budget, it
 frees space until it fits: first bytes no held segment covers, in files
-nothing is writing (what a failed transfer left), then held segments,
+nothing is writing or serving (what a failed transfer left; a segment
+counts as not held only if the saved state agrees), then held segments,
 least recently used first (a segment is used when it is fetched or served
 to a peer). Freed space is measured again, not assumed. If the fetch cannot
 fit after freeing everything it may, the model is in error with the
@@ -212,7 +216,8 @@ A segment may be evicted only when all of these hold:
 - Nothing is serving it to a peer, nor writing its file, at that moment.
 - The fleet keeps a copy. A node that can fetch the model from its origin
   (a root) may always evict, since the origin has it. A peer may evict only
-  a segment that a root holds, or that a peer with a lower node ID holds.
+  a segment that a root whose catalog names the revision holds (`cataloged`
+  in `/segments`), or that a node with a lower ID holds.
   So of the peers holding a segment no root holds, the one with the lowest
   ID never evicts it, and two peers evicting at once cannot both drop the
   last copy. Each peer's `/segments` says what it holds; a peer that does
@@ -224,14 +229,17 @@ with nothing left held is removed. Eviction forgets only the consumer
 checksums over the evicted segment, so a request for another range of the
 file stays ready.
 
-A revision the catalog no longer names is removed whole, files, state and
-manifest, at a tick when all of these hold: no saved request and no
-selection entry on this node names it, nothing is serving it, and every
-peer answers that its own catalog does not name it either (`cataloged` in
-`/segments`). A node whose catalog still names it may be counting on this
-node's copy, as the lowest-ID holder, so a catalog change takes effect on
-disk only once it has reached the whole fleet. Without a budget nothing is
-evicted or removed.
+A revision the catalog no longer names, and that no saved request or
+selection entry on this node names, is retired. At every tick, with a
+budget, its segments are evicted by the same fleet rule, except that no
+node can fetch it again, roots included: a node drops a retired segment
+only if a node with a lower ID holds it. Once nothing of it is held its
+files, state and manifest are removed (only its own files: a revision
+named `refs/pr/1` lives under the directory of one named `refs`). So the
+lowest-ID holder keeps one copy of a retired revision, until removed by
+hand: another node's catalog may still name it, and as discovery can miss
+nodes no node can tell that every catalog in the fleet dropped it. Without
+a budget nothing is evicted or removed.
 
 ## Network protocol
 

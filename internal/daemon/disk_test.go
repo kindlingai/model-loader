@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -229,7 +230,7 @@ func (s statusSays) Cataloged(model, revision string) bool { return s.cataloged 
 func peerSays(t *testing.T, st *store.Store, id string, cataloged bool) string {
 	t.Helper()
 	roles := []string{"peer"}
-	if id == "nas" {
+	if strings.Contains(id, "nas") {
 		roles = []string{"root"}
 	}
 	ts := httptest.NewServer(server.New(st, statusSays{fakeStatus{server.StatusResponse{NodeID: id, Roles: roles}}, cataloged}))
@@ -237,57 +238,83 @@ func peerSays(t *testing.T, st *store.Store, id string, cataloged bool) string {
 	return strings.TrimPrefix(ts.URL, "http://")
 }
 
-// A revision the catalog no longer names is removed once nothing names
-// it: not this node's catalog, requests or selection, and no peer's
-// catalog.
-func TestBudgetRemovesOldRevisions(t *testing.T) {
+// A retired revision, one nothing names, is evicted where a node with a
+// lower ID holds it, and removed once nothing of it is held; the
+// lowest-ID holder keeps it.
+func TestBudgetRetiresOldRevisions(t *testing.T) {
 	f := newDiskFleet(t, "spark-a")
 	seedFiles(t, f.st, "gone", seg, map[string][]byte{"g.bin": pattern(2*seg, 'g')}, "g.bin")
+	holder, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, holder, "gone", seg, map[string][]byte{"g.bin": pattern(2*seg, 'g')}, "g.bin")
 	gone := func() bool {
-		_, err := os.Stat(f.st.ModelDir("gone", "r1"))
+		_, err := os.Stat(f.st.FilePath("gone", "r1", "g.bin"))
 		return os.IsNotExist(err) && !f.st.HasManifest("gone", "r1")
 	}
-	retired := []string{peerSays(t, f.peerSt, "spark-a", false), peerSays(t, f.peerSt, "nas", false)}
-	node := func(budget int64, sel *catalog.Selection, peers []string) *Daemon {
+	lower := peerSays(t, holder, "spark-a", false)
+	node := func(budget int64, sel *catalog.Selection, peers ...string) *Daemon {
 		d := f.node(budget, sel)
 		d.cfg.Discoverer = discovery.NewStatic(peers)
 		return d
 	}
 
-	// Without a budget nothing is removed.
-	node(0, &catalog.Selection{}, retired).diskPass(context.Background())
+	node(0, &catalog.Selection{}, lower).diskPass(context.Background())
 	if gone() {
 		t.Fatal("removed with no budget")
 	}
-	// A peer whose catalog still names it may count on this copy.
-	node(100*seg, &catalog.Selection{}, []string{peerSays(t, f.peerSt, "spark-a", true), retired[1]}).diskPass(context.Background())
+	// This node is the lowest-ID holder: it keeps the copy, whatever any
+	// catalog says.
+	node(100*seg, &catalog.Selection{}, peerSays(t, holder, "spark-z", false)).diskPass(context.Background())
+	node(100*seg, &catalog.Selection{}, "127.0.0.1:1").diskPass(context.Background())
 	if gone() {
-		t.Fatal("removed while a peer's catalog names it")
+		t.Fatal("removed by the lowest-ID holder")
 	}
-	// So may a peer that does not say, or does not answer.
-	node(100*seg, &catalog.Selection{}, []string{f.peer.addr(), retired[1]}).diskPass(context.Background())
-	node(100*seg, &catalog.Selection{}, []string{"127.0.0.1:1", retired[1]}).diskPass(context.Background())
-	if gone() {
-		t.Fatal("removed while a peer did not say")
-	}
-	// A saved request, or the selection, names it.
-	d := node(100*seg, &catalog.Selection{}, retired)
+	// A saved request, or the selection (a glob in it too), names it.
+	d := node(100*seg, &catalog.Selection{}, lower)
 	if _, err := d.cfg.Requests.Put(request.Request{Name: "old", Pieces: catalog.Pieces{Model: "gone", Revision: "r1"}}); err != nil {
 		t.Fatal(err)
 	}
 	d.diskPass(context.Background())
-	node(100*seg, &catalog.Selection{Wanted: []string{"gone"}}, retired).diskPass(context.Background())
+	node(100*seg, &catalog.Selection{Wanted: []string{"go*"}}, lower).diskPass(context.Background())
 	if gone() {
 		t.Fatal("removed while a request or the selection names it")
 	}
 
-	d = node(100*seg, &catalog.Selection{}, retired)
+	d = node(100*seg, &catalog.Selection{}, lower)
 	d.diskPass(context.Background())
 	if !gone() {
-		t.Fatal("old revision still there")
+		t.Fatal("retired revision still here, with a lower-ID node holding it")
 	}
-	if ds := d.Status().Disk; ds == nil || ds.UsedBytes != 20*seg || ds.EvictableBytes != 10*seg {
-		t.Fatalf("status disk = %+v, want used %d (old model), evictable %d (a1.bin)", ds, 20*seg, 10*seg)
+	if _, err := os.Stat(f.st.ModelDir("gone", "r1")); !os.IsNotExist(err) {
+		t.Fatalf("empty directory left: %v", err)
+	}
+	if ds := d.Status().Disk; ds == nil || ds.UsedBytes != 20*seg {
+		t.Fatalf("status disk = %+v, want used %d (old model)", ds, 20*seg)
+	}
+}
+
+// A root's copy lets a peer evict only while the root's catalog names the
+// revision: one that dropped it cannot fetch it again.
+func TestBudgetRetiredRootCopyDoesNotCount(t *testing.T) {
+	f := newDiskFleet(t, "spark-z")
+	root, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, root, "old", seg, map[string][]byte{"a1.bin": pattern(10*seg, 'a'), "a2.bin": pattern(10*seg, 'A')}, "a1.bin", "a2.bin")
+	for _, cataloged := range []bool{false, true} {
+		d := f.node(20*seg, &catalog.Selection{})
+		d.cfg.Discoverer = discovery.NewStatic([]string{peerSays(t, root, "z-nas", cataloged)})
+		d.diskPass(context.Background())
+		want := int64(0)
+		if cataloged {
+			want = 20 * seg
+		}
+		if ds := d.Status().Disk; ds == nil || ds.EvictableBytes != want {
+			t.Fatalf("root cataloged %v: status disk = %+v, want evictable %d", cataloged, ds, want)
+		}
 	}
 }
 
@@ -369,14 +396,21 @@ func TestBudgetReclaimsFailedWrites(t *testing.T) {
 	if err := f.st.SaveState(rs); err != nil {
 		t.Fatal(err)
 	}
-	d := f.node(25*seg, &catalog.Selection{})
+	d := f.node(27*seg, &catalog.Selection{})
+	// Dropped in memory only, its drop unsaved: it would be held again
+	// after a restart, so its bytes stay.
+	mem, _ := d.revState(mf)
+	mem.DropSegment(fm, 0)
+	// Being served: the reader may still have its bytes to send.
+	defer d.BeginUse("old", "r1", fm, 9*seg, 10*seg)()
 	if _, err := d.makeRoom(context.Background(), []spaceNeed{{key: "x", remaining: func() int64 { return 10 * seg }}}); err != nil {
 		t.Fatalf("makeRoom: %v", err)
 	}
-	if n, _ := f.st.Allocated(); n != 15*seg {
-		t.Fatalf("store allocates %d bytes, want %d: the dropped segments freed", n, 15*seg)
+	if n, _ := f.st.Allocated(); n != 16*seg {
+		t.Fatalf("store allocates %d bytes, want %d: segments 5-8 freed, 0 and 9 kept", n, 16*seg)
 	}
-	if got := f.held("old", "a1.bin"); got != "1111100000" {
+	mem.MarkSegment(fm, 0, "", store.TrustManifest)
+	if got := f.held("old", "a1.bin"); got != "1111100000" { // as saved
 		t.Fatalf("a1.bin: held %s", got)
 	}
 }
@@ -390,6 +424,14 @@ func TestBudgetSharedReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The first fetch has written half of it.
+	half := store.FileManifest{Path: "h", Size: 5 * seg, SegmentSize: seg}
+	hf, err := f.st.EnsureFile("x", "r1", half)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hf.WriteAt(pattern(5*seg, 'h'), 0)
+	hf.Close()
 	r2, err := d.makeRoom(context.Background(), []spaceNeed{need})
 	if err != nil {
 		t.Fatalf("second fetch of the same segment: %v", err)
@@ -404,24 +446,63 @@ func TestBudgetSharedReservation(t *testing.T) {
 	}
 }
 
-// A root makes room before it downloads a revision from its origin.
+// A root makes room before it downloads a revision from its origin, in
+// whole filesystem blocks, and a download it resumes needs room only for
+// what it has still to fetch.
 func TestBudgetBeforeWAN(t *testing.T) {
-	origin := newFakeOrigin(t, map[string][]byte{"w.bin": pattern(20*seg, 'w')})
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	root := func(t *testing.T, files map[string][]byte, budget int64) (*Daemon, *fakeOrigin, string) {
+		origin := newFakeOrigin(t, files)
+		dir := t.TempDir()
+		st, err := store.Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := catalog.Model{Name: "glm", Revision: "r1", Source: catalog.Source{Type: catalog.SourceHTTP, URL: origin.ts.URL}}
+		return New(Config{
+			NodeID: "nas", Roles: []string{"root"}, Store: st, DiskBudget: budget,
+			Catalog: &catalog.Catalog{Models: []catalog.Model{m}}, Selection: &catalog.Selection{Wanted: []string{"glm"}},
+			Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
+		}), origin, dir
 	}
-	m := catalog.Model{Name: "glm", Revision: "r1", Source: catalog.Source{Type: catalog.SourceHTTP, URL: origin.ts.URL}}
-	d := New(Config{
-		NodeID: "nas", Roles: []string{"root"}, Store: st, DiskBudget: 10 * seg,
-		Catalog: &catalog.Catalog{Models: []catalog.Model{m}}, Selection: &catalog.Selection{Wanted: []string{"glm"}},
-		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
+	budgetErr := func(t *testing.T, d *Daemon) {
+		t.Helper()
+		_ = d.Reconcile(context.Background()) // a manifest error goes to the status
+		if ms := d.Status().Models; len(ms) != 1 || !strings.Contains(ms[0].Error, "disk budget") {
+			t.Fatalf("status = %+v, want a disk budget error", ms)
+		}
+	}
+	t.Run("too big", func(t *testing.T) {
+		d, origin, _ := root(t, map[string][]byte{"w.bin": pattern(20*seg, 'w')}, 10*seg)
+		budgetErr(t, d)
+		if n := origin.bytes.Load(); n != 0 {
+			t.Fatalf("origin served %d bytes over the budget", n)
+		}
 	})
-	_ = d.Reconcile(context.Background()) // a manifest error goes to the status
-	if ms := d.Status().Models; len(ms) != 1 || !strings.Contains(ms[0].Error, "disk budget") {
-		t.Fatalf("status = %+v, want a disk budget error", ms)
-	}
-	if n := origin.bytes.Load(); n != 0 {
-		t.Fatalf("origin served %d bytes over the budget", n)
-	}
+	t.Run("blocks", func(t *testing.T) {
+		d, _, _ := root(t, map[string][]byte{"w.bin": pattern(100, 'w')}, 100)
+		budgetErr(t, d)
+	})
+	t.Run("resume", func(t *testing.T) {
+		d, origin, dir := root(t, map[string][]byte{"w1.bin": pattern(2*seg, 'w'), "w2.bin": pattern(2*seg, 'W')}, 4*seg)
+		if err := d.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// As if the node stopped before it saved the manifest.
+		if err := os.Remove(filepath.Join(dir, "manifests", "glm", "r1.json")); err != nil {
+			t.Fatal(err)
+		}
+		served, manifests := origin.bytes.Load(), origin.manifests.Load()
+		if err := d.Reconcile(context.Background()); err != nil {
+			t.Fatalf("resumed download with all of it on disk: %v", err)
+		}
+		if origin.manifests.Load() == manifests {
+			t.Fatal("did not download again")
+		}
+		if ms := d.Status().Models; len(ms) != 1 || ms[0].State != server.StateReady {
+			t.Fatalf("resumed download: status %+v, want ready", ms)
+		}
+		if n := origin.bytes.Load() - served; n != 0 {
+			t.Fatalf("resumed download fetched %d bytes again", n)
+		}
+	})
 }

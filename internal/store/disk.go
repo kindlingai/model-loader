@@ -88,15 +88,51 @@ func allocatedPath(path string) int64 {
 	return int64(st.Blocks) * 512
 }
 
-// RemoveRevision deletes a revision's files, state and manifest.
-func (s *Store) RemoveRevision(model, revision string) error {
-	errs := []error{os.RemoveAll(s.ModelDir(model, revision))}
+// RemoveRevision deletes a revision: the files paths names, its state
+// and its manifest, and then the directories that leaves empty. It
+// deletes only those files, never a whole directory: the files of a
+// revision with a slash in its name ("refs/pr/1") are under the directory
+// of another ("refs").
+func (s *Store) RemoveRevision(model, revision string, paths []string) error {
+	var errs []error
+	for _, p := range paths {
+		if err := os.Remove(s.FilePath(model, revision, p)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+		s.pruneDirs(filepath.Dir(s.FilePath(model, revision, p)))
+	}
 	for _, p := range []string{s.statePath(model, revision), s.manifestPath(model, revision)} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
 		}
+		s.pruneDirs(filepath.Dir(p))
 	}
 	return errors.Join(errs...)
+}
+
+// pruneDirs removes dir and its parents while they are empty, up to the
+// store's top directories.
+func (s *Store) pruneDirs(dir string) {
+	stop := map[string]bool{s.root: true}
+	for _, sub := range []string{"manifests", "models", "state"} {
+		stop[filepath.Join(s.root, sub)] = true
+	}
+	for !stop[dir] && strings.HasPrefix(dir, s.root+string(filepath.Separator)) {
+		if os.Remove(dir) != nil { // not empty, or gone
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}
+
+// BlockSize returns the filesystem block size of the store, the unit the
+// store's use is counted in; 4096 if it cannot tell.
+func (s *Store) BlockSize() int64 {
+	var st unix.Statfs_t
+	if err := unix.Statfs(s.root, &st); err == nil && st.Bsize > 0 {
+		return int64(st.Bsize)
+	}
+	return 4096
 }
 
 // FreeSegment gives the disk space of segment i of fm back to the

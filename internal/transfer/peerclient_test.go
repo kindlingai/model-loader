@@ -1,8 +1,10 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -192,5 +194,18 @@ func TestPeerClientOpenBlobEscapesPath(t *testing.T) {
 	}
 	if string(body) != "data" {
 		t.Fatalf("body = %q, want %q", body, "data")
+	}
+}
+
+// A peer's /segments answer is read only up to a bound.
+func TestSegmentsBodyLimited(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"model":"m","roles":["`))
+		w.Write(bytes.Repeat([]byte("x"), maxSegmentsBody+1))
+		w.Write([]byte(`"]}`))
+	}))
+	defer ts.Close()
+	if _, err := NewPeerClient(nil).Segments(context.Background(), ts.Listener.Addr().String(), "m", "r1"); err == nil {
+		t.Fatal("Segments = nil error for an answer past the limit")
 	}
 }

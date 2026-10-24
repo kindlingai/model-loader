@@ -73,7 +73,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.k8sService, "k8s-service", "", "headless Service DNS name, for -discovery=k8s")
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
-	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous file downloads")
+	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous segment transfers")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {

@@ -61,7 +61,7 @@ func (c *PeerClient) Status(ctx context.Context, addr string) (*server.StatusRes
 		return nil, fmt.Errorf("peer %s: status: %s", addr, resp.Status)
 	}
 	var s server.StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSegmentsBody)).Decode(&s); err != nil {
 		return nil, fmt.Errorf("peer %s: decode status: %w", addr, err)
 	}
 	return &s, nil
@@ -91,6 +91,40 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 		return nil, fmt.Errorf("peer %s: decode manifest: %w", addr, err)
 	}
 	return &m, nil
+}
+
+// maxSegmentsBody bounds a peer's /segments (and /status) answer. A revision with ten
+// thousand files of a hundred segment runs each fits well inside it.
+const maxSegmentsBody = 16 << 20
+
+// ErrNoSegments means a peer predates GET /segments, so what it holds is
+// unknown.
+var ErrNoSegments = errors.New("peer does not report segments")
+
+// Segments fetches which segments of model/revision a peer holds. It
+// returns ErrNoSegments if the peer is too old to answer (404).
+func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string) (*server.SegmentsResponse, error) {
+	u := fmt.Sprintf("http://%s/segments/%s/%s", addr, url.PathEscape(model), url.PathEscape(revision))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("peer %s: segments: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrNoSegments
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("peer %s: segments: %s", addr, resp.Status)
+	}
+	var s server.SegmentsResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSegmentsBody)).Decode(&s); err != nil {
+		return nil, fmt.Errorf("peer %s: decode segments: %w", addr, err)
+	}
+	return &s, nil
 }
 
 // OpenBlob returns a reader for byte range [offset, offset+length) of path

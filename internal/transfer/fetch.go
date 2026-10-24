@@ -2,9 +2,11 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/source"
@@ -42,23 +44,33 @@ func (p PeerFetcher) Open(ctx context.Context, path string, offset, length int64
 	return p.Client.OpenBlob(ctx, p.Addr, p.Model, p.Revision, path, offset, length)
 }
 
-// uncacheEvery is how many bytes to write to a destination file between
-// fsync + page-cache drops, so a large download doesn't balloon resident
-// page cache. It matches the segment size so each verified segment's pages
-// are dropped once they're durable.
-const uncacheEvery = store.DefaultSegmentSize
+// Options tunes FetchFile. The zero value fetches every segment, trying
+// every fetcher in order, one segment at a time.
+type Options struct {
+	// Need marks the segments to fetch. nil means every segment.
+	Need []bool
+	// Order, if set, returns the indices into the fetchers to try for
+	// segment i, in order. A fetcher it leaves out is not tried for that
+	// segment.
+	Order func(i int) []int
+	// Slots, if set, is a semaphore shared with every other transfer on
+	// the node: each segment transfer holds one slot while it runs. Its
+	// capacity is also how many segments of this file are fetched at once,
+	// so different segments can come from different sources in parallel.
+	Slots chan struct{}
+}
 
-// FetchFile downloads the not-yet-done segments of fm that need marks
-// into the store; a nil need means every segment. It tries fetchers in
-// order for each segment, falling back to the next one when a fetcher
-// doesn't have it yet or fails. Each segment is verified against the
-// manifest as soon as it lands. Once every segment of the file is done,
-// needed or not, the whole file is verified once more and marked complete;
-// until then the file is partial, a sparse file with every held segment at
-// its own offset. rs is mutated and persisted to st as progress is made,
-// so a restart resumes from the last saved segment rather than from
-// scratch.
-func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm store.FileManifest, rs *store.RevisionState, fetchers []Fetcher, need []bool) error {
+// FetchFile downloads the not-yet-done segments of fm that opts.Need marks
+// into the store. For each segment it tries the fetchers opts.Order names,
+// falling back to the next one when a fetcher doesn't have it yet or
+// fails. Each segment is verified against the manifest as soon as it
+// lands. Once every segment of the file is done, needed or not, the whole
+// file is verified once more and marked complete; until then the file is
+// partial, a sparse file with every held segment at its own offset. rs is
+// mutated and persisted to st as progress is made, so a restart resumes
+// from the last saved segment rather than from scratch.
+func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm store.FileManifest, rs *store.RevisionState, fetchers []Fetcher, opts Options) error {
+	need := opts.Need
 	fileState := rs.FileState(fm)
 	if fileState.Complete {
 		return nil
@@ -73,54 +85,111 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if need != nil && len(need) != fm.NumSegments() {
 		return fmt.Errorf("fetch %s: need has %d segments, manifest %d", fm.Path, len(need), fm.NumSegments())
 	}
-	missing := 0
+	var todo []int
 	for i, done := range fileState.SegmentsDone {
 		if !done && (need == nil || need[i]) {
-			missing++
+			todo = append(todo, i)
 		}
 	}
-	if missing == 0 && !allDone(fileState.SegmentsDone) {
+	if len(todo) == 0 && !allDone(fileState.SegmentsDone) {
 		return nil // every needed segment is already held.
 	}
-	if missing > 0 && len(fetchers) == 0 {
+	if len(todo) > 0 && len(fetchers) == 0 {
 		return fmt.Errorf("fetch %s: no sources available", fm.Path)
 	}
 
-	f, err := st.EnsureFile(model, revision, fm)
+	// Each segment transfer opens the destination once it has a slot and
+	// closes it when the segment is done, so files waiting for the
+	// transfer limit hold no descriptors, between segments or before.
+	openFile := func() (*os.File, error) {
+		f, err := st.EnsureFile(model, revision, fm)
+		if err != nil {
+			return nil, fmt.Errorf("fetch %s: %w", fm.Path, err)
+		}
+		return f, nil
+	}
+
+	if opts.Slots != nil && cap(opts.Slots) == 0 {
+		opts.Slots = nil // an unbuffered channel would block every send.
+	}
+	order := opts.Order
+	if order == nil {
+		all := make([]int, len(fetchers))
+		for k := range all {
+			all[k] = k
+		}
+		order = func(int) []int { return all }
+	}
+	workers := 1
+	if opts.Slots != nil {
+		workers = max(1, cap(opts.Slots))
+	}
+	workers = min(workers, max(1, len(todo)))
+
+	var (
+		mu       sync.Mutex // guards fileState, rs, dead and firstErr
+		dead     = make([]bool, len(fetchers))
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
+	queue := make(chan int)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range queue {
+				if opts.Slots != nil {
+					select {
+					case opts.Slots <- struct{}{}:
+					case <-ctx.Done():
+						fail(ctx.Err())
+						continue
+					}
+				}
+				f, err := openFile()
+				if err == nil {
+					err = fetchSegment(ctx, f, fm, i, fetchers, order(i), dead, &mu)
+					f.Close()
+				}
+				if opts.Slots != nil {
+					<-opts.Slots
+				}
+				if err != nil {
+					fail(fmt.Errorf("fetch %s segment %d: %w", fm.Path, i, err))
+					continue
+				}
+				mu.Lock()
+				fileState.SegmentsDone[i] = true
+				rs.SetFileState(fileState)
+				err = st.SaveState(rs)
+				mu.Unlock()
+				if err != nil {
+					fail(fmt.Errorf("fetch %s: save state: %w", fm.Path, err))
+				}
+			}
+		}()
+	}
+	for _, i := range todo {
+		queue <- i
+	}
+	close(queue)
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	f, err := openFile()
 	if err != nil {
-		return fmt.Errorf("fetch %s: %w", fm.Path, err)
+		return err
 	}
 	defer f.Close()
-
-	dead := make([]bool, len(fetchers))
-	var sinceSync int64
-	for i := 0; i < fm.NumSegments(); i++ {
-		if fileState.SegmentsDone[i] || (need != nil && !need[i]) {
-			continue
-		}
-		start, end := fm.SegmentBounds(i)
-		length := end - start
-
-		n, err := fetchSegment(ctx, f, fm, i, start, length, fetchers, dead)
-		if err != nil {
-			return fmt.Errorf("fetch %s segment %d: %w", fm.Path, i, err)
-		}
-
-		fileState.SegmentsDone[i] = true
-		rs.SetFileState(fileState)
-		if err := st.SaveState(rs); err != nil {
-			return fmt.Errorf("fetch %s: save state: %w", fm.Path, err)
-		}
-
-		sinceSync += n
-		if sinceSync >= uncacheEvery {
-			if err := syncAndUncache(f); err != nil {
-				return fmt.Errorf("fetch %s: %w", fm.Path, err)
-			}
-			sinceSync = 0
-		}
-	}
-
 	if err := syncAndUncache(f); err != nil {
 		return fmt.Errorf("fetch %s: %w", fm.Path, err)
 	}
@@ -166,66 +235,90 @@ func syncAndUncache(f *os.File) error {
 	return nil
 }
 
-// fetchSegment tries each fetcher in order for one segment, returning the
-// first success. A fetcher reporting ErrRangeUnavailable is skipped for this
-// segment only. One that fails outright (a peer that went away mid-copy, a
-// dropped connection, data that fails verification) is marked in dead and
-// skipped for the rest of the file, so the copy fails over to the next peer
-// or the root instead of failing, and doesn't wait on a dead address again
-// for every segment.
-func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, start, length int64, fetchers []Fetcher, dead []bool) (int64, error) {
+// fetchSegment tries the fetchers order names, in turn, for segment i,
+// returning at the first success. A fetcher reporting ErrRangeUnavailable
+// is skipped for this segment only. One that fails outright (a peer that
+// went away mid-copy, a dropped connection, data that fails verification)
+// is marked in dead and skipped for the rest of the file, so the copy fails
+// over to the next peer or the root instead of failing, and doesn't wait on
+// a dead address again for every segment. mu guards dead.
+//
+// At most the segment's own bytes are written, so a source that sends too
+// much cannot overwrite a neighbouring segment another worker holds. The
+// segment is synced before it is verified, so verifying drops its pages
+// from page cache.
+func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, fetchers []Fetcher, order []int, dead []bool, mu *sync.Mutex) error {
+	start, end := fm.SegmentBounds(i)
+	length := end - start
+	isDead := func(k int) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return dead[k]
+	}
+	kill := func(k int) {
+		mu.Lock()
+		dead[k] = true
+		mu.Unlock()
+	}
 	var lastErr error
-	for k, fetcher := range fetchers {
-		if dead[k] {
+	for _, k := range order {
+		if k < 0 || k >= len(fetchers) || isDead(k) {
 			continue
 		}
-		rc, err := fetcher.Open(ctx, fm.Path, start, length)
-		if err == ErrRangeUnavailable {
+		rc, err := fetchers[k].Open(ctx, fm.Path, start, length)
+		if errors.Is(err, ErrRangeUnavailable) {
 			lastErr = err
 			continue
 		}
 		if err != nil {
-			dead[k], lastErr = true, err
+			kill(k)
+			lastErr = err
 			continue
 		}
 
 		// Write at most the segment's own bytes, so a source that sends
 		// too much cannot overwrite a neighbouring segment that is held.
-		w := io.NewOffsetWriter(f, start)
-		copied, copyErr := io.Copy(w, io.LimitReader(rc, length))
+		copied, copyErr := io.Copy(io.NewOffsetWriter(f, start), io.LimitReader(rc, length))
+		extra := 0
 		if copyErr == nil && copied == length {
 			// Only a full, good copy is probed for more: a failed one is
 			// dropped at once, not held open waiting on the source.
-			if extra, _ := rc.Read(make([]byte, 1)); extra > 0 {
-				copyErr = fmt.Errorf("source sent more than the %d bytes asked for", length)
-			}
+			extra, _ = rc.Read(make([]byte, 1))
 		}
 		closeErr := rc.Close()
-		if copyErr != nil {
-			dead[k], lastErr = true, copyErr
-			continue
+		var bad error
+		switch {
+		case copyErr != nil:
+			bad = copyErr
+		case copied != length:
+			bad = fmt.Errorf("short read: wanted %d bytes, got %d", length, copied)
+		case extra > 0:
+			bad = fmt.Errorf("source sent more than the %d bytes asked for", length)
+		case closeErr != nil:
+			bad = closeErr
 		}
-		if closeErr != nil {
-			dead[k], lastErr = true, closeErr
-			continue
-		}
-		if copied != length {
-			dead[k], lastErr = true, fmt.Errorf("short read: wanted %d bytes, got %d", length, copied)
+		if bad != nil {
+			kill(k)
+			lastErr = bad
 			continue
 		}
 
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync: %w", err)
+		}
 		verified, err := store.VerifySegment(f, fm, i)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		if !verified {
-			dead[k], lastErr = true, fmt.Errorf("segment failed hash verification")
+			kill(k)
+			lastErr = errors.New("segment failed hash verification")
 			continue
 		}
-		return copied, nil
+		return nil
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("every source failed earlier in this file")
+		lastErr = errors.New("no source left to try")
 	}
-	return 0, lastErr
+	return lastErr
 }

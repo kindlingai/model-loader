@@ -9,7 +9,11 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kindlingai/model-loader/internal/store"
 )
@@ -71,7 +75,7 @@ func TestFetchFileSingleFetcher(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	fetcher := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, Options{}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 
@@ -103,7 +107,7 @@ func TestFetchFileFallsBackOnRangeUnavailable(t *testing.T) {
 
 	empty := &fakeFetcher{content: content, ready: 0}
 	full := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty, full}, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty, full}, Options{}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if empty.calls == 0 {
@@ -147,7 +151,7 @@ func TestFetchFileResumesWithoutRefetchingDoneSegments(t *testing.T) {
 	rs.SetFileState(fs)
 
 	fetcher := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, Options{}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if fetcher.calls != fm.NumSegments()-1 {
@@ -169,7 +173,7 @@ func TestFetchFileFailsWhenNoFetcherHasRange(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	empty := &fakeFetcher{content: content, ready: 0}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty}, nil); err == nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{empty}, Options{}); err == nil {
 		t.Fatal("expected an error when no fetcher has the range")
 	}
 }
@@ -201,7 +205,7 @@ func TestFetchFileFailsOverFromDeadSource(t *testing.T) {
 
 	dead := &deadFetcher{}
 	root := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{dead, root}, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{dead, root}, Options{}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if dead.calls != 1 {
@@ -231,7 +235,7 @@ func TestFetchFileZeroLength(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	fetcher := &fakeFetcher{}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, Options{}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if fetcher.calls != 0 {
@@ -263,7 +267,7 @@ func TestFetchFileDetectsCorruption(t *testing.T) {
 	rs := store.NewRevisionState(m)
 
 	corrupt := &fakeFetcher{content: []byte("goodbye worl"), ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{corrupt}, nil); err == nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{corrupt}, Options{}); err == nil {
 		t.Fatal("expected an error when the fetched bytes fail hash verification")
 	}
 }
@@ -283,7 +287,7 @@ func TestFetchFileAlreadyComplete(t *testing.T) {
 
 	// No fetchers at all: FetchFile must return immediately without trying
 	// to open anything, since the file is already marked complete.
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, Options{}); err != nil {
 		t.Fatalf("FetchFile on already-complete file: %v", err)
 	}
 }
@@ -307,7 +311,7 @@ func TestFetchFilePartialNonAdjacentSegments(t *testing.T) {
 	rs := store.NewRevisionState(m)
 	fetcher := &fakeFetcher{content: content, ready: int64(len(content))}
 
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, []bool{true, false, false, true, false}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, Options{Need: []bool{true, false, false, true, false}}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if fetcher.calls != 2 {
@@ -340,7 +344,7 @@ func TestFetchFilePartialNonAdjacentSegments(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetcher.calls = 0
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, nil); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{fetcher}, Options{}); err != nil {
 		t.Fatalf("FetchFile (rest): %v", err)
 	}
 	if fetcher.calls != 3 {
@@ -367,7 +371,7 @@ func TestFetchFilePartialAlreadyHeld(t *testing.T) {
 	fs := rs.FileState(fm)
 	fs.SegmentsDone[1] = true
 	rs.SetFileState(fs)
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, []bool{false, true, false}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, Options{Need: []bool{false, true, false}}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 }
@@ -394,7 +398,7 @@ func TestFetchFileAllHeldChecksWholeWithoutSources(t *testing.T) {
 	fs := rs.FileState(fm)
 	fs.SegmentsDone = []bool{true, true, true}
 	rs.SetFileState(fs)
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, []bool{false, true, false}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, Options{Need: []bool{false, true, false}}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if !rs.FileState(fm).Complete {
@@ -410,29 +414,144 @@ func (o overSender) Open(ctx context.Context, path string, offset, length int64)
 }
 
 // A source that sends more than the segment must not write past it into a
-// held neighbouring segment, and is dropped for the next source.
+// neighbouring segment, and is dropped for the next source.
 func TestFetchFileSourceSendsTooMuch(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	content := []byte("0123456789abcdefghijklmnopqrst")
+	content := []byte("0123456789abcdefghij")
 	fm := buildManifestFile("w.bin", content, 10)
 	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
 	rs := store.NewRevisionState(m)
 	good := &fakeFetcher{content: content, ready: int64(len(content))}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{good}, []bool{false, true, false}); err != nil {
-		t.Fatal(err)
-	}
-	good.calls = 0
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{overSender{content}, good}, []bool{true, false, false}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{overSender{content}, good}, Options{Need: []bool{true, false}}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	got, _ := os.ReadFile(st.FilePath("m", "r1", "w.bin"))
-	if !bytes.Equal(got[:20], content[:20]) {
-		t.Fatalf("held segment 1 overwritten: %q", got[:20])
+	if got[10] != 0 {
+		t.Fatalf("byte 10 = %q: the extra byte landed in the next segment", got[10])
 	}
 	if good.calls != 1 {
 		t.Fatalf("good source called %d times, want 1 after the bad one was dropped", good.calls)
 	}
+}
+
+// Order picks the sources per segment, and a source it leaves out is not
+// tried for that segment.
+func TestFetchFileOrderPerSegment(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("o"), 40)
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	a := &countingFetcher{content: content}
+	b := &countingFetcher{content: content}
+	order := func(i int) []int {
+		if i%2 == 0 {
+			return []int{0}
+		}
+		return []int{1}
+	}
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{a, b}, Options{Order: order, Slots: make(chan struct{}, 2)}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if a.calls.Load() != 2 || b.calls.Load() != 2 {
+		t.Fatalf("calls = %d, %d; want 2 each", a.calls.Load(), b.calls.Load())
+	}
+	if !rs.FileState(fm).Complete {
+		t.Fatal("file not complete")
+	}
+}
+
+// countingFetcher is a concurrency-safe fakeFetcher holding everything.
+type countingFetcher struct {
+	content []byte
+	calls   atomic.Int32
+}
+
+func (c *countingFetcher) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	c.calls.Add(1)
+	return io.NopCloser(bytes.NewReader(c.content[offset : offset+length])), nil
+}
+
+// A file queued behind a full transfer limit has no descriptor open.
+func TestFetchFileOpensOnlyWithASlot(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("s"), 20)
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{} // taken by another transfer
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = FetchFile(ctx, st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{&countingFetcher{content: content}}, Options{Slots: slots})
+	if err == nil {
+		t.Fatal("FetchFile = nil, want the context error")
+	}
+	if _, err := os.Stat(st.FilePath("m", "r1", "w.bin")); !os.IsNotExist(err) {
+		t.Fatalf("destination exists (%v) while waiting for a slot", err)
+	}
+}
+
+// Between segments, while waiting for a slot again, a file holds no open
+// descriptor: segment transfers close it as they finish.
+func TestFetchFileClosesBetweenSegments(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("c"), 20)
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	before := openFDs(t)
+	slots := make(chan struct{}, 1)
+	stolen := make(chan struct{})
+	var once sync.Once
+	steal := fetcherFunc(func(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+		// After the first segment, take the slot as soon as the worker
+		// gives it back, so the worker waits for it.
+		once.Do(func() {
+			go func() { slots <- struct{}{}; close(stolen) }()
+		})
+		return io.NopCloser(bytes.NewReader(content[offset : offset+length])), nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- FetchFile(context.Background(), st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{steal}, Options{Slots: slots})
+	}()
+	<-stolen
+	time.Sleep(50 * time.Millisecond) // let the worker reach the slot wait
+	got := openFDs(t)
+	<-slots
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got > before {
+		t.Fatalf("%d descriptors open while waiting for a slot, want at most %d", got, before)
+	}
+}
+
+type fetcherFunc func(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
+
+func (f fetcherFunc) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	return f(ctx, path, offset, length)
+}
+
+func openFDs(t *testing.T) int {
+	t.Helper()
+	n := 0
+	for fd := 0; fd < 4096; fd++ {
+		var st syscall.Stat_t
+		if syscall.Fstat(fd, &st) == nil {
+			n++
+		}
+	}
+	return n
 }

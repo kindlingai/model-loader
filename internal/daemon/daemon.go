@@ -23,7 +23,8 @@ import (
 	"github.com/kindlingai/model-loader/internal/want"
 )
 
-// defaultMaxConcurrentTransfers caps simultaneous file downloads per node.
+// defaultMaxConcurrentTransfers caps simultaneous segment transfers per
+// node.
 // home-ops hit real OOMs at 4 concurrent Hugging Face downloads; 2 is a safe
 // default for a box that may also be serving an LLM workload.
 const defaultMaxConcurrentTransfers = 2
@@ -58,8 +59,8 @@ type Config struct {
 	// wrapping http.DefaultClient.
 	Peers *transfer.PeerClient
 
-	// MaxConcurrentTransfers bounds simultaneous file downloads across all
-	// models. Defaults to defaultMaxConcurrentTransfers.
+	// MaxConcurrentTransfers bounds simultaneous segment transfers across
+	// all files and models. Defaults to defaultMaxConcurrentTransfers.
 	MaxConcurrentTransfers int
 
 	// StallTimeout bounds how long a download from a model's origin may go
@@ -75,8 +76,9 @@ type Config struct {
 // Daemon runs the reconcile loop and reports status via the StatusProvider
 // interface server.Server depends on.
 type Daemon struct {
-	cfg Config
-	sem chan struct{}
+	cfg        Config
+	sem        chan struct{}
+	availSlots chan struct{} // see availabilityQueries
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
@@ -95,10 +97,11 @@ func New(cfg Config) *Daemon {
 		cfg.StallTimeout = defaultStallTimeout
 	}
 	return &Daemon{
-		cfg:      cfg,
-		sem:      make(chan struct{}, cfg.MaxConcurrentTransfers),
-		statuses: make(map[string]server.ModelStatus),
-		verified: make(map[string]bool),
+		cfg:        cfg,
+		sem:        make(chan struct{}, cfg.MaxConcurrentTransfers),
+		availSlots: make(chan struct{}, availabilityQueries),
+		statuses:   make(map[string]server.ModelStatus),
+		verified:   make(map[string]bool),
 	}
 }
 
@@ -318,16 +321,16 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	if err != nil {
 		peers = nil // a discovery hiccup shouldn't block falling back to WAN.
 	}
-	fetchers := d.buildFetchers(m, peers)
+	srcs := d.buildSources(ctx, m, manifest, peers)
 
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
 			continue
 		}
-		d.sem <- struct{}{}
-		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, fetchers, fn.Segments)
-		<-d.sem
+		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
+			Need: fn.Segments, Order: srcs.order(fm.Path), Slots: d.sem,
+		})
 		if err != nil {
 			ms := progress(w, manifest, need, rs, server.StateError)
 			ms.Error = err.Error()

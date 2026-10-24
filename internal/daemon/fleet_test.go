@@ -212,3 +212,58 @@ func TestDaemonSegmentFailsOverWhenHolderGoesAway(t *testing.T) {
 		t.Fatal("file content mismatch")
 	}
 }
+
+// A plain peer too old for /segments, whose /status reports the model
+// ready, still comes before a root that holds it.
+func TestDaemonPrefersOlderReadyPeerOverRoot(t *testing.T) {
+	content := pattern(30, 'o')
+	files := map[string][]byte{"w.bin": content}
+	var inflight, peak atomic.Int32
+	rootStore, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, rootStore, "glm", 10, files, "w.bin")
+	root := newFleetNode(t, rootStore, "nas", &inflight, &peak)
+
+	oldStore, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, oldStore, "glm", 10, files, "w.bin")
+	oldSrv := server.New(oldStore, fakeStatus{server.StatusResponse{NodeID: "old", Roles: []string{"peer"},
+		Models: []server.ModelStatus{{Model: "glm", Revision: "r1", State: server.StateReady}}}})
+	var oldBlobs atomic.Int32
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/segments/") {
+			http.NotFound(w, r) // too old to have it
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/blob/") {
+			oldBlobs.Add(1)
+		}
+		oldSrv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(old.Close)
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := catalog.Model{Name: "glm", Revision: "r1", Source: catalog.Source{Type: catalog.SourceHTTP, URL: "http://unused.invalid"}}
+	d := New(Config{
+		NodeID: "new", Roles: []string{"peer"}, Store: st,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{m}}, Selection: allSelection(),
+		Sources:    source.New(nil, ""),
+		Discoverer: discovery.NewStatic([]string{root.addr(), old.Listener.Addr().String()}),
+	})
+	if err := d.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if n := root.blobs.Load(); n != 0 {
+		t.Fatalf("root served %d blobs, want 0", n)
+	}
+	if n := oldBlobs.Load(); n != 3 {
+		t.Fatalf("older peer served %d blobs, want 3", n)
+	}
+}

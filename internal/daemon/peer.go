@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -60,14 +61,21 @@ type sources struct {
 	// avail[k] is what peer k holds, or nil when it did not say (an older
 	// version, or the query failed). Unused past the peers.
 	avail []*server.SegmentsResponse
+	// whole[k] means peer k is a plain peer too old for /segments whose
+	// /status reports the revision ready: it holds every segment.
+	whole []bool
 	peers int
 }
+
+// availabilityQueries bounds how many peers are asked at once.
+const availabilityQueries = 8
 
 // buildSources lists m's sources and asks every peer, in parallel, which
 // segments it holds.
 func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, peers []discovery.Peer) *sources {
-	s := &sources{avail: make([]*server.SegmentsResponse, len(peers)), peers: len(peers)}
+	s := &sources{avail: make([]*server.SegmentsResponse, len(peers)), whole: make([]bool, len(peers)), peers: len(peers)}
 	var wg sync.WaitGroup
+	slots := make(chan struct{}, availabilityQueries)
 	for k, p := range peers {
 		s.fetchers = append(s.fetchers, transfer.PeerFetcher{
 			Client: d.cfg.Peers, Addr: p.Addr, Model: m.Name, Revision: m.Revision,
@@ -75,12 +83,19 @@ func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, peers []disc
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
 			qctx, cancel := context.WithTimeout(ctx, availabilityTimeout)
 			defer cancel()
-			// On any error (an older peer, a timeout) avail[k] stays nil:
+			// On any error (a timeout, a bad answer) avail[k] stays nil:
 			// unknown, which ranks it behind every holder.
-			if resp, err := d.cfg.Peers.Segments(qctx, p.Addr, m.Name, m.Revision); err == nil {
+			resp, err := d.cfg.Peers.Segments(qctx, p.Addr, m.Name, m.Revision)
+			if err == nil {
 				s.avail[k] = resp
+				return
+			}
+			if errors.Is(err, transfer.ErrNoSegments) {
+				s.whole[k] = d.olderPeerHasAll(qctx, p.Addr, m)
 			}
 		}()
 	}
@@ -91,6 +106,26 @@ func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, peers []disc
 		}
 	}
 	return s
+}
+
+// olderPeerHasAll reports whether a peer too old for /segments is a plain
+// peer whose /status reports m ready, as nodes chose sources before.
+func (d *Daemon) olderPeerHasAll(ctx context.Context, addr string, m catalog.Model) bool {
+	st, err := d.cfg.Peers.Status(ctx, addr)
+	if err != nil {
+		return false
+	}
+	for _, r := range st.Roles {
+		if r == "root" {
+			return false // a root ranks after peers anyway.
+		}
+	}
+	for _, ms := range st.Models {
+		if ms.Model == m.Name && ms.Revision == m.Revision && ms.State == server.StateReady {
+			return true
+		}
+	}
+	return false
 }
 
 // order returns, for each segment of the file at path, the sources to try:
@@ -104,6 +139,8 @@ func (s *sources) order(path string) func(i int) []int {
 		var peerHolders, rootHolders, unknown, others []int
 		for k := 0; k < s.peers; k++ {
 			switch a := s.avail[k]; {
+			case s.whole[k]:
+				peerHolders = append(peerHolders, k)
 			case a == nil:
 				unknown = append(unknown, k)
 			case a.Files[path].Has(i) && a.IsRoot():

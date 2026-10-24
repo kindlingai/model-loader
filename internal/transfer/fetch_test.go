@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kindlingai/model-loader/internal/store"
 )
@@ -473,4 +474,26 @@ type countingFetcher struct {
 func (c *countingFetcher) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
 	c.calls.Add(1)
 	return io.NopCloser(bytes.NewReader(c.content[offset : offset+length])), nil
+}
+
+// A file queued behind a full transfer limit has no descriptor open.
+func TestFetchFileOpensOnlyWithASlot(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("s"), 20)
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{} // taken by another transfer
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = FetchFile(ctx, st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{&countingFetcher{content: content}}, Options{Slots: slots})
+	if err == nil {
+		t.Fatal("FetchFile = nil, want the context error")
+	}
+	if _, err := os.Stat(st.FilePath("m", "r1", "w.bin")); !os.IsNotExist(err) {
+		t.Fatalf("destination exists (%v) while waiting for a slot", err)
+	}
 }

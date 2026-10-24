@@ -93,6 +93,10 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	return &m, nil
 }
 
+// maxSegmentsBody bounds a peer's /segments answer. A revision with ten
+// thousand files of a hundred segment runs each fits well inside it.
+const maxSegmentsBody = 16 << 20
+
 // ErrNoSegments means a peer predates GET /segments, so what it holds is
 // unknown.
 var ErrNoSegments = errors.New("peer does not report segments")
@@ -117,7 +121,7 @@ func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string)
 		return nil, fmt.Errorf("peer %s: segments: %s", addr, resp.Status)
 	}
 	var s server.SegmentsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSegmentsBody)).Decode(&s); err != nil {
 		return nil, fmt.Errorf("peer %s: decode segments: %w", addr, err)
 	}
 	return &s, nil

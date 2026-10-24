@@ -408,3 +408,69 @@ func TestReverifyFileSizeChanged(t *testing.T) {
 		t.Fatalf("size = %d, want 30 (sparse, full size)", info.Size())
 	}
 }
+
+// Reverify does not follow a symlink out of the store, so it neither reads
+// nor truncates what it points to.
+func TestReverifyIgnoresSymlink(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, rs := seedHeld(t, s, map[string][]byte{"a.bin": bytes.Repeat([]byte("a"), 30)}, "a.bin")
+	outside := filepath.Join(t.TempDir(), "important")
+	os.WriteFile(outside, []byte("0123456789IMPORTANT0123456789IMPORTANT"), 0o644)
+	p := s.FilePath("m", "r1", "a.bin")
+	os.Remove(p)
+	if err := os.Symlink(outside, p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reverify(m, rs); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "0123456789IMPORTANT0123456789IMPORTANT" {
+		t.Fatalf("outside file changed: %q", got)
+	}
+	if fs := rs.FileState(m.Files[0]); fs.Complete || fs.SegmentsDone[0] {
+		t.Fatalf("a symlinked file is still held: %+v", fs)
+	}
+}
+
+// Segment bounds never overflow, even for sizes near MaxInt64.
+func TestSegmentBoundsNoOverflow(t *testing.T) {
+	const max = int64(^uint64(0) >> 1)
+	fm := FileManifest{Size: max, SegmentSize: max - 1, SegmentSHA256: []string{"a", "b"}}
+	if s, e := fm.SegmentBounds(1); s != max-1 || e != max {
+		t.Fatalf("bounds = (%d, %d), want (%d, %d)", s, e, max-1, max)
+	}
+}
+
+// A failed state save is remembered until a save succeeds.
+func TestStateSaved(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, rs := seedHeld(t, s, map[string][]byte{"a.bin": []byte("aaaa")}, "a.bin")
+	if !s.StateSaved("m", "r1") {
+		t.Fatal("StateSaved = false before any failure")
+	}
+	sd := filepath.Join(dir, "state")
+	os.Chmod(sd, 0o500)
+	os.RemoveAll(filepath.Join(sd, "m"))
+	if err := s.SaveState(rs); err == nil {
+		os.Chmod(sd, 0o755)
+		t.Skip("state dir still writable (running as root?)")
+	}
+	if s.StateSaved("m", "r1") {
+		t.Fatal("StateSaved = true after a failed save")
+	}
+	os.Chmod(sd, 0o755)
+	if err := s.SaveState(rs); err != nil {
+		t.Fatal(err)
+	}
+	if !s.StateSaved("m", "r1") {
+		t.Fatal("StateSaved = false after a good save")
+	}
+	_ = m
+}

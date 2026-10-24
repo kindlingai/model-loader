@@ -52,8 +52,11 @@ func (f FileManifest) SegmentBounds(i int) (start, end int64) {
 		size = f.Size
 	}
 	start = int64(i) * size
-	end = start + size
-	if end > f.Size || len(f.SegmentSHA256) == 0 {
+	if start > f.Size || start < 0 {
+		return f.Size, f.Size // past the end: no bytes, never an overflow
+	}
+	end = start + min(size, f.Size-start)
+	if len(f.SegmentSHA256) == 0 {
 		end = f.Size
 	}
 	return start, end

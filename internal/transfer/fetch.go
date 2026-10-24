@@ -193,11 +193,14 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 		// too much cannot overwrite a neighbouring segment that is held.
 		w := io.NewOffsetWriter(f, start)
 		copied, copyErr := io.Copy(w, io.LimitReader(rc, length))
-		extra, _ := rc.Read(make([]byte, 1))
-		closeErr := rc.Close()
-		if copyErr == nil && extra > 0 {
-			copyErr = fmt.Errorf("source sent more than the %d bytes asked for", length)
+		if copyErr == nil && copied == length {
+			// Only a full, good copy is probed for more: a failed one is
+			// dropped at once, not held open waiting on the source.
+			if extra, _ := rc.Read(make([]byte, 1)); extra > 0 {
+				copyErr = fmt.Errorf("source sent more than the %d bytes asked for", length)
+			}
 		}
+		closeErr := rc.Close()
 		if copyErr != nil {
 			dead[k], lastErr = true, copyErr
 			continue

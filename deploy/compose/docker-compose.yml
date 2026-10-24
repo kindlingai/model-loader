@@ -1,32 +1,69 @@
-# A single-box "both" deployment by default: one container acts as root and
-# peer at once, matching the project's goal of a complete, self-contained
-# setup on one machine. For a multi-box LAN, run this on each box with
-# MODEL_LOADER_MODE=peer (and MODEL_LOADER_PEERS pointing at the others, plus
-# one box running MODEL_LOADER_MODE=root or "both").
+# model-loader on one box, with docker compose. Run the same file on every
+# box; .env says what this box is (.env.example, nas.env.example and
+# spark.env.example). README.md has the rest.
+#
+#   docker compose up -d                       # model-loader alone
+#   docker compose -f docker-compose.yml -f gr8.yml up -d   # with gr8
+#
+# Unset, the box runs -mode=both: its own root and peer, holding every
+# model in catalog.yaml. That is a complete setup on one machine.
+#
+# No top-level name: the project stays "compose", after this directory, and
+# the store volume "compose_model-loader-store", as before, so an upgrade
+# keeps the running deployment and its store.
 services:
   model-loader:
-    image: ghcr.io/kindlingai/model-loader:latest
+    image: ${MODEL_LOADER_IMAGE:-ghcr.io/kindlingai/model-loader:latest}
     restart: unless-stopped
-    ports:
-      - "${MODEL_LOADER_PORT:-7762}:7762"
+    # The host's network: other boxes reach this one at its LAN address, the
+    # node ID defaults to the box's hostname rather than the container's,
+    # and -discovery=mentat reaches the box's mentatd on 127.0.0.1. Other
+    # boxes fetch on MODEL_LOADER_PORT. The local request API is the unix
+    # socket model-loader.sock in the store, never that port: it has no
+    # authentication, so only what can open the socket may use it.
+    network_mode: host
+    # Group 1000 is gr8's (its image runs as 1000:1000). The socket is mode
+    # 0660 in this process's group, so gr8 can open it; the store's files
+    # are 0644 and its directories 0755, so anyone reads them.
+    user: "0:1000"
     environment:
-      MODEL_LOADER_MODE: "${MODEL_LOADER_MODE:-both}"
-      MODEL_LOADER_PEERS: "${MODEL_LOADER_PEERS:-}"
+      MODEL_LOADER_MODE: ${MODEL_LOADER_MODE:-both}
+      MODEL_LOADER_DISCOVERY: ${MODEL_LOADER_DISCOVERY:-static}
+      MODEL_LOADER_PEERS: ${MODEL_LOADER_PEERS:-}
+      MODEL_LOADER_SELECTION: ${MODEL_LOADER_SELECTION:-}
+      MODEL_LOADER_DISK_BUDGET: ${MODEL_LOADER_DISK_BUDGET:-}
+      MODEL_LOADER_NODE_ID: ${MODEL_LOADER_NODE_ID:-}
+      MODEL_LOADER_PORT: ${MODEL_LOADER_PORT:-7762}
       # Hugging Face token for gated or private repos; only a root uses it.
-      HF_TOKEN: "${HF_TOKEN:-}"
+      HF_TOKEN: ${HF_TOKEN:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
         exec /usr/local/bin/model-loader
         -mode="$$MODEL_LOADER_MODE"
         -catalog=/etc/model-loader/catalog.yaml
+        -selection="$$MODEL_LOADER_SELECTION"
         -store=/var/lib/model-loader
-        -listen=:7762
-        -discovery=static
+        -listen=:$${MODEL_LOADER_PORT:-7762}
+        -local-listen=unix:model-loader.sock
+        -discovery="$$MODEL_LOADER_DISCOVERY"
+        -mentat-port=$${MODEL_LOADER_PORT:-7762}
         -peers="$$MODEL_LOADER_PEERS"
+        -disk-budget="$$MODEL_LOADER_DISK_BUDGET"
+        -node-id="$$MODEL_LOADER_NODE_ID"
     volumes:
       - ./catalog.yaml:/etc/model-loader/catalog.yaml:ro
-      - model-loader-store:/var/lib/model-loader
+      # The store. Unset, a named volume; set MODEL_LOADER_STORE to a host
+      # directory to keep it outside docker (a NAS's master copy, say).
+      - ${MODEL_LOADER_STORE:-model-loader-store}:/var/lib/model-loader
+    # Healthy once the local request API answers on its socket: gr8 (gr8.yml)
+    # starts only then.
+    healthcheck:
+      test: ["CMD", "model-loader", "-check", "unix:/var/lib/model-loader/model-loader.sock"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 1s
 
 volumes:
   model-loader-store:

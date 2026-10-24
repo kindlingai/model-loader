@@ -1,0 +1,78 @@
+# gr8 on one GPU node, reading its weights from that node's model-loader
+# store. This is the part of a gr8 pod that touches model-loader, plus what a
+# box needs to run it at all; gr8's docker/compose.yaml and docker/README.md
+# have the rest of its settings and what each is for.
+#
+# The two model-loader settings in `env` are the interface kindlingai/gr8#180
+# adds to gr8's launcher (the store path and the local model-loader address).
+# gr8 releases before #178 and #180 ignore them and fetch their own weights.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gr8
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: gr8}
+  template:
+    metadata:
+      labels: {app: gr8}
+    spec:
+      # The node to run on. Its model-loader peer (the DaemonSet) serves the
+      # store this pod reads.
+      nodeSelector:
+        kubernetes.io/hostname: spark-0
+      # The RoCE fabric and the OpenAI front end need the node's interfaces.
+      hostNetwork: true
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+      initContainers:
+        # gr8 starts once the node's model-loader answers on its socket.
+        - name: wait-for-model-loader
+          image: ghcr.io/kindlingai/model-loader:latest
+          command:
+            - /bin/sh
+            - -c
+            - until model-loader -check unix:/var/lib/model-loader/model-loader.sock; do sleep 2; done
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: store, mountPath: /var/lib/model-loader, readOnly: true}
+      containers:
+        - name: gr8
+          image: ghcr.io/kindlingai/gr8:latest
+          env:
+            - {name: MODEL_CACHE, value: /var/lib/model-loader}
+            - {name: MODEL_LOADER, value: unix:/var/lib/model-loader/model-loader.sock}
+            - {name: G6_HOME, value: /var/lib/gr8/home}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL], add: [IPC_LOCK]}
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              # The RoCE devices (/dev/infiniband), from an RDMA device
+              # plugin such as k8s-rdma-shared-dev-plugin. hostNetwork gives
+              # the interfaces, not the device nodes. The resource name is
+              # the plugin's configuration; rdma/spark_roce is one cluster's.
+              rdma/spark_roce: 1
+          volumeMounts:
+            # Read-only: model-loader alone writes the store. gr8 still opens
+            # the socket in it, which a read-only mount allows.
+            - {name: store, mountPath: /var/lib/model-loader, readOnly: true}
+            - {name: home, mountPath: /var/lib/gr8/home}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        # The peer DaemonSet's store on this node.
+        - name: store
+          hostPath: {path: /var/lib/model-loader, type: Directory}
+        - name: home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

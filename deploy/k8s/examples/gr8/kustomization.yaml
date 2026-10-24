@@ -1,0 +1,55 @@
+# gr8 next to model-loader on Kubernetes, with a NAS outside the cluster as
+# the root that holds the master copy, and every GPU node a peer:
+#
+#   kubectl apply -k deploy/k8s/examples/gr8
+#
+# Change before use: nas.lan:7762 (the NAS's model-loader), the catalog,
+# and the gr8 node and settings in gr8.yaml. The NAS runs model-loader with
+# -mode=root (deploy/compose/nas.env.example). README.md says more.
+resources:
+  - ../../base
+  - gr8.yaml
+
+patches:
+  # The NAS is the root, so the cluster runs none.
+  - patch: |
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: model-loader-root
+  - target: {kind: DaemonSet, name: model-loader-peer}
+    patch: |
+      # Peers fetch from each other first, then from the NAS. -selection
+      # names a file that is not there, which selects nothing: a peer holds
+      # what the requests of the gr8 on its node ask for, and no more.
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: -peers=nas.lan:7762
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: -selection=/var/lib/model-loader/selection.yaml
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: -disk-budget=90%
+      # Group 1000 is gr8's (its image runs as 1000:1000). The local request
+      # API's socket, model-loader.sock in the store, is mode 0660 in this
+      # process's group, so gr8 can open it and nothing else on the node
+      # can. The store's files are 0644 and its directories 0755.
+      - op: add
+        path: /spec/template/spec/containers/0/securityContext
+        value: {runAsUser: 0, runAsGroup: 1000}
+      # Ready once the socket answers, which is what gr8 waits on.
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe
+        value:
+          exec:
+            command: [model-loader, -check, unix:/var/lib/model-loader/model-loader.sock]
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+configMapGenerator:
+  - name: model-loader-catalog
+    behavior: replace
+    files:
+      - catalog.yaml

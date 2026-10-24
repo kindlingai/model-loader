@@ -1,0 +1,61 @@
+# gr8 next to model-loader on one box. Use it with docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f gr8.yml up -d
+#
+# gr8 reads its weights from the model-loader store, mounted read-only, and
+# asks the local model-loader for the pieces its rank needs through the
+# socket in that store. It starts once model-loader's health check passes,
+# that is once the socket answers.
+#
+# This is the part of gr8's own docker/compose.yaml that touches
+# model-loader, plus what a box needs to run it at all. gr8's file has the
+# rest (logs volume, read-only image, health check), and its docker/README.md
+# says what each setting is for.
+#
+# The two settings in `environment` are the interface kindlingai/gr8#180
+# adds to gr8's launcher (the store path and the local model-loader
+# address). gr8 releases before #178 and #180 ignore them and fetch their
+# own weights.
+services:
+  gr8:
+    image: ${GR8_IMAGE:-ghcr.io/kindlingai/gr8:latest}
+    container_name: gr8
+    depends_on:
+      model-loader:
+        condition: service_healthy
+    # The launcher's options (MODEL, PEERS and so on): gr8's docker/.env.
+    env_file:
+      - path: ${GR8_ENV:-gr8.env}
+        required: false
+    environment:
+      - MODEL_CACHE=/var/lib/model-loader
+      - MODEL_LOADER=unix:/var/lib/model-loader/model-loader.sock
+      - G6_HOME=/var/lib/gr8/home
+    network_mode: host
+    pid: host
+    devices:
+      - /dev/infiniband:/dev/infiniband
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ulimits:
+      memlock: -1
+      core: 0
+    cap_drop: [ALL]
+    cap_add: [IPC_LOCK]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 30s
+    volumes:
+      # Read-only: model-loader alone writes the store. gr8 still opens the
+      # socket in it, which a read-only mount allows.
+      - ${MODEL_LOADER_STORE:-model-loader-store}:/var/lib/model-loader:ro
+      - gr8-home:/var/lib/gr8/home
+
+volumes:
+  gr8-home:

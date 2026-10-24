@@ -44,6 +44,7 @@ func main() {
 
 type config struct {
 	showVersion bool
+	check       string
 	mode        string
 	storeDir    string
 	catalogPath string
@@ -76,7 +77,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.listen, "listen", fmt.Sprintf(":%d", defaultPort), "address to serve the HTTP API on")
 	fs.StringVar(&cfg.nodeID, "node-id", "", "this node's identifier (default: hostname)")
 	fs.StringVar(&cfg.discoveryKind, "discovery", "static", "peer discovery backend: static, k8s, or mentat (the local mentatd's peer table, on kindling-spark-os)")
-	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list, for -discovery=static; with -discovery=mentat, more peers to add, such as a NAS that runs no mentatd")
+	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list; with -discovery=k8s or mentat, more peers to add, such as a NAS root outside the cluster")
 	fs.StringVar(&cfg.mentatURL, "mentat-url", discovery.DefaultMentatURL, "the local mentatd's HTTP side port, for -discovery=mentat")
 	fs.IntVar(&cfg.mentatPort, "mentat-port", defaultPort, "port model-loader listens on on every box, for -discovery=mentat")
 	fs.StringVar(&cfg.k8sService, "k8s-service", "", "headless Service DNS name, for -discovery=k8s")
@@ -88,10 +89,11 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.diskBudget, "disk-budget", "", "most the store may hold, as bytes (500G, 2T) or a percentage of its filesystem (80%); fetches evict unwanted segments the fleet keeps copies of to stay under it. Empty: no budget, nothing evicted")
 	fs.StringVar(&cfg.localListen, "local-listen", "unix:model-loader.sock", "where to serve the local request API: unix:PATH (relative to -store) or host:port; empty to turn it off")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
+	fs.StringVar(&cfg.check, "check", "", "check that the local request API at unix:PATH (relative to -store) or host:port answers, exit 0 if it does, and exit; for health checks and for a consumer to wait on")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
-	if cfg.showVersion {
+	if cfg.showVersion || cfg.check != "" {
 		return cfg, nil
 	}
 
@@ -135,6 +137,9 @@ func run(args []string) error {
 	cfg, err := parseFlags(args)
 	if err != nil {
 		return err
+	}
+	if cfg.check != "" {
+		return checkLocal(cfg.check, cfg.storeDir)
 	}
 	if cfg.showVersion {
 		fmt.Println("model-loader", version)
@@ -268,36 +273,80 @@ func run(args []string) error {
 }
 
 func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
+	static, err := staticPeers(cfg.staticPeers)
+	if err != nil {
+		return nil, err
+	}
+	var d discovery.Discoverer
 	switch cfg.discoveryKind {
 	case "k8s":
-		return discovery.NewK8sDNS(cfg.k8sService, cfg.k8sPort), nil
+		d = discovery.NewK8sDNS(cfg.k8sService, cfg.k8sPort)
 	case "mentat":
-		m, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort)
-		if err != nil {
+		if d, err = discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(cfg.staticPeers) == "" {
-			return m, nil
-		}
-		static, err := buildDiscoverer(&config{staticPeers: cfg.staticPeers})
-		if err != nil {
-			return nil, err
-		}
-		return discovery.NewMulti(m, static), nil
 	default:
-		var addrs []string
-		for _, a := range strings.Split(cfg.staticPeers, ",") {
-			a = strings.TrimSpace(a)
-			if a == "" {
-				continue
-			}
-			if _, _, err := net.SplitHostPort(a); err != nil {
-				return nil, fmt.Errorf("-peers: invalid address %q: %w", a, err)
-			}
-			addrs = append(addrs, a)
-		}
-		return discovery.NewStatic(addrs), nil
+		return static, nil
 	}
+	// -peers adds boxes the backend cannot find, such as a NAS root outside
+	// the cluster or with no mentatd. Multi keeps them while the backend is
+	// down.
+	if strings.TrimSpace(cfg.staticPeers) == "" {
+		return d, nil
+	}
+	return discovery.NewMulti(d, static), nil
+}
+
+// staticPeers parses -peers, a comma-separated host:port list.
+func staticPeers(list string) (discovery.Discoverer, error) {
+	var addrs []string
+	for _, a := range strings.Split(list, ",") {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(a); err != nil {
+			return nil, fmt.Errorf("-peers: invalid address %q: %w", a, err)
+		}
+		addrs = append(addrs, a)
+	}
+	return discovery.NewStatic(addrs), nil
+}
+
+// checkTimeout bounds -check, so a wedged daemon fails a health check
+// rather than hanging it.
+const checkTimeout = 3 * time.Second
+
+// checkLocal asks the local request API at addr (as -local-listen takes
+// it, a relative unix path being under storeDir) for its request list,
+// and returns nil if it answers 200. It proves more than a TCP check of
+// -listen can: that the socket a consumer uses is there, is not stale,
+// and is served.
+func checkLocal(addr, storeDir string) error {
+	network, target := "tcp", addr
+	if path, ok := strings.CutPrefix(addr, "unix:"); ok {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(storeDir, path)
+		}
+		network, target = "unix", path
+	}
+	client := &http.Client{
+		Timeout: checkTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, target)
+			},
+		},
+	}
+	resp, err := client.Get("http://local/requests")
+	if err != nil {
+		return fmt.Errorf("check %s: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("check %s: %s", addr, resp.Status)
+	}
+	return nil
 }
 
 // listenLocal listens on addr for the local request API: "unix:PATH" is a

@@ -41,8 +41,16 @@ jobs:
       - name: validate kustomize base
         run: kubectl kustomize deploy/k8s/base >/dev/null
 
+      - name: validate kustomize gr8 example
+        run: kubectl kustomize deploy/k8s/examples/gr8 >/dev/null
+
       - name: validate docker compose
-        run: docker compose -f deploy/compose/docker-compose.yml config >/dev/null
+        run: |
+          docker compose -f deploy/compose/docker-compose.yml config >/dev/null
+          docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/gr8.yml config >/dev/null
+          for env in nas spark; do
+            docker compose --env-file deploy/compose/$env.env.example -f deploy/compose/docker-compose.yml config >/dev/null
+          done
 
   image:
     runs-on: blacksmith-2vcpu-ubuntu-2204

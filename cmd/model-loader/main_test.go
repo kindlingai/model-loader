@@ -154,3 +154,25 @@ func TestBuildDiscovererMentat(t *testing.T) {
 		}
 	}
 }
+
+// -peers adds boxes with -discovery=k8s too (a NAS root outside the
+// cluster), and they stay listed when the backend fails.
+func TestBuildDiscovererK8sPeers(t *testing.T) {
+	cfg, err := parseFlags([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "k8s",
+		"-k8s-service", "model-loader-headless.invalid", "-peers", "nas.lan:7762"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := buildDiscoverer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Peers(context.Background())
+	if err != nil || len(got) != 1 || got[0].Addr != "nas.lan:7762" {
+		t.Fatalf("Peers = %v, %v; want nas.lan:7762", got, err)
+	}
+	cfg.staticPeers = "nas.lan"
+	if _, err := buildDiscoverer(cfg); err == nil {
+		t.Fatal("-peers with no port accepted")
+	}
+}

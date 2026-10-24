@@ -1,0 +1,39 @@
+# gr8 on a spark-os box, reading its weights from the box's model-loader
+# store. Add it to gr8's own compose file:
+#
+#   docker compose -f docker/compose.yaml -f /path/to/gr8.override.yml up -d
+#
+# It mounts the store read-only where gr8 reads its model, points gr8 at the
+# local model-loader's socket, and holds gr8 back until that socket answers.
+# Paths here are absolute, so the file can live anywhere.
+#
+# The two settings in `environment` are the interface kindlingai/gr8#180
+# adds to gr8's launcher (the store path and the local model-loader
+# address). gr8 releases before #178 and #180 ignore them and fetch their
+# own weights.
+services:
+  gr8:
+    environment:
+      - MODEL_CACHE=/var/lib/model-loader
+      - MODEL_LOADER=unix:/var/lib/model-loader/model-loader.sock
+    volumes:
+      # Read-only: model-loader alone writes the store. gr8 still opens the
+      # socket in it, which a read-only mount allows.
+      - /var/lib/model-loader:/var/lib/model-loader:ro
+    depends_on:
+      model-loader-ready:
+        condition: service_completed_successfully
+
+  # Exits 0 once the box's model-loader (model-loader.service) answers on
+  # its socket. Compose cannot wait on a systemd unit, so it waits on this.
+  model-loader-ready:
+    image: ${MODEL_LOADER_IMAGE:-ghcr.io/kindlingai/model-loader:latest}
+    user: "1000:1000"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - until model-loader -check unix:/var/lib/model-loader/model-loader.sock; do sleep 2; done
+    volumes:
+      - /var/lib/model-loader:/var/lib/model-loader:ro

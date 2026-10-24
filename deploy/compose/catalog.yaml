@@ -1,3 +1,9 @@
-# Fleet-wide desired state. See docs/design.md and internal/catalog for the
-# schema. Replace this with your own models before deploying.
-models: []
+# Every model the fleet may hold, each pinned to a revision (pin a commit for
+# a real deployment). Every box and the NAS use the same catalog. See
+# docs/design.md and internal/catalog for the schema.
+models:
+  - name: glm-5.3-exlr8
+    source:
+      type: huggingface
+      repo: kindlingai/glm-5.3-exlr8-k2-k3-k4
+    revision: main

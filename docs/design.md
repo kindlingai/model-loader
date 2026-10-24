@@ -334,13 +334,35 @@ answer:
 
 One repo, one binary, three deploy trees under `deploy/`:
 
-- `deploy/k8s/` — Kustomize: a root DaemonSet/Deployment and a peer
-  DaemonSet, a headless Service for discovery, a ConfigMap for the catalog.
+- `deploy/k8s/` — Kustomize: a root Deployment and a peer DaemonSet, a
+  headless Service for discovery, a ConfigMap for the catalog.
+  `examples/gr8` adds gr8 on one node, with a NAS outside the cluster as
+  the root.
 - `deploy/compose/` — a `docker-compose.yml` with role and peer list set by
-  environment variables.
+  environment variables, `gr8.yml` to add gr8 on the same box, and env
+  files for a NAS root and for a Spark peer.
 - `deploy/spark-os/` — a systemd unit and `/etc/spark/model-loader.env`
-  template, following kindling-spark-os's existing convention (binary under
-  `/opt/kindling/model-loader/`, unit conditional on its env file existing).
+  template, following kindling-spark-os's existing convention (binary at
+  `/usr/local/bin/model-loader`, unit conditional on its env file
+  existing), with mentat discovery, and `gr8.override.yml` for gr8's own
+  compose file.
+
+Each target gives gr8 the same two things:
+
+- The store, mounted read-only in gr8's container. Only model-loader
+  writes it. Its files are 0644 and its directories 0755.
+- The local request API: the unix socket `model-loader.sock` in the store,
+  so the same read-only mount carries it (a read-only mount does not stop
+  a process opening a socket). The socket is mode 0660, and model-loader
+  runs in group 1000, gr8's, so gr8 can open it and other users cannot.
+  The API has no authentication, so it is never on a TCP port.
+
+gr8 starts once `model-loader -check unix:PATH` passes, that is once the
+socket answers a request. A TCP check of `-listen` would not show that: the
+local API opens after it, and a socket left by a dead process is still a
+file. Compose waits on a health check, k8s on an init container, and
+spark-os's compose override on a one-shot container, as compose cannot wait
+on a systemd unit.
 
 ## Relationship to home-ops
 

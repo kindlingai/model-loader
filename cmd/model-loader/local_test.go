@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -79,5 +80,69 @@ func TestListenLocal(t *testing.T) {
 		}
 		won[0].(*lockedListener).Listener.(*net.UnixListener).SetUnlinkOnClose(false)
 		won[0].Close()
+	}
+}
+
+// -check passes only for a local API that answers: not a missing socket,
+// a stale one no process serves, or a server that answers an error.
+func TestCheckLocal(t *testing.T) {
+	dir, err := os.MkdirTemp("", "ml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if err := checkLocal("unix:s.sock", dir); err == nil {
+		t.Fatal("check passed with no socket")
+	}
+
+	ln, err := listenLocal("unix:s.sock", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := http.StatusOK
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/requests" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(status)
+	})}
+	go srv.Serve(ln)
+	if err := checkLocal("unix:s.sock", dir); err != nil {
+		t.Fatalf("check of a served socket: %v", err)
+	}
+	if err := checkLocal("unix:"+filepath.Join(dir, "s.sock"), "/nowhere"); err != nil {
+		t.Fatalf("check by absolute path: %v", err)
+	}
+	status = http.StatusInternalServerError
+	if err := checkLocal("unix:s.sock", dir); err == nil {
+		t.Fatal("check passed on a 500")
+	}
+
+	// A socket left behind: the file is there, nothing serves it.
+	stale := filepath.Join(dir, "stale.sock")
+	l, err := net.Listen("unix", stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	l.Close()
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkLocal("unix:stale.sock", dir); err == nil {
+		t.Fatal("check passed on a stale socket")
+	}
+	srv.Close()
+}
+
+// -check needs no other flags, as a probe has none of the daemon's.
+func TestCheckFlag(t *testing.T) {
+	cfg, err := parseFlags([]string{"-check", "unix:/run/x.sock"})
+	if err != nil || cfg.check != "unix:/run/x.sock" {
+		t.Fatalf("parseFlags: %+v, %v", cfg, err)
+	}
+	if err := run([]string{"-check", "127.0.0.1:1"}); err == nil {
+		t.Fatal("run -check passed with nothing listening")
 	}
 }

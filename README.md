@@ -67,12 +67,12 @@ internal/transfer/  resumable range-fetch engine
 internal/want/      what a node must hold: selection to needed segments
 internal/request/   named requests from local consumers (gr8), saved in the store
 internal/xxh64/     XXH64 (seed 0), for consumer range checksums
-internal/discovery/ peer discovery backends (static, k8s DNS)
+internal/discovery/ peer discovery backends (static, k8s DNS, mentat)
 internal/server/    LAN-facing HTTP server (status/manifest/blob), local request API
 internal/daemon/    reconcile loop tying it together
-deploy/k8s/         Kustomize manifests
-deploy/compose/     docker-compose.yml
-deploy/spark-os/    systemd unit + env template for kindling-spark-os
+deploy/k8s/         Kustomize manifests; examples/gr8 runs gr8 beside a peer
+deploy/compose/     docker-compose.yml; gr8.yml adds gr8 on the same box
+deploy/spark-os/    systemd unit, env template and gr8 compose override
 ```
 
 ## License

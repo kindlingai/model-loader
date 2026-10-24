@@ -1,29 +1,46 @@
-# model-loader node daemon. Per-box settings (MODEL_LOADER_MODE and friends)
-# come from /etc/spark/model-loader.env, which the initramfs copies from the
-# box's own disk the same way it does for /etc/spark/node.env (mentat).
+# model-loader node daemon. Per-box settings come from
+# /etc/spark/model-loader.env, which the initramfs copies from the box's own
+# disk the same way it does /etc/spark/node.env (mentat).
 #
-# Flags are passed via a shell wrapper rather than the binary reading the
-# environment itself, so the same catalog.yaml/binary work unmodified across
-# the k8s, compose, and spark-os deploy targets -- only this unit's
-# env-to-flag mapping is spark-os-specific. The one exception is HF_TOKEN,
-# which the binary reads from its environment like huggingface_hub does.
+# Flags are passed through a shell wrapper rather than the binary reading
+# the environment itself, so the same catalog.yaml and binary work unchanged
+# across the k8s, compose and spark-os deploy targets; only this unit's
+# env-to-flag mapping is spark-os's. The one exception is HF_TOKEN, which
+# the binary reads from its environment like huggingface_hub does. "$$"
+# passes a "$" through to the shell; with one, systemd would substitute the
+# variable itself and know no "${VAR:-default}", so every default would be
+# empty.
+#
+# Peers come from the box's mentatd (-discovery=mentat), which already finds
+# the other boxes; MODEL_LOADER_PEERS adds a NAS root, which runs no mentatd.
+# The store must be on the DGX OS disk: install spark-os with
+# --mounts /var/lib/model-loader.
 [Unit]
 Description=model-loader node daemon
-After=network.target NetworkManager.service
+After=network.target NetworkManager.service mentatd.service
 ConditionPathExists=/etc/spark/model-loader.env
+# Keeps retrying, with no start limit, as mentatd.service does.
 StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=/etc/spark/model-loader.env
+# Group 1000 is gr8's (its image runs as 1000:1000). The local request API's
+# socket, model-loader.sock in the store, is mode 0660 in this process's
+# group, so gr8's container can open it and other users cannot. The store's
+# files are 0644 and its directories 0755, so gr8 reads them.
+Group=1000
 ExecStart=/bin/sh -c '\
   exec /usr/local/bin/model-loader \
-    -mode="$MODEL_LOADER_MODE" \
-    -catalog="${MODEL_LOADER_CATALOG:-/etc/model-loader/catalog.yaml}" \
-    -store="${MODEL_LOADER_STORE:-/var/lib/model-loader}" \
-    -listen="${MODEL_LOADER_LISTEN:-:7762}" \
-    -discovery="${MODEL_LOADER_DISCOVERY:-static}" \
-    -peers="${MODEL_LOADER_PEERS:-}" \
-    -node-id="${MODEL_LOADER_NODE_ID:-}" \
+    -mode="$$MODEL_LOADER_MODE" \
+    -catalog="$${MODEL_LOADER_CATALOG:-/etc/model-loader/catalog.yaml}" \
+    -selection="$${MODEL_LOADER_SELECTION:-}" \
+    -store="$${MODEL_LOADER_STORE:-/var/lib/model-loader}" \
+    -listen="$${MODEL_LOADER_LISTEN:-:7762}" \
+    -local-listen="$${MODEL_LOADER_LOCAL_LISTEN:-unix:model-loader.sock}" \
+    -discovery="$${MODEL_LOADER_DISCOVERY:-mentat}" \
+    -peers="$${MODEL_LOADER_PEERS:-}" \
+    -disk-budget="$${MODEL_LOADER_DISK_BUDGET:-}" \
+    -node-id="$${MODEL_LOADER_NODE_ID:-}" \
 '
 Restart=always
 RestartSec=2

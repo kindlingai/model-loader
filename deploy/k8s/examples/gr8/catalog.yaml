@@ -1,0 +1,9 @@
+# Every model the fleet may hold, each pinned to a revision. The NAS root
+# holds them all; a peer holds what its gr8 asks for. The NAS's catalog
+# must list the same models.
+models:
+  - name: glm-5.3-exlr8
+    source:
+      type: huggingface
+      repo: kindlingai/glm-5.3-exlr8-k2-k3-k4
+    revision: main

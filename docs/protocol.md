@@ -166,6 +166,11 @@ mode 0660: its owner and group may use it. model-loader holds a lock on
 path whose lock another process holds, that is not a socket, or that
 another process answers on.
 
+`model-loader -check ADDR` (ADDR as `-local-listen` takes it) sends
+`GET /requests` to the local API and exits 0 if it answers 200, 1 if not,
+within 3 s. Health checks, and consumers waiting for model-loader to start,
+use it.
+
 ### `PUT /requests/{name}`
 
 Create the request `name`, or replace it. `name` is 1 to 128 of

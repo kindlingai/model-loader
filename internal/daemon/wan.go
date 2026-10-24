@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/kindlingai/model-loader/internal/want"
 	"hash"
 	"io"
 	"io/fs"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
@@ -63,13 +65,29 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 
 	total := manifest.TotalSize()
 	var done int64
+	var progress atomic.Int64 // bytes of the revision on disk so far
 	report := func(inFile int64) {
+		progress.Store(done + inFile)
 		d.setStatus(server.ModelStatus{
 			Model: m.Name, Revision: m.Revision, State: server.StateDownloading,
 			BytesTotal: total, BytesDone: done + inFile,
 		})
 	}
 	report(0)
+
+	// Room for the whole revision, less what is on disk of it, before any
+	// of it is written. A resumed download's bytes on disk are already in
+	// the store's use, and progress counts them once originProgress has
+	// looked at their file, so until then they are counted twice: more
+	// room is asked for, never less.
+	release, err := d.makeRoom(ctx, []spaceNeed{{
+		key:       "wan\x00" + want.Key(m.Name, m.Revision),
+		remaining: func() int64 { return total - progress.Load() },
+	}})
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	for i, fm := range manifest.Files {
 		of, err := d.originProgress(m, rs, fm, report)
@@ -78,7 +96,10 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 		}
 		if !of.Complete {
 			report(of.BytesDone)
-			if err := d.downloadFile(ctx, src, m, rs, of, report); err != nil {
+			done := d.writing(m.Name, m.Revision, fm)
+			err := d.downloadFile(ctx, src, m, rs, of, report)
+			done()
+			if err != nil {
 				return nil, fmt.Errorf("download %s: %w", fm.Path, err)
 			}
 		}

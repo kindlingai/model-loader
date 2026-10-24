@@ -183,21 +183,33 @@ Spread over the boxes, with each deleting what it does not need, both fit.
 such as `85%`) sets the most the store may hold. Without one nothing is
 evicted or removed.
 
-Before a fetch, the node makes room: if the bytes it holds plus what every
-fetch in flight still has to fetch would go over the budget, it evicts
-segments, least recently used first (a segment is used when it is fetched
-or served to a peer), until the fetch fits. If it cannot fit after evicting
-everything it may, the model is in error with the reason, and is tried
-again at the next tick. A root pulling through for a peer makes room the
-same way. At every tick the node also evicts down to the budget (it may
-have been lowered) and counts what it could evict, for `/status`.
+The store's use is the disk space its model files take: the blocks the
+filesystem allocated to them. So it counts what is really on disk, bytes a
+failed transfer wrote included, and holds across restarts.
+
+Before a fetch, the node reserves room for every segment it still has to
+fetch (fetches of the same segment share one reservation; a root's
+download from its origin reserves the whole revision before it writes).
+If the store's use plus every reservation would go over the budget, it
+frees space until it fits: first bytes no held segment covers, in files
+nothing is writing (what a failed transfer left), then held segments,
+least recently used first (a segment is used when it is fetched or served
+to a peer). Freed space is measured again, not assumed. If the fetch cannot
+fit after freeing everything it may, the model is in error with the
+reason, and is tried again at the next tick. A root pulling through for a
+peer makes room the same way, and the segments the pull needs (its range
+and what its checksums span) cannot be evicted to make it. At every tick
+the node also frees down to the budget (it may have been lowered) and
+counts what it could evict, for `/status`.
 
 A segment may be evicted only when all of these hold:
 
 - Nothing on this node wants it: no request and no selection entry names
-  it. Those pieces are pinned. If the selection cannot be worked out,
-  nothing is evicted.
-- It is not being served to a peer at that moment.
+  it. Those pieces are pinned. The pins are read again just before
+  eviction acts, and a request change waits for that, so a request
+  acknowledged before eviction is never overtaken by it. If the wants
+  cannot be worked out, nothing is evicted.
+- Nothing is serving it to a peer, nor writing its file, at that moment.
 - The fleet keeps a copy. A node that can fetch the model from its origin
   (a root) may always evict, since the origin has it. A peer may evict only
   a segment that a root holds, or that a peer with a lower node ID holds.
@@ -207,13 +219,19 @@ A segment may be evicted only when all of these hold:
   not answer is taken to hold nothing.
 
 An evicted segment's blocks go back to the filesystem (a hole punched in
-the file, on Linux); a file with nothing left held is removed. Eviction
-forgets only the consumer checksums over the evicted segment, so a request
-for another range of the file stays ready.
+the file, on Linux and macOS; elsewhere the space stays charged); a file
+with nothing left held is removed. Eviction forgets only the consumer
+checksums over the evicted segment, so a request for another range of the
+file stays ready.
 
-Revisions the catalog no longer names are removed whole, files, state and
-manifest, at the next tick: no selection or request can name them, so
-nothing can want them.
+A revision the catalog no longer names is removed whole, files, state and
+manifest, at a tick when all of these hold: no saved request and no
+selection entry on this node names it, nothing is serving it, and every
+peer answers that its own catalog does not name it either (`cataloged` in
+`/segments`). A node whose catalog still names it may be counting on this
+node's copy, as the lowest-ID holder, so a catalog change takes effect on
+disk only once it has reached the whole fleet. Without a budget nothing is
+evicted or removed.
 
 ## Network protocol
 

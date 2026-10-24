@@ -19,7 +19,8 @@ type RevisionRef struct {
 }
 
 // Revisions lists every model revision the store has a manifest or state
-// for.
+// for. Each is named as its manifest or state file names it, not by its
+// path: a revision may itself contain a slash.
 func (s *Store) Revisions() ([]RevisionRef, error) {
 	seen := make(map[RevisionRef]bool)
 	var out []RevisionRef
@@ -32,13 +33,15 @@ func (s *Store) Revisions() ([]RevisionRef, error) {
 			if d.IsDir() || !strings.HasSuffix(path, ".json") || strings.HasPrefix(d.Name(), ".") {
 				return nil
 			}
-			rel, err := filepath.Rel(dir, strings.TrimSuffix(path, ".json"))
-			if err != nil {
-				return err
+			var id struct {
+				Model    string `json:"model"`
+				Revision string `json:"revision"`
 			}
-			model, rev := filepath.Split(filepath.ToSlash(rel))
-			ref := RevisionRef{strings.TrimSuffix(model, "/"), rev}
-			if ref.Model != "" && !seen[ref] {
+			if err := unmarshalJSONFile(path, &id); err != nil || id.Model == "" || id.Revision == "" {
+				return nil // not ours, or half written: leave it be.
+			}
+			ref := RevisionRef{id.Model, id.Revision}
+			if !seen[ref] {
 				seen[ref] = true
 				out = append(out, ref)
 			}
@@ -51,22 +54,38 @@ func (s *Store) Revisions() ([]RevisionRef, error) {
 	return out, nil
 }
 
-// OriginBytes returns how many bytes a root has downloaded of a revision
-// it has no manifest for yet (see RevisionState.Origin).
-func (s *Store) OriginBytes(model, revision string) (int64, error) {
-	var rs RevisionState
-	err := unmarshalJSONFile(s.statePath(model, revision), &rs)
-	if os.IsNotExist(err) {
-		return 0, nil
+// Allocated returns the disk space the store's model files take: the
+// blocks the filesystem has allocated to them, so sparse files count only
+// what is written, and bytes written but never verified (a failed
+// transfer) count too.
+func (s *Store) Allocated() (int64, error) {
+	var total int64
+	err := filepath.WalkDir(filepath.Join(s.root, "models"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.Type().IsRegular() {
+			total += allocatedPath(path)
+		}
+		return nil
+	})
+	return total, err
+}
+
+// FileAllocated returns the disk space one file of a revision takes.
+func (s *Store) FileAllocated(model, revision, relPath string) int64 {
+	return allocatedPath(s.FilePath(model, revision, relPath))
+}
+
+func allocatedPath(path string) int64 {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return 0
 	}
-	if err != nil {
-		return 0, err
-	}
-	var n int64
-	for _, of := range rs.Origin {
-		n += of.BytesDone
-	}
-	return n, nil
+	return int64(st.Blocks) * 512
 }
 
 // RemoveRevision deletes a revision's files, state and manifest.
@@ -84,7 +103,8 @@ func (s *Store) RemoveRevision(model, revision string) error {
 // filesystem: it punches a hole over the segment, so the file keeps its
 // size and its other segments, or removes the file if none is left held.
 // The caller drops the segment from the state, and saves it, first, so
-// nothing serves the bytes once they are gone.
+// nothing serves the bytes once they are gone, and makes sure nothing is
+// writing the file.
 func (s *Store) FreeSegment(model, revision string, fm FileManifest, i int, lastHeld bool) error {
 	path := s.FilePath(model, revision, fm.Path)
 	if lastHeld {
@@ -93,7 +113,7 @@ func (s *Store) FreeSegment(model, revision string, fm FileManifest, i int, last
 		}
 		return nil
 	}
-	f, err := openRegular(path)
+	f, err := openRegularRW(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -103,6 +123,20 @@ func (s *Store) FreeSegment(model, revision string, fm FileManifest, i int, last
 	defer f.Close()
 	start, end := fm.SegmentBounds(i)
 	return punchHole(f, start, end-start)
+}
+
+// openRegularRW opens path for writing without following a symlink, and
+// only if it is a regular file.
+func openRegularRW(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	return f, nil
 }
 
 // ParseBudget reads a disk budget: a byte count with an optional K, M, G

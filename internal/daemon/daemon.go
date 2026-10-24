@@ -102,11 +102,12 @@ type Daemon struct {
 	kick       chan struct{}     // see Kick
 	wantsGen   atomic.Uint64     // see Kick
 
-	diskMu   sync.Mutex                // serializes making room and evicting
-	reserved map[*reservation]struct{} // fetches in flight; diskMu guards
-	useMu    sync.Mutex                // guards serving
-	serving  map[string]int            // segments being served; see useKey
-	onPass   func()                    // tests: called as each Run pass starts
+	diskMu   sync.Mutex              // serializes making room and evicting
+	reserved map[string]*reservation // room held for fetches; diskMu guards
+	pinMu    sync.Mutex              // orders request changes and eviction
+	useMu    sync.Mutex              // guards serving
+	serving  map[string]int          // segments being served; see useKey
+	onPass   func()                  // tests: called as each Run pass starts
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
@@ -142,7 +143,7 @@ func New(cfg Config) *Daemon {
 		limit:      transfer.NewLimiter(cfg.MaxConcurrentTransfers),
 		availSlots: make(chan struct{}, availabilityQueries),
 		kick:       make(chan struct{}, 1),
-		reserved:   make(map[*reservation]struct{}),
+		reserved:   make(map[string]*reservation),
 		serving:    make(map[string]int),
 		change:     make(chan struct{}),
 		statuses:   make(map[string]server.ModelStatus),
@@ -304,9 +305,11 @@ func (d *Daemon) reloadSelection() error {
 	if err != nil {
 		return err
 	}
+	d.pinMu.Lock() // see PutRequest
 	d.mu.Lock()
 	d.cfg.Selection = sel
 	d.mu.Unlock()
+	d.pinMu.Unlock()
 	return nil
 }
 
@@ -403,7 +406,17 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 
 	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
 
-	release, err := d.makeRoom(ctx, func() int64 { return need.Bytes(manifest) - need.BytesDone(manifest, rs) })
+	var needs []spaceNeed
+	for _, fm := range manifest.Files {
+		if fn := need.Files[fm.Path]; fn != nil {
+			for i, n := range fn.Segments {
+				if n && rs.SegmentTrust(fm, i) == "" {
+					needs = append(needs, segmentNeed(manifest, rs, fm, i))
+				}
+			}
+		}
+	}
+	release, err := d.makeRoom(ctx, needs)
 	if err != nil {
 		ms := progress(w, manifest, need, rs, server.StateError)
 		ms.Error = err.Error()
@@ -435,6 +448,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			continue
 		}
 		var err error
+		done := d.writing(m.Name, m.Revision, fm)
 		if pull {
 			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
 		} else {
@@ -442,6 +456,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 				Need: fn.Segments, Order: srcs.order(fm.Path), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
 			})
 		}
+		done()
 		if err != nil {
 			// Go on with the other files: one bad piece (a consumer
 			// checksum that does not match, say) must not hold back

@@ -65,6 +65,12 @@ type DiskStatus struct {
 	EvictableBytes int64 `json:"evictable_bytes"`
 }
 
+// Cataloger, when the StatusProvider implements it, says whether the
+// node's catalog names a model revision.
+type Cataloger interface {
+	Cataloged(model, revision string) bool
+}
+
 // UseTracker, when the StatusProvider implements it, is told when a range
 // starts being served. The function it returns is called when serving
 // ends. Eviction keeps a segment that is being served, and removes the

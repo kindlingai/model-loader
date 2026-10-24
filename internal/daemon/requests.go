@@ -111,7 +111,11 @@ func (d *Daemon) PutRequest(r request.Request) (server.RequestStatus, error) {
 	if err := request.Resolve(d.cfg.Catalog, &r); err != nil {
 		return server.RequestStatus{}, err
 	}
+	// Under pinMu, so an eviction under way either sees this request's
+	// pins or is over before the request is acknowledged.
+	d.pinMu.Lock()
 	saved, err := d.cfg.Requests.Put(r)
+	d.pinMu.Unlock()
 	if err != nil {
 		return server.RequestStatus{}, err
 	}
@@ -158,7 +162,9 @@ func (d *Daemon) DeleteRequest(name string) (bool, error) {
 	if d.cfg.Requests == nil {
 		return false, nil
 	}
+	d.pinMu.Lock()
 	found, err := d.cfg.Requests.Delete(name)
+	d.pinMu.Unlock()
 	if found {
 		d.Kick()
 		d.notify()

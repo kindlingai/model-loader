@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -25,49 +27,68 @@ func TestParseBudget(t *testing.T) {
 	}
 }
 
-// Evicting a segment forgets only the checks over it, and frees it while
-// the rest of the file reads the same.
+// Evicting a segment forgets only the checks over it, and frees its
+// blocks while the rest of the file reads the same.
 func TestEvictSegment(t *testing.T) {
 	st, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	fm := FileManifest{Path: "f", Size: 30, SegmentSize: 10}
-	m := &Manifest{Model: "m", Revision: "r", Files: []FileManifest{fm}}
+	const seg = 64 << 10
+	fm := FileManifest{Path: "f", Size: 3 * seg, SegmentSize: seg}
+	m := &Manifest{Model: "m", Revision: "refs/pr/1", Files: []FileManifest{fm}}
 	rs := NewRevisionState(m)
 	for i := range 3 {
 		rs.MarkSegment(fm, i, "", TrustManifest)
 	}
 	rs.AddChecked(fm, RangeCheck{Offset: 0, Length: 5})
-	rs.AddChecked(fm, RangeCheck{Offset: 15, Length: 10})
+	rs.AddChecked(fm, RangeCheck{Offset: seg + 5, Length: 10})
 	rs.EvictSegment(fm, 0)
 	fs := rs.FileState(fm)
-	if fs.SegmentsDone[0] || !fs.SegmentsDone[1] || fs.HasChecked(RangeCheck{Offset: 0, Length: 5}) || !fs.HasChecked(RangeCheck{Offset: 15, Length: 10}) {
+	if fs.SegmentsDone[0] || !fs.SegmentsDone[1] || fs.HasChecked(RangeCheck{Offset: 0, Length: 5}) || !fs.HasChecked(RangeCheck{Offset: seg + 5, Length: 10}) {
 		t.Fatalf("state after evicting segment 0 = %+v", fs)
 	}
 	if fs.LastUsed(1) == 0 {
 		t.Fatal("a fetched segment has no use time")
 	}
 
-	f, err := st.EnsureFile("m", "r", fm)
+	f, err := st.EnsureFile(m.Model, m.Revision, fm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := []byte("aaaaaaaaaabbbbbbbbbbcccccccccc")
+	data := make([]byte, 3*seg)
+	for i := range data {
+		data[i] = byte(i%251) + 1
+	}
 	f.WriteAt(data, 0)
+	f.Sync()
 	f.Close()
-	if err := st.FreeSegment("m", "r", fm, 0, false); err != nil {
+	before := st.FileAllocated(m.Model, m.Revision, "f")
+	err = st.FreeSegment(m.Model, m.Revision, fm, 0, false)
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		if err == nil {
+			t.Fatal("FreeSegment says it freed space it cannot free here")
+		}
+		return
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := os.ReadFile(st.FilePath("m", "r", "f"))
-	if len(got) != 30 || string(got[10:]) != string(data[10:]) || string(got[:10]) != string(make([]byte, 10)) {
-		t.Fatalf("after freeing segment 0: %q", got)
+	got, _ := os.ReadFile(st.FilePath(m.Model, m.Revision, "f"))
+	if len(got) != 3*seg || !bytes.Equal(got[seg:], data[seg:]) || !bytes.Equal(got[:seg], make([]byte, seg)) {
+		t.Fatal("after freeing segment 0 the file does not read zeros, then the rest")
 	}
-	if err := st.FreeSegment("m", "r", fm, 1, true); err != nil {
+	if after := st.FileAllocated(m.Model, m.Revision, "f"); after > before-seg {
+		t.Fatalf("allocated %d bytes before freeing a %d byte segment, %d after", before, seg, after)
+	}
+	if err := st.FreeSegment(m.Model, m.Revision, fm, 1, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(st.FilePath("m", "r", "f")); !os.IsNotExist(err) {
+	if _, err := os.Stat(st.FilePath(m.Model, m.Revision, "f")); !os.IsNotExist(err) {
 		t.Fatal("file with nothing held left on disk")
+	}
+	if n, err := st.Allocated(); err != nil || n != 0 {
+		t.Fatalf("Allocated = %d, %v; want 0", n, err)
 	}
 	refs, err := st.Revisions()
 	if err != nil || len(refs) != 0 {
@@ -75,10 +96,11 @@ func TestEvictSegment(t *testing.T) {
 	}
 	st.SaveManifest(m)
 	st.SaveState(rs)
-	if refs, _ := st.Revisions(); len(refs) != 1 || refs[0] != (RevisionRef{"m", "r"}) {
+	// A revision with a slash in it is named as its manifest names it.
+	if refs, _ := st.Revisions(); len(refs) != 1 || refs[0] != (RevisionRef{"m", "refs/pr/1"}) {
 		t.Fatalf("Revisions = %v", refs)
 	}
-	if err := st.RemoveRevision("m", "r"); err != nil {
+	if err := st.RemoveRevision(m.Model, m.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if refs, _ := st.Revisions(); len(refs) != 0 {

@@ -48,8 +48,9 @@ not the whole revision. Once every wanted piece is held and verified its
 
 - `budget_bytes`: the most the store may hold (`-disk-budget`); 0 means no
   budget, and nothing is evicted.
-- `used_bytes`: what the store holds: every held segment, and a root's
-  download from its origin in progress.
+- `used_bytes`: the disk space the store's model files take, as blocks the
+  filesystem allocated: held segments, a download in progress, and what a
+  failed transfer left until it is freed.
 - `evictable_bytes`: what eviction could remove now. Counted only with a
   budget.
 
@@ -97,6 +98,7 @@ or range outside the manifest, is ignored, as is any answer over 16 MiB.
   "model": "glm-5.3",
   "revision": "abc1234",
   "node_id": "spark-02",
+  "cataloged": true,
   "roles": ["peer"],
   "files": {
     "experts/exlr8-layer-003.k4.safetensors": {
@@ -109,9 +111,11 @@ or range outside the manifest, is ignored, as is any answer over 16 MiB.
 
 Here the node holds segments 0-3 and 9 of a 12-segment file. `node_id` and
 `roles` are the node's, as in `/status`; eviction uses both to decide which
-node keeps a segment. A fetching node asks every peer once per
-reconcile pass and prefers plain peers that hold a segment to roots that
-hold it.
+node keeps a segment. `cataloged` says whether the node's catalog names the
+revision; a node removes a revision its catalog dropped only once every
+peer says `false` here (see "Disk budget and eviction" in
+`docs/design.md`). A fetching node asks every peer once per reconcile pass
+and prefers plain peers that hold a segment to roots that hold it.
 
 ## `GET /blob/{model}/{revision}/{path}`
 

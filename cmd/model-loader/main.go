@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -82,7 +83,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.discoveryKind, "discovery", "static", "peer discovery backend: static, k8s, or mentat (the local mentatd's peer table, on kindling-spark-os)")
 	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list; with -discovery=k8s or mentat, more peers to add, such as a NAS root outside the cluster")
 	fs.StringVar(&cfg.mentatURL, "mentat-url", discovery.DefaultMentatURL, "the local mentatd's HTTP side port, for -discovery=mentat")
-	fs.IntVar(&cfg.mentatPort, "mentat-port", defaultPort, "port model-loader listens on on every box, for -discovery=mentat")
+	fs.IntVar(&cfg.mentatPort, "mentat-port", defaultPort, "port model-loader listens on at a box that publishes none in its mentat record, for -discovery=mentat")
 	fs.StringVar(&cfg.k8sService, "k8s-service", "", "headless Service DNS name, for -discovery=k8s")
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
@@ -196,7 +197,7 @@ func run(args []string) error {
 		log.Printf("model-loader: warning: %v", err) // the rest still load.
 	}
 
-	disc, err := buildDiscoverer(cfg)
+	disc, mentat, err := buildDiscoverer(cfg)
 	if err != nil {
 		return err
 	}
@@ -259,6 +260,16 @@ func run(args []string) error {
 		log.Printf("model-loader: reconcile: %v", err)
 	})
 
+	published := make(chan struct{})
+	if mentat != nil {
+		go func() {
+			defer close(published)
+			publishToMentat(ctx, mentat, listenPort(cfg.listen), d)
+		}()
+	} else {
+		close(published)
+	}
+
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
@@ -272,32 +283,96 @@ func run(args []string) error {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shut down http server: %w", err)
 	}
+	<-published
 	return <-errCh
 }
 
-func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
+// mentatPublishInterval is how often this box's record is sent to its
+// mentatd. An unchanged record costs nothing there, and a restarted
+// mentatd, which holds none, has it back within this.
+const mentatPublishInterval = 5 * time.Second
+
+// publishToMentat keeps this box's record in its mentatd current until
+// ctx ends, then deletes it, so other boxes stop reading holdings it no
+// longer serves. An error is logged when it first appears, not on every
+// send.
+//
+// shortcut: mentatd refuses the delete (429) within one status push of
+// the record's last change, and the record then stays until mentatd
+// restarts; readers check that a box answers before relying on its
+// record. Retry the delete if a stale record ever misleads one.
+func publishToMentat(ctx context.Context, m *discovery.Mentat, port int, d *daemon.Daemon) {
+	last := ""
+	for {
+		err := m.Publish(ctx, mentatRecord(d.Status(), port))
+		if err != nil && err.Error() != last && ctx.Err() == nil {
+			log.Printf("model-loader: %v", err)
+		}
+		last = fmt.Sprint(err)
+		select {
+		case <-ctx.Done():
+			dctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := m.Publish(dctx, nil); err != nil {
+				log.Printf("model-loader: %v", err)
+			}
+			return
+		case <-time.After(mentatPublishInterval):
+		}
+	}
+}
+
+// mentatRecord is the record st and port describe: the revisions held
+// whole or in the part selected.
+func mentatRecord(st server.StatusResponse, port int) *discovery.MentatRecord {
+	rec := &discovery.MentatRecord{Port: port, Roles: st.Roles, Holdings: []discovery.MentatHolding{}}
+	for _, ms := range st.Models {
+		if ms.State == server.StateReady || ms.State == server.StatePartial {
+			rec.Holdings = append(rec.Holdings, discovery.MentatHolding{Model: ms.Model, Revision: ms.Revision, State: ms.State})
+		}
+	}
+	return rec
+}
+
+// listenPort is the port in -listen, or 0 when it names none, which
+// readers of the record take as no port.
+func listenPort(listen string) int {
+	_, p, err := net.SplitHostPort(listen)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(p)
+	return n
+}
+
+// buildDiscoverer returns the discoverer cfg names, and with
+// -discovery=mentat the Mentat inside it, through which the box publishes
+// its record.
+func buildDiscoverer(cfg *config) (discovery.Discoverer, *discovery.Mentat, error) {
 	static, err := staticPeers(cfg.staticPeers)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var d discovery.Discoverer
+	var mentat *discovery.Mentat
 	switch cfg.discoveryKind {
 	case "k8s":
 		d = discovery.NewK8sDNS(cfg.k8sService, cfg.k8sPort)
 	case "mentat":
-		if d, err = discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
-			return nil, err
+		if mentat, err = discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
+			return nil, nil, err
 		}
+		d = mentat
 	default:
-		return static, nil
+		return static, nil, nil
 	}
 	// -peers adds boxes the backend cannot find, such as a NAS root outside
 	// the cluster or with no mentatd. Multi keeps them while the backend is
 	// down.
 	if strings.TrimSpace(cfg.staticPeers) == "" {
-		return d, nil
+		return d, mentat, nil
 	}
-	return discovery.NewMulti(d, static), nil
+	return discovery.NewMulti(d, static), mentat, nil
 }
 
 // staticPeers parses -peers, a comma-separated host:port list.

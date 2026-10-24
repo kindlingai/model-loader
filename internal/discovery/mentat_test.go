@@ -2,7 +2,9 @@ package discovery
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -234,5 +236,89 @@ func TestMentatSharesFetches(t *testing.T) {
 	m.mu.Unlock()
 	if _, err := m.Peers(context.Background()); err != nil || calls.Load() != 2 {
 		t.Fatalf("after the TTL: %v, %d calls; want a second fetch", err, calls.Load())
+	}
+}
+
+// A box's model-loader record gives the port to reach it at. A box with
+// none, or with a record that does not give a valid port, is reached at
+// the default, and a malformed record costs only that box its port.
+func TestMentatRecordPort(t *testing.T) {
+	body := `{"node_id": "a", "peers": {
+	  "b": {"node_ip": "10.0.0.2", "alive": true, "records": {"model-loader": {"port": 9000}, "gr8": "x"}},
+	  "c": {"node_ip": "10.0.0.3", "alive": true, "records": {"model-loader": "not an object"}},
+	  "d": {"node_ip": "10.0.0.4", "alive": true, "records": {"model-loader": {"port": 70000}}},
+	  "e": {"node_ip": "10.0.0.5", "alive": true}}}`
+	got, err := newMentat(t, fakeMentatd(t, http.StatusOK, body)).Peers(context.Background())
+	want := []Peer{{Addr: "10.0.0.2:9000"}, {Addr: "10.0.0.3:7762"}, {Addr: "10.0.0.4:7762"}, {Addr: "10.0.0.5:7762"}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("Peers = %v, %v; want %v", got, err, want)
+	}
+}
+
+// Publish sends the record sorted, halves its holdings while mentatd has
+// no room (413) and says it did, and deletes it for nil.
+func TestMentatPublish(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	var methods []string
+	const room = 200
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/records/model-loader" {
+			http.NotFound(w, r)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		methods, bodies = append(methods, r.Method), append(bodies, string(b))
+		mu.Unlock()
+		if len(b) > room {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	m := newMentat(t, ts.URL)
+
+	small := &MentatRecord{Port: 7762, Roles: []string{"peer"}, Holdings: []MentatHolding{
+		{"b/m", "r1", "ready"}, {"a/m", "r2", "partial"}, {"a/m", "r1", "ready"},
+	}}
+	if err := m.Publish(context.Background(), small); err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"port":7762,"roles":["peer"],"holdings":[{"model":"a/m","revision":"r1","state":"ready"},{"model":"a/m","revision":"r2","state":"partial"},{"model":"b/m","revision":"r1","state":"ready"}]}`; bodies[0] != want {
+		t.Fatalf("sent %s, want %s", bodies[0], want)
+	}
+	if small.Holdings[0].Model != "b/m" {
+		t.Fatal("Publish reordered the caller's holdings")
+	}
+
+	big := &MentatRecord{Port: 7762}
+	for i := range 8 {
+		big.Holdings = append(big.Holdings, MentatHolding{"org/model", strings.Repeat("r", 10) + string(rune('a'+i)), "ready"})
+	}
+	bodies = nil
+	if err := m.Publish(context.Background(), big); err != nil {
+		t.Fatal(err)
+	}
+	var sent MentatRecord
+	last := bodies[len(bodies)-1]
+	if err := json.Unmarshal([]byte(last), &sent); err != nil || len(last) > room || !sent.Truncated || len(sent.Holdings) == 0 {
+		t.Fatalf("after %d tries sent %s; want one under %d bytes, truncated, with holdings", len(bodies), last, room)
+	}
+
+	// No holdings is an empty list, not null.
+	if err := m.Publish(context.Background(), &MentatRecord{Port: 1}); err != nil || !strings.Contains(bodies[len(bodies)-1], `"holdings":[]`) {
+		t.Fatalf("Publish with no holdings = %v, sent %s", err, bodies[len(bodies)-1])
+	}
+
+	// A record that does not fit with no holdings is an error.
+	huge := &MentatRecord{Port: 7762, Roles: []string{strings.Repeat("x", room)}}
+	if err := m.Publish(context.Background(), huge); err == nil || !strings.Contains(err.Error(), "413") {
+		t.Fatalf("Publish of a record with no room = %v, want a 413 error", err)
+	}
+
+	if err := m.Publish(context.Background(), nil); err != nil || methods[len(methods)-1] != http.MethodDelete {
+		t.Fatalf("Publish(nil) = %v, last method %s; want a DELETE", err, methods[len(methods)-1])
 	}
 }

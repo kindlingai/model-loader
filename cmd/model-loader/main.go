@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -226,15 +225,21 @@ func run(args []string) error {
 		// does not hold yet.
 		srv.SetPuller(d)
 	}
-	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv}
+	httpSrv := &http.Server{Handler: srv}
+	// Bound before anything is published, so the record names the port
+	// this process holds, -listen :0 included.
+	ln, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
+		return fmt.Errorf("http server: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 2)
 	go func() {
-		log.Printf("model-loader %s: node %q (%s) serving on %s", version, nodeID, strings.Join(roles, "+"), cfg.listen)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("model-loader %s: node %q (%s) serving on %s", version, nodeID, strings.Join(roles, "+"), ln.Addr())
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http server: %w", err)
 			return
 		}
@@ -264,7 +269,7 @@ func run(args []string) error {
 	if mentat != nil {
 		go func() {
 			defer close(published)
-			publishToMentat(ctx, mentat, listenPort(cfg.listen), d)
+			publishToMentat(ctx, mentat, ln.Addr().(*net.TCPAddr).Port, d)
 		}()
 	} else {
 		close(published)
@@ -274,6 +279,8 @@ func run(args []string) error {
 	case <-ctx.Done():
 	case err := <-errCh:
 		if err != nil {
+			stop()
+			<-published
 			return err
 		}
 	}
@@ -292,15 +299,15 @@ func run(args []string) error {
 // mentatd, which holds none, has it back within this.
 const mentatPublishInterval = 5 * time.Second
 
+// mentatUnpublishTimeout bounds deleting the record at shutdown. mentatd
+// takes a change once per status push, 2 s by default, so this outlasts a
+// refusal for a change just made.
+const mentatUnpublishTimeout = 5 * time.Second
+
 // publishToMentat keeps this box's record in its mentatd current until
 // ctx ends, then deletes it, so other boxes stop reading holdings it no
 // longer serves. An error is logged when it first appears, not on every
 // send.
-//
-// shortcut: mentatd refuses the delete (429) within one status push of
-// the record's last change, and the record then stays until mentatd
-// restarts; readers check that a box answers before relying on its
-// record. Retry the delete if a stale record ever misleads one.
 func publishToMentat(ctx context.Context, m *discovery.Mentat, port int, d *daemon.Daemon) {
 	last := ""
 	for {
@@ -311,13 +318,31 @@ func publishToMentat(ctx context.Context, m *discovery.Mentat, port int, d *daem
 		last = fmt.Sprint(err)
 		select {
 		case <-ctx.Done():
-			dctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := m.Publish(dctx, nil); err != nil {
+			unpublish(m)
+			return
+		case <-time.After(mentatPublishInterval):
+		}
+	}
+}
+
+// unpublish deletes the record, trying again while mentatd refuses the
+// change for one just made, for up to mentatUnpublishTimeout.
+func unpublish(m *discovery.Mentat) {
+	ctx, cancel := context.WithTimeout(context.Background(), mentatUnpublishTimeout)
+	defer cancel()
+	for {
+		err := m.Publish(ctx, nil)
+		if !errors.Is(err, discovery.ErrMentatBusy) {
+			if err != nil {
 				log.Printf("model-loader: %v", err)
 			}
 			return
-		case <-time.After(mentatPublishInterval):
+		}
+		select {
+		case <-ctx.Done():
+			log.Printf("model-loader: %v", err)
+			return
+		case <-time.After(250 * time.Millisecond):
 		}
 	}
 }
@@ -332,17 +357,6 @@ func mentatRecord(st server.StatusResponse, port int) *discovery.MentatRecord {
 		}
 	}
 	return rec
-}
-
-// listenPort is the port in -listen, or 0 when it names none, which
-// readers of the record take as no port.
-func listenPort(listen string) int {
-	_, p, err := net.SplitHostPort(listen)
-	if err != nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(p)
-	return n
 }
 
 // buildDiscoverer returns the discoverer cfg names, and with

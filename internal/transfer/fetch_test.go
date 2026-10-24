@@ -458,7 +458,7 @@ func TestFetchFileOrderPerSegment(t *testing.T) {
 		}
 		return []int{1}
 	}
-	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{a, b}, Options{Order: order, Slots: make(chan struct{}, 2)}); err != nil {
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{a, b}, Options{Order: order, Limit: NewLimiter(2)}); err != nil {
 		t.Fatalf("FetchFile: %v", err)
 	}
 	if a.calls.Load() != 2 || b.calls.Load() != 2 {
@@ -489,11 +489,11 @@ func TestFetchFileOpensOnlyWithASlot(t *testing.T) {
 	content := bytes.Repeat([]byte("s"), 20)
 	fm := buildManifestFile("w.bin", content, 10)
 	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
-	slots := make(chan struct{}, 1)
-	slots <- struct{}{} // taken by another transfer
+	slots := NewLimiter(1)
+	slots.Acquire(context.Background(), 0) // taken by another transfer
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	err = FetchFile(ctx, st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{&countingFetcher{content: content}}, Options{Slots: slots})
+	err = FetchFile(ctx, st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{&countingFetcher{content: content}}, Options{Limit: slots})
 	if err == nil {
 		t.Fatal("FetchFile = nil, want the context error")
 	}
@@ -513,25 +513,25 @@ func TestFetchFileClosesBetweenSegments(t *testing.T) {
 	fm := buildManifestFile("w.bin", content, 10)
 	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
 	before := openFDs(t)
-	slots := make(chan struct{}, 1)
+	slots := NewLimiter(1)
 	stolen := make(chan struct{})
 	var once sync.Once
 	steal := fetcherFunc(func(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
 		// After the first segment, take the slot as soon as the worker
 		// gives it back, so the worker waits for it.
 		once.Do(func() {
-			go func() { slots <- struct{}{}; close(stolen) }()
+			go func() { slots.Acquire(context.Background(), 0); close(stolen) }()
 		})
 		return io.NopCloser(bytes.NewReader(content[offset : offset+length])), nil
 	})
 	done := make(chan error, 1)
 	go func() {
-		done <- FetchFile(context.Background(), st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{steal}, Options{Slots: slots})
+		done <- FetchFile(context.Background(), st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{steal}, Options{Limit: slots})
 	}()
 	<-stolen
 	time.Sleep(50 * time.Millisecond) // let the worker reach the slot wait
 	got := openFDs(t)
-	<-slots
+	slots.Release()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

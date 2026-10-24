@@ -171,6 +171,9 @@ func (r *Registry) Delete(name string) (bool, error) {
 	if err := os.Remove(filepath.Join(r.dir, name+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return true, fmt.Errorf("release request %s: %w", name, err)
 	}
+	if err := syncDir(r.dir); err != nil {
+		return true, fmt.Errorf("release request %s: %w", name, err)
+	}
 	delete(r.reqs, name)
 	return true, nil
 }
@@ -211,5 +214,19 @@ func writeAtomic(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir makes a rename or removal in dir durable, so a request PUT or
+// DELETE acknowledged is still so after a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

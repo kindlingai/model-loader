@@ -74,11 +74,13 @@ type Options struct {
 	// segment i, in order. A fetcher it leaves out is not tried for that
 	// segment.
 	Order func(i int) []int
-	// Slots, if set, is a semaphore shared with every other transfer on
-	// the node: each segment transfer holds one slot while it runs. Its
-	// capacity is also how many segments of this file are fetched at once,
-	// so different segments can come from different sources in parallel.
-	Slots chan struct{}
+	// Limit, if set, is shared with every other transfer on the node:
+	// each segment transfer holds one of its slots while it runs, asked
+	// for at Priority. Its size is also how many segments of this file are
+	// fetched at once, so different segments can come from different
+	// sources in parallel.
+	Limit    *Limiter
+	Priority int
 	// Checks are a consumer's checksums for ranges of the file. Each is
 	// checked once every segment it covers is held, unless all of them
 	// were verified against the manifest; one that fails drops the
@@ -145,9 +147,6 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		return f, nil
 	}
 
-	if opts.Slots != nil && cap(opts.Slots) == 0 {
-		opts.Slots = nil // an unbuffered channel would block every send.
-	}
 	order := opts.Order
 	if order == nil {
 		all := make([]int, len(fetchers))
@@ -157,8 +156,8 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		order = func(int) []int { return all }
 	}
 	workers := 1
-	if opts.Slots != nil {
-		workers = max(1, cap(opts.Slots))
+	if opts.Limit != nil {
+		workers = opts.Limit.Cap()
 	}
 	workers = min(workers, max(1, len(todo)))
 
@@ -181,11 +180,9 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		go func() {
 			defer wg.Done()
 			for i := range queue {
-				if opts.Slots != nil {
-					select {
-					case opts.Slots <- struct{}{}:
-					case <-ctx.Done():
-						fail(ctx.Err())
+				if opts.Limit != nil {
+					if err := opts.Limit.Acquire(ctx, opts.Priority); err != nil {
+						fail(err)
 						continue
 					}
 				}
@@ -196,8 +193,8 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 					sum, trust, err = fetchSegment(ctx, f, fm, i, fetchers, order(i), checksOverlapping(opts.Checks, start, end), dead, &mu)
 					f.Close()
 				}
-				if opts.Slots != nil {
-					<-opts.Slots
+				if opts.Limit != nil {
+					opts.Limit.Release()
 				}
 				if err != nil {
 					fail(fmt.Errorf("fetch %s segment %d: %w", fm.Path, i, err))

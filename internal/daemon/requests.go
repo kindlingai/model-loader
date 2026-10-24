@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/request"
@@ -44,23 +45,34 @@ func (d *Daemon) withRequests(sel *catalog.Selection) (*catalog.Selection, map[s
 	return out, prio
 }
 
-// sortByPriority orders wants by their highest request priority, highest
-// first, keeping catalog order among equals, so the most urgent model
-// starts first and gets the transfer slots first.
+// sortByPriority sets each want's priority to its highest request
+// priority and orders wants by it, highest first, keeping catalog order
+// among equals. The order is the order models start in; the priority is
+// what their transfers ask the node's transfer limit for, so a waiting
+// transfer of a higher one is admitted first.
 func sortByPriority(wants []want.Want, prio map[string]int) {
 	if len(prio) == 0 {
 		return
 	}
-	sort.SliceStable(wants, func(i, j int) bool {
-		return prio[want.Key(wants[i].Model.Name, wants[i].Model.Revision)] > prio[want.Key(wants[j].Model.Name, wants[j].Model.Revision)]
-	})
+	for i := range wants {
+		wants[i].Priority = prio[want.Key(wants[i].Model.Name, wants[i].Model.Revision)]
+	}
+	sort.SliceStable(wants, func(i, j int) bool { return wants[i].Priority > wants[j].Priority })
 }
 
-// Kick starts a reconcile pass now rather than at the next tick. A pass
-// already running for a model notices the kick when it finishes, and runs
-// again, so a request made mid-pass is not left for a whole interval.
+// Kick records that what the node wants changed, and starts a reconcile
+// pass now rather than at the next tick. A pass already running for a
+// model read its wants before the change; when it finishes it sees the
+// change and wakes the loop again, so a request made mid-pass is not left
+// for a whole interval.
 func (d *Daemon) Kick() {
-	d.kicks.Add(1)
+	d.wantsGen.Add(1)
+	d.wake()
+}
+
+// wake starts a reconcile pass now, without recording a change, so passes
+// waking the loop do not wake each other without end.
+func (d *Daemon) wake() {
 	select {
 	case d.kick <- struct{}{}:
 	default:
@@ -80,6 +92,17 @@ func (d *Daemon) notifyLocked() {
 	d.change = make(chan struct{})
 }
 
+// waitPoll is how often WaitRequest looks at a request between status
+// changes.
+const waitPoll = 250 * time.Millisecond
+
+// notify wakes everything waiting on changed.
+func (d *Daemon) notify() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.notifyLocked()
+}
+
 // PutRequest implements server.Requests.
 func (d *Daemon) PutRequest(r request.Request) (server.RequestStatus, error) {
 	if d.cfg.Requests == nil {
@@ -93,6 +116,7 @@ func (d *Daemon) PutRequest(r request.Request) (server.RequestStatus, error) {
 		return server.RequestStatus{}, err
 	}
 	d.Kick()
+	d.notify()
 	return d.requestStatus(saved), nil
 }
 
@@ -110,6 +134,10 @@ func (d *Daemon) RequestStatus(name string) (server.RequestStatus, bool) {
 
 // WaitRequest implements server.Requests.
 func (d *Daemon) WaitRequest(ctx context.Context, name string) (server.RequestStatus, bool) {
+	// Segments land without a status change, so this also looks again
+	// every waitPoll.
+	tick := time.NewTicker(waitPoll)
+	defer tick.Stop()
 	for {
 		ch := d.changed()
 		st, ok := d.RequestStatus(name)
@@ -118,8 +146,9 @@ func (d *Daemon) WaitRequest(ctx context.Context, name string) (server.RequestSt
 		}
 		select {
 		case <-ch:
+		case <-tick.C:
 		case <-ctx.Done():
-			return st, true
+			return d.RequestStatus(name) // as it is now, not as it was
 		}
 	}
 }
@@ -132,6 +161,7 @@ func (d *Daemon) DeleteRequest(name string) (bool, error) {
 	found, err := d.cfg.Requests.Delete(name)
 	if found {
 		d.Kick()
+		d.notify()
 	}
 	return found, err
 }

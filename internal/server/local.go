@@ -64,9 +64,17 @@ func NewLocal(reqs Requests) http.Handler {
 	})
 	mux.HandleFunc("PUT /requests/{name}", func(w http.ResponseWriter, r *http.Request) {
 		var req request.Request
-		dec := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody))
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
+		err := dec.Decode(&req)
+		if err == nil {
+			// Exactly one JSON object: anything after it, even past the
+			// size limit, is an error.
+			if _, extra := dec.Token(); extra != io.EOF {
+				err = errors.New("more than one JSON value")
+			}
+		}
+		if err != nil {
 			http.Error(w, "bad request body: "+err.Error(), http.StatusBadRequest)
 			return
 		}

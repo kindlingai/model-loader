@@ -149,6 +149,10 @@ node: every reconcile adds the pieces of every request to the selection's.
   partial entry in the selection file.)
 - Putting or releasing a request starts a reconcile at once, not at the
   next tick.
+- A file that fails (a consumer checksum that does not match, say) does not
+  stop the other files of the model; the model reports the error.
+- A request's checksums apply even when the selection file wants the whole
+  model.
 
 ## Store
 

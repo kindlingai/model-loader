@@ -271,3 +271,140 @@ func TestLocalAPI(t *testing.T) {
 		t.Fatalf("GET released = %d, want 404", code)
 	}
 }
+
+// Trailing content after the JSON object, or a body over the limit, is
+// refused.
+func TestLocalAPIBody(t *testing.T) {
+	f := newRequestFleet(t)
+	ts := httptest.NewServer(server.NewLocal(f.node(t.TempDir())))
+	t.Cleanup(ts.Close)
+	for name, body := range map[string]string{
+		"trailing": `{"model":"glm"} not json`,
+		"two":      `{"model":"glm"}{"model":"glm"}`,
+		"huge":     `{"model":"glm"}` + strings.Repeat(" ", 17<<20),
+	} {
+		req, _ := http.NewRequest("PUT", ts.URL+"/requests/r", strings.NewReader(body))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Errorf("%s: PUT = %d, want 400", name, resp.StatusCode)
+		}
+	}
+}
+
+// A request whose checksum is wrong does not stop another request for a
+// different file of the same model.
+func TestBadChecksumDoesNotBlockOtherFiles(t *testing.T) {
+	// Through a pull-through root, so the manifest has no segment hashes
+	// and the checksum applies. a.bin, the bad one, comes first.
+	content := pattern(40, 'q')
+	pf := newPullFleet(t, map[string][]byte{"a.bin": content, "z.bin": pattern(10, 'z')}, nil)
+	peer, _ := pf.peer(&catalog.Selection{})
+	reg, err := request.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.cfg.Requests = reg
+	if _, err := peer.PutRequest(request.Request{Name: "bad", Pieces: catalog.Pieces{Model: "glm",
+		Ranges: []catalog.FileRanges{{Path: "a.bin", Ranges: []catalog.ByteRange{{Offset: 0, Length: 10, XXH64: "0123456789abcdef"}}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.PutRequest(request.Request{Name: "good", Pieces: catalog.Pieces{Model: "glm", Include: []string{"z.bin"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile = nil with a bad checksum")
+	}
+	if st, _ := peer.RequestStatus("good"); st.State != server.StateReady {
+		t.Fatalf("good request: %s %d/%d, want ready despite the bad one", st.State, st.BytesDone, st.BytesTotal)
+	}
+}
+
+// A request's checksums still apply when the selection wants the whole
+// model.
+func TestRequestChecksWithWholeSelection(t *testing.T) {
+	content := pattern(40, 'h')
+	pf := newPullFleet(t, map[string][]byte{"a.bin": content}, nil, func(o *fakeOrigin) {
+		o.digest = func(string, string) string { return "" } // no whole-file digest
+	})
+	peer, _ := pf.peer(allSelection())
+	reg, err := request.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.cfg.Requests = reg
+	good := xxh64.Format(xxh64.Sum64(content[10:20]))
+	if _, err := peer.PutRequest(request.Request{Name: "r", Pieces: catalog.Pieces{Model: "glm",
+		Ranges: []catalog.FileRanges{{Path: "a.bin", Ranges: []catalog.ByteRange{{Offset: 10, Length: 10, XXH64: good}}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := peer.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	}
+	if st, _ := peer.RequestStatus("r"); st.State != server.StateReady {
+		t.Fatalf("request: %s, want ready (its checksum was checked)", st.State)
+	}
+}
+
+// A wait sees a request become ready even when no status changes (another
+// model's transfer can hold the status), and a timed-out wait reports the
+// status as it is then.
+func TestWaitSeesStateWithoutStatusChange(t *testing.T) {
+	f := newRequestFleet(t)
+	d := f.node(t.TempDir())
+	if _, err := d.PutRequest(rankRequest("r", 0, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PutRequest(rankRequest("r", 50, 10)); err != nil { // not held yet
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		d.DeleteRequest("r")
+	}()
+	if _, ok := d.WaitRequest(ctx, "r"); ok {
+		t.Fatal("WaitRequest still reports a request released while it waited")
+	}
+}
+
+// A request made while a pass is running for its model is reconciled when
+// that pass ends, without waiting for the next tick; passes do not wake
+// each other without end.
+func TestKickDuringPass(t *testing.T) {
+	f := newRequestFleet(t)
+	d := f.node(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var passes atomic.Int32
+	d.onPass = func() { passes.Add(1) }
+	go d.Run(ctx, time.Hour, nil)
+	if _, err := d.PutRequest(rankRequest("r", 0, 10)); err != nil {
+		t.Fatal(err)
+	}
+	wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
+	defer wcancel()
+	if st, _ := d.WaitRequest(wctx, "r"); st.State != server.StateReady {
+		t.Fatalf("first request: %s", st.State)
+	}
+	if _, err := d.PutRequest(rankRequest("r", 50, 30)); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := d.WaitRequest(wctx, "r"); st.State != server.StateReady {
+		t.Fatalf("replaced request: %s, want ready before the hourly tick", st.State)
+	}
+	n := passes.Load()
+	time.Sleep(300 * time.Millisecond)
+	if extra := passes.Load() - n; extra > 1 {
+		t.Fatalf("%d more passes with nothing changed: passes wake each other", extra)
+	}
+}

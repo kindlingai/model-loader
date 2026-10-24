@@ -93,10 +93,11 @@ type Config struct {
 // interface server.Server depends on.
 type Daemon struct {
 	cfg        Config
-	sem        chan struct{}
-	availSlots chan struct{} // see availabilityQueries
-	kick       chan struct{} // see Kick
-	kicks      atomic.Uint64
+	limit      *transfer.Limiter // segment transfers, by priority
+	availSlots chan struct{}     // see availabilityQueries
+	kick       chan struct{}     // see Kick
+	wantsGen   atomic.Uint64     // see Kick
+	onPass     func()            // tests: called as each Run pass starts
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
@@ -128,7 +129,7 @@ func New(cfg Config) *Daemon {
 	}
 	return &Daemon{
 		cfg:        cfg,
-		sem:        make(chan struct{}, cfg.MaxConcurrentTransfers),
+		limit:      transfer.NewLimiter(cfg.MaxConcurrentTransfers),
 		availSlots: make(chan struct{}, availabilityQueries),
 		kick:       make(chan struct{}, 1),
 		change:     make(chan struct{}),
@@ -189,6 +190,10 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		gen := d.wantsGen.Load() // before the wants it goes with
+		if d.onPass != nil {
+			d.onPass()
+		}
 		wants, err := d.refreshWants()
 		if err != nil {
 			onErr(err)
@@ -201,14 +206,13 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				kicks := d.kicks.Load()
 				err := d.reconcileModel(ctx, w)
 				busy.Delete(key)
 				if err != nil {
 					onErr(fmt.Errorf("model %s: %w", key, err))
 				}
-				if d.kicks.Load() != kicks {
-					d.Kick() // wants changed mid-pass: look again now.
+				if d.wantsGen.Load() != gen {
+					d.wake() // wants changed since they were read: look again.
 				}
 			}()
 		}
@@ -384,6 +388,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		srcs = d.buildSources(ctx, m, manifest, peers)
 	}
 
+	var errs []error
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
@@ -394,16 +399,23 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
 		} else {
 			err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
-				Need: fn.Segments, Order: srcs.order(fm.Path), Slots: d.sem, Checks: fn.Checks,
+				Need: fn.Segments, Order: srcs.order(fm.Path), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
 			})
 		}
 		if err != nil {
-			ms := progress(w, manifest, need, rs, server.StateError)
-			ms.Error = err.Error()
-			d.setStatus(ms)
-			return fmt.Errorf("fetch %s: %w", fm.Path, err)
+			// Go on with the other files: one bad piece (a consumer
+			// checksum that does not match, say) must not hold back
+			// every other request for the model.
+			errs = append(errs, fmt.Errorf("fetch %s: %w", fm.Path, err))
+			continue
 		}
 		d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
+	}
+	if err := errors.Join(errs...); err != nil {
+		ms := progress(w, manifest, need, rs, server.StateError)
+		ms.Error = err.Error()
+		d.setStatus(ms)
+		return err
 	}
 
 	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))

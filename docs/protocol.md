@@ -132,7 +132,9 @@ named request. The API is served apart from the LAN API, on
 `-local-listen`: by default the unix socket `model-loader.sock` in the
 store directory; `host:port` serves it over TCP instead, and an empty value
 turns it off. It has no authentication: anything that can reach it can pin
-and release pieces, so keep it on the socket or on localhost.
+and release pieces, so keep it on the socket or on localhost. The socket is
+mode 0660: its owner and group may use it. model-loader will not start on a
+socket path that is not a socket, or that another process answers on.
 
 ### `PUT /requests/{name}`
 
@@ -157,14 +159,18 @@ of one catalog model revision, as an entry of the selection file's
 
 - `revision` may be left out when the catalog has one revision of `model`.
 - `xxh64` is optional: the consumer's XXH64 (seed 0) of exactly that range.
-  The request is ready only once every one matches (see `docs/design.md`).
-- `priority`: models with a higher-priority request start first and take
-  transfer slots first. It does not stop a transfer already running.
-  Default 0, as for the selection file.
+  The request is ready only once every one matches, except over bytes the
+  manifest's segment hashes (or a complete file's sha256) verified: those
+  are the origin's bytes, so a checksum that does not match them is not
+  applied (see `docs/design.md`).
+- `priority`: models with a higher-priority request start first, and when
+  a transfer slot (`-max-concurrent-transfers`) comes free, a waiting
+  segment of the highest-priority model takes it. It does not stop a
+  transfer already running. Default 0, as for the selection file.
 
 Answers `200` with the request's status (below), or `400` for a body that
 is not well formed or names no catalog model revision. Unknown fields are
-an error.
+an error, as is anything after the JSON object or a body over 16 MiB.
 
 Replacing a request keeps every piece it shares with the old one: only
 the new pieces are fetched. Pieces only the old request named stay on disk

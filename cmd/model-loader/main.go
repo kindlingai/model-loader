@@ -272,7 +272,12 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
 
 // listenLocal listens on addr for the local request API: "unix:PATH" is a
 // unix socket, PATH relative to storeDir unless absolute; anything else is
-// a TCP host:port. A stale socket from an earlier run is removed first.
+// a TCP host:port.
+//
+// A socket left by an earlier run is removed first, but only a socket that
+// nothing answers on: a path that is not a socket, or one another
+// model-loader is serving, is an error. The socket is mode 0660, so the
+// owner and its group (the consumer's, in a deployment) can use it.
 func listenLocal(addr, storeDir string) (net.Listener, error) {
 	path, ok := strings.CutPrefix(addr, "unix:")
 	if !ok {
@@ -281,11 +286,26 @@ func listenLocal(addr, storeDir string) (net.Listener, error) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(storeDir, path)
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("local api: remove stale socket: %w", err)
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&fs.ModeSocket == 0 {
+			return nil, fmt.Errorf("local api: %s exists and is not a socket", path)
+		}
+		if c, err := net.DialTimeout("unix", path, time.Second); err == nil {
+			c.Close()
+			return nil, fmt.Errorf("local api: %s is in use by another process", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("local api: remove stale socket: %w", err)
+		}
 	}
+	// The mode is set before anything is served on it. (The umask is not
+	// changed for this: it is the whole process's.)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
+		return nil, fmt.Errorf("local api: %w", err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		ln.Close()
 		return nil, fmt.Errorf("local api: %w", err)
 	}
 	return ln, nil

@@ -170,7 +170,7 @@ func TestFromSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ws) != 2 || ws[0].Model.Revision != "r2" || ws[0].Whole || len(ws[0].Pieces) != 1 || !ws[1].Whole || ws[1].Pieces != nil {
+	if len(ws) != 2 || ws[0].Model.Revision != "r2" || ws[0].Whole || len(ws[0].Pieces) != 1 || !ws[1].Whole || len(ws[1].Pieces) != 1 {
 		t.Fatalf("wants = %+v", ws)
 	}
 

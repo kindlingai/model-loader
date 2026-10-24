@@ -107,8 +107,10 @@ func parseFlags(args []string) (*config, error) {
 	default:
 		errs = append(errs, fmt.Errorf("-discovery: unknown backend %q (want static, k8s or mentat)", cfg.discoveryKind))
 	}
-	if cfg.discoveryKind == "mentat" && (cfg.mentatPort <= 0 || cfg.mentatPort > 65535) {
-		errs = append(errs, fmt.Errorf("-mentat-port: %d is not a port", cfg.mentatPort))
+	if cfg.discoveryKind == "mentat" {
+		if _, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
+			errs = append(errs, fmt.Errorf("-mentat-url, -mentat-port: %w", err))
+		}
 	}
 	if cfg.discoveryKind == "k8s" && cfg.k8sService == "" {
 		errs = append(errs, errors.New("-k8s-service is required when -discovery=k8s"))
@@ -270,7 +272,10 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
 	case "k8s":
 		return discovery.NewK8sDNS(cfg.k8sService, cfg.k8sPort), nil
 	case "mentat":
-		m := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort)
+		m, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort)
+		if err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(cfg.staticPeers) == "" {
 			return m, nil
 		}

@@ -147,7 +147,10 @@ func TestBuildDiscovererMentat(t *testing.T) {
 			t.Fatalf("-peers %q: Peers = %v, want %v", peers, addrs, want)
 		}
 	}
-	if _, err := parseFlags([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "mentat", "-mentat-port", "0"}); err == nil {
-		t.Fatal("-mentat-port 0 accepted")
+	for _, bad := range [][]string{{"-mentat-port", "0"}, {"-mentat-url", "http://"}, {"-mentat-url", ""}, {"-mentat-url", "127.0.0.1:6380"}} {
+		args := append([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "mentat", "-peers", "nas.lan:7762"}, bad...)
+		if _, err := parseFlags(args); err == nil {
+			t.Fatalf("%v accepted", bad)
+		}
 	}
 }

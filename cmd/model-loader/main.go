@@ -36,6 +36,9 @@ const defaultPort = 7762
 var version = "dev"
 
 func main() {
+	// The store's files are 0644 and its directories 0755 whatever umask
+	// the service starts with: a consumer reads them as another user.
+	syscall.Umask(0o022)
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "model-loader:", err)
 		os.Exit(1)
@@ -398,7 +401,7 @@ func listenSocket(path string) (net.Listener, error) {
 		}
 	}
 	// The mode is set before anything is served on it. (The umask is not
-	// changed for this: it is the whole process's.)
+	// changed for this: it is the whole process's, and stays 022.)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("local api: %w", err)

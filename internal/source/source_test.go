@@ -79,7 +79,8 @@ func TestHTTPSourceResolveErrorsOnMissingManifest(t *testing.T) {
 
 func TestHuggingfaceSourceResolve(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/models/org/repo/tree/rev", func(w http.ResponseWriter, r *http.Request) {
+	hubRevision(mux, "org/repo", nil)
+	mux.HandleFunc("/api/models/org/repo/tree/"+testCommit, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("recursive") != "true" {
 			t.Errorf("expected recursive=true, got %q", r.URL.RawQuery)
 		}
@@ -111,6 +112,9 @@ func TestHuggingfaceSourceResolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
+	if resolved.Commit != testCommit {
+		t.Errorf("commit = %q, want %q", resolved.Commit, testCommit)
+	}
 	if len(resolved.Files) != 2 {
 		t.Fatalf("got %d files, want 2 (directory entry should be skipped): %+v", len(resolved.Files), resolved.Files)
 	}
@@ -128,7 +132,21 @@ func TestHuggingfaceSourceResolve(t *testing.T) {
 	}
 }
 
-const testSHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+const (
+	testSHA    = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	testCommit = "0123456789abcdef0123456789abcdef01234567"
+)
+
+// hubRevision answers the Hub's revision info for org/repo@rev with
+// testCommit, after check, if set, has looked at the request.
+func hubRevision(mux *http.ServeMux, repo string, check func(*http.Request)) {
+	mux.HandleFunc("/api/models/"+repo+"/revision/rev", func(w http.ResponseWriter, r *http.Request) {
+		if check != nil {
+			check(r)
+		}
+		io.WriteString(w, `{"sha":"`+testCommit+`"}`)
+	})
+}
 
 // The token must reach huggingface.co for gated repos, but never the CDN
 // host the Hub redirects downloads to.
@@ -140,7 +158,8 @@ func TestHuggingfaceSourceTokenStaysOnHub(t *testing.T) {
 			t.Errorf("%s %s: Authorization = %q, want %q", r.Host, r.URL.Path, got, want)
 		}
 	}
-	mux.HandleFunc("/api/models/org/gated/tree/rev", func(w http.ResponseWriter, r *http.Request) {
+	hubRevision(mux, "org/gated", func(r *http.Request) { wantAuth(r, "Bearer hf_secret") })
+	mux.HandleFunc("/api/models/org/gated/tree/"+testCommit, func(w http.ResponseWriter, r *http.Request) {
 		wantAuth(r, "Bearer hf_secret")
 		io.WriteString(w, `[{"type":"file","path":"w.bin","size":1,"lfs":{"oid":"`+testSHA+`","size":5}}]`)
 	})
@@ -181,7 +200,8 @@ func TestHuggingfaceSourceTokenStaysOnHub(t *testing.T) {
 // each LFS sha256 with asterisks; Resolve must fail rather than download.
 func TestHuggingfaceSourceResolveRejectsMaskedSHA(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/models/org/gated/tree/rev", func(w http.ResponseWriter, r *http.Request) {
+	hubRevision(mux, "org/gated", nil)
+	mux.HandleFunc("/api/models/org/gated/tree/"+testCommit, func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `[{"type":"file","path":"w.bin","size":1,"lfs":{"oid":"`+strings.Repeat("*", 64)+`","size":5}}]`)
 	})
 	srv := httptest.NewServer(mux)

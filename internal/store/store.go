@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -19,7 +20,8 @@ import (
 //	<root>/state/<model>/<revision>.json
 //
 // The models tree holds the materialized files consumers read directly;
-// manifests and state are small JSON side files, not meant for consumers.
+// manifests and state are small JSON side files. What a consumer may rely
+// on in all three is the store contract in docs/design.md.
 type Store struct {
 	root string
 
@@ -84,7 +86,9 @@ func (s *Store) HasManifest(model, revision string) bool {
 //
 // If it fails, StateSaved reports false for the revision until a save
 // succeeds: what is on disk may still mark held bytes this node found bad,
-// and must not be served.
+// and must not be served. The old file is removed then, so a consumer
+// reading the store does not use those bytes either; a missing state file
+// marks nothing held.
 func (s *Store) SaveState(rs *RevisionState) error {
 	rs.saveMu.Lock()
 	defer rs.saveMu.Unlock()
@@ -93,6 +97,11 @@ func (s *Store) SaveState(rs *RevisionState) error {
 	err := os.MkdirAll(filepath.Dir(path), 0o755)
 	if err == nil {
 		err = marshalJSONAtomic(path, snap)
+	}
+	if err != nil {
+		if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove stale state: %w", rmErr))
+		}
 	}
 	s.unsavedMu.Lock()
 	defer s.unsavedMu.Unlock()

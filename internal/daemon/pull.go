@@ -147,7 +147,7 @@ func (d *Daemon) publishLazyManifest(ctx context.Context, m catalog.Model) (*sto
 	if len(resolved.Files) == 0 {
 		return nil, fmt.Errorf("source for %s resolved no files", m.Name)
 	}
-	mf := &store.Manifest{Model: m.Name, Revision: m.Revision}
+	mf := &store.Manifest{Model: m.Name, Revision: m.Revision, Commit: resolved.Commit}
 	for _, rf := range resolved.Files {
 		fm := store.FileManifest{Path: rf.Path, Size: rf.Size, SHA256: rf.SHA256, SegmentSize: d.segmentSize()}
 		if fm.Size == 0 && fm.SHA256 == "" {
@@ -275,7 +275,7 @@ func (d *Daemon) pullFile(ctx context.Context, m catalog.Model, mf *store.Manife
 		}
 		// What failed may have come from a LAN node with a bad copy: get
 		// it from the origin this time.
-		srcs = d.originSources(m)
+		srcs = d.originSources(atCommit(m, mf))
 	}
 }
 
@@ -309,6 +309,16 @@ func (d *Daemon) pullSources(ctx context.Context, m catalog.Model, mf *store.Man
 	d.pullSrcs[key] = cachedSources{srcs, time.Now()}
 	d.pullMu.Unlock()
 	return srcs
+}
+
+// atCommit returns m with its revision replaced by the commit mf resolved
+// it to, if any, so what is fetched from the origin is of that commit even
+// after a branch moves.
+func atCommit(m catalog.Model, mf *store.Manifest) catalog.Model {
+	if mf != nil && mf.Commit != "" {
+		m.Revision = mf.Commit
+	}
+	return m
 }
 
 // originSources returns m's origin as its only source.

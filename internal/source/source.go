@@ -37,7 +37,10 @@ type File struct {
 
 // Resolved is a model's file list as learned from its origin.
 type Resolved struct {
-	Files []File
+	// Commit is the commit the requested revision (a branch, tag or
+	// commit) resolved to, when the origin has commits; Files are of it.
+	Commit string
+	Files  []File
 }
 
 // Source fetches model data from one kind of origin (HTTP, Hugging Face,

@@ -172,8 +172,82 @@ On-disk layout:
 ```
 <store>/manifests/<model>/<revision>.json
 <store>/models/<model>/<revision>/<relative-path>
-<store>/state/<model>/<revision>.json   # per-file download progress, not for consumers
+<store>/state/<model>/<revision>.json   # per-file progress: what is held
+<store>/requests/<name>.json            # saved local requests
 ```
+
+### Store contract for consumers
+
+A consumer such as gr8 reads weights in place from the store, with no
+model-loader code and no network: only the files below. What this section
+names is stable; any other file or field is model-loader's own and may
+change.
+
+Paths:
+
+- `<model>` is the catalog entry's `name`, and `<revision>` its `revision`
+  as the catalog writes it: a branch, tag or commit. It may contain a
+  slash (`refs/pr/1`).
+- `<store>/models/<model>/<revision>/<path>` is the file at manifest path
+  `<path>`.
+- `<store>/manifests/<model>/<revision>.json` is the manifest (as `GET
+  /manifest`, see `docs/protocol.md`). Its `files` list every file of the
+  revision, held or not, with `path`, `size` and `segment_size`.
+- `<store>/state/<model>/<revision>.json` says what is held. Its `files`
+  have, per file `path`: `complete`, `segments_done` (one bool per
+  segment) and `whole_failed`. A manifest file the state does not list is
+  not held.
+
+Manifest and state are replaced by a rename once written, so a reader
+never sees half of one.
+
+Revision to commit: the manifest's `commit` is the commit the origin
+resolved the revision to when the manifest was made, and every file is of
+that commit (a root fetches by the commit, not by the branch). A consumer
+reads it from the manifest. It is resolved once: a branch that moves later
+does not change the store's copy; pin a new revision in the catalog to
+follow it. Peers copy the root's manifest, `commit` included. Two roots
+that each make the manifest of a branch may resolve it to different
+commits, so pin commits in the catalog of a fleet with several roots.
+`commit` is empty for an origin with no commits (plain HTTP), and in a
+manifest an older model-loader made.
+
+Complete:
+
+- A file is complete when its state has `complete: true` and not
+  `whole_failed`: it is held whole and matched its whole-file sha256 (or
+  every segment hash, with no sha256 to check).
+- A revision is complete when every file of its manifest is: `/status`
+  then reports it `ready`.
+- A range `[offset, offset+length)` of a file is verified on disk when the
+  file is complete, or when it is not `whole_failed`, every segment from
+  `offset / segment_size` to `(offset+length-1) / segment_size` has
+  `segments_done` true, and not every segment of the file does (a file with
+  every segment held is not used until its whole-file check passes). A
+  partial request (or `partial` entry) is ready when every one of its
+  ranges and whole files is; `GET /requests/{name}` reports the same, and
+  also checks the request's `xxh64`s, which a consumer reading offline
+  checks itself.
+
+Bytes a segment the state marks held covers are on disk: a segment is
+marked held only once written and verified, and an evicted one is marked
+not held before its bytes are freed. If saving the state fails, the old
+state file is removed, as it may mark held a segment since found bad;
+until a save succeeds the revision reads as holding nothing. Eviction removes only pieces nothing
+on the node wants, so a consumer keeps what it reads pinned with a request
+or a selection entry while model-loader runs.
+
+Sparse files: a file held only in part is a sparse file at its full size,
+every held segment at its original offset, so a reader uses the absolute
+offsets from the file's own index (a safetensors header, gr8's index
+slices). Bytes outside held segments read as zeros.
+
+Permissions: model-loader is the only writer. Under `models/`,
+`manifests/` and `state/` it creates every file 0644 and every directory
+0755 (it sets its umask to 022), owned by the user it runs as, so a
+consumer reads them as any user, from a read-only mount. The local API
+socket, `model-loader.sock`, is 0660 in model-loader's group (see
+"Deployment targets").
 
 ### Disk budget and eviction
 

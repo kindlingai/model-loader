@@ -46,6 +46,37 @@ type StatusResponse struct {
 	NodeID string        `json:"node_id"`
 	Roles  []string      `json:"roles"`
 	Models []ModelStatus `json:"models"`
+	// Disk is how the node uses its store's disk; nil on a node too old
+	// to say.
+	Disk *DiskStatus `json:"disk,omitempty"`
+}
+
+// DiskStatus is a node's disk budget and use.
+type DiskStatus struct {
+	// BudgetBytes is the most the store may hold; 0 means no budget, and
+	// nothing is evicted.
+	BudgetBytes int64 `json:"budget_bytes"`
+	// UsedBytes is what the store holds: every held segment, and a root's
+	// download from its origin in progress.
+	UsedBytes int64 `json:"used_bytes"`
+	// EvictableBytes is what eviction could remove now: held segments
+	// nothing on this node wants, that another node keeps a copy of (see
+	// docs/design.md). Counted only with a budget, at each reconcile tick.
+	EvictableBytes int64 `json:"evictable_bytes"`
+}
+
+// Cataloger, when the StatusProvider implements it, says whether the
+// node's catalog names a model revision.
+type Cataloger interface {
+	Cataloged(model, revision string) bool
+}
+
+// UseTracker, when the StatusProvider implements it, is told when a range
+// starts being served. The function it returns is called when serving
+// ends. Eviction keeps a segment that is being served, and removes the
+// least recently used first.
+type UseTracker interface {
+	BeginUse(model, revision string, fm store.FileManifest, start, end int64) (done func())
 }
 
 // StatusProvider supplies the current node-wide status. It is implemented by

@@ -221,6 +221,25 @@ func (d *Daemon) Pull(ctx context.Context, name, revision, path string, start, e
 		mark(c.Offset, c.Offset+c.Length)
 		used = append(used, c)
 	}
+	rs, err := d.revState(mf)
+	if err != nil {
+		return err
+	}
+	// Every segment the pull needs, the range and what its checks span, is
+	// in use until it is over, so making room for it cannot evict one of
+	// them.
+	defer d.useSegments(m.Name, m.Revision, fm, segs)()
+	var needs []spaceNeed
+	for i, s := range segs {
+		if s && rs.SegmentTrust(fm, i) == "" {
+			needs = append(needs, segmentNeed(mf, rs, fm, i, d.blockSize()))
+		}
+	}
+	release, err := d.makeRoom(ctx, needs)
+	if err != nil {
+		return err
+	}
+	defer release()
 	return d.pullFile(ctx, m, mf, fm, segs, used)
 }
 
@@ -354,6 +373,7 @@ func (d *Daemon) pullSegment(ctx context.Context, m catalog.Model, fm store.File
 		defer d.pullLimit.Release()
 		pctx, cancel := context.WithTimeout(transfer.WithNoPull(context.WithoutCancel(ctx)), pullTimeout)
 		defer cancel()
+		defer d.writing(m.Name, m.Revision, fm)()
 		need := make([]bool, fm.NumSegments())
 		need[i] = true
 		return nil, transfer.FetchFile(pctx, d.cfg.Store, m.Name, m.Revision, fm, rs,

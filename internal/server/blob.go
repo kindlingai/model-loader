@@ -48,6 +48,12 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Mark the range in use before reading the state, so eviction either
+	// sees the use and keeps the segments, or dropped them from the state
+	// first and this answers 416.
+	if u, ok := s.status.(UseTracker); ok && fm.Size > 0 {
+		defer u.BeginUse(model, revision, fm, start, end+1)()
+	}
 
 	state, err := s.store.LoadState(manifest)
 	if err != nil {

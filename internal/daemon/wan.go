@@ -11,12 +11,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
+	"github.com/kindlingai/model-loader/internal/want"
 )
 
 // errStalled is the cancel cause when a download from a model's origin
@@ -71,6 +73,53 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 	}
 	report(0)
 
+	// Every file is being written until the manifest and the final state
+	// are saved: until then the state says nothing is held, and space no
+	// held segment covers is freed (see reclaimLocked).
+	for _, fm := range manifest.Files {
+		defer d.writing(m.Name, m.Revision, fm)()
+	}
+
+	// What each file has on disk that the download resumes from. A file
+	// whose progress does not hold is started over, so its old bytes are
+	// freed now, before room is made, rather than counted twice.
+	written := make([]atomic.Int64, len(manifest.Files))
+	for i, fm := range manifest.Files {
+		of, err := d.originProgress(m, rs, fm, report)
+		if err != nil {
+			return nil, fmt.Errorf("check %s: %w", fm.Path, err)
+		}
+		switch {
+		case of.Complete:
+			written[i].Store(fm.Size)
+		case of.BytesDone > 0:
+			written[i].Store(of.BytesDone)
+		default:
+			if err := os.Truncate(d.cfg.Store.FilePath(m.Name, m.Revision, fm.Path), 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return nil, fmt.Errorf("start %s over: %w", fm.Path, err)
+			}
+		}
+	}
+
+	// Room for the whole revision, less what is on disk of it, before any
+	// more of it is written, in whole filesystem blocks as the store's use
+	// is counted.
+	bs := d.blockSize()
+	release, err := d.makeRoom(ctx, []spaceNeed{{
+		key: "wan\x00" + want.Key(m.Name, m.Revision),
+		remaining: func() int64 {
+			var n int64
+			for i, fm := range manifest.Files {
+				n += max(0, roundUp(fm.Size, bs)-roundUp(written[i].Load(), bs))
+			}
+			return n
+		},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	for i, fm := range manifest.Files {
 		of, err := d.originProgress(m, rs, fm, report)
 		if err != nil {
@@ -78,10 +127,15 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 		}
 		if !of.Complete {
 			report(of.BytesDone)
-			if err := d.downloadFile(ctx, src, m, rs, of, report); err != nil {
+			err := d.downloadFile(ctx, src, m, rs, of, func(inFile int64) {
+				written[i].Store(inFile)
+				report(inFile)
+			})
+			if err != nil {
 				return nil, fmt.Errorf("download %s: %w", fm.Path, err)
 			}
 		}
+		written[i].Store(fm.Size)
 		manifest.Files[i] = of.FileManifest
 		done += fm.Size
 		report(0)

@@ -175,6 +175,72 @@ On-disk layout:
 <store>/state/<model>/<revision>.json   # per-file download progress, not for consumers
 ```
 
+### Disk budget and eviction
+
+GLM-5.3 and GLM-5.3-Flash together are close to the SSD size of a box.
+Spread over the boxes, with each deleting what it does not need, both fit.
+`-disk-budget` (bytes such as `3T`, or a share of the store's filesystem
+such as `85%`) sets the most the store may hold. Without one nothing is
+evicted or removed.
+
+The store's use is the disk space its model files take: the blocks the
+filesystem allocated to them. So it counts what is really on disk, bytes a
+failed transfer wrote included, and holds across restarts.
+
+Before a fetch, the node reserves room for every segment it still has to
+fetch, counted in the filesystem blocks it touches. Fetches of the same
+segment share one reservation, and one that joins a fetch already let in
+is not checked again. A root's download from its origin reserves what of
+the revision is not on disk yet before it writes; a file whose progress
+does not hold is started over, and its old bytes freed, first.
+If the store's use plus every reservation would go over the budget, it
+frees space until it fits: first bytes no held segment covers, in files
+nothing is writing or serving (what a failed transfer left; a segment
+counts as not held only if the saved state agrees), then held segments,
+least recently used first (a segment is used when it is fetched or served
+to a peer). Freed space is measured again, not assumed. If the fetch cannot
+fit after freeing everything it may, the model is in error with the
+reason, and is tried again at the next tick. A root pulling through for a
+peer makes room the same way, and the segments the pull needs (its range
+and what its checksums span) cannot be evicted to make it. At every tick
+the node also frees down to the budget (it may have been lowered) and
+counts what it could evict, for `/status`.
+
+A segment may be evicted only when all of these hold:
+
+- Nothing on this node wants it: no request and no selection entry names
+  it. Those pieces are pinned. The pins are read again just before
+  eviction acts, and a request change waits for that, so a request
+  acknowledged before eviction is never overtaken by it. If the wants
+  cannot be worked out, nothing is evicted.
+- Nothing is serving it to a peer, nor writing its file, at that moment.
+- The fleet keeps a copy. A node that can fetch the model from its origin
+  (a root) may always evict, since the origin has it. A peer may evict only
+  a segment that a root whose catalog names the revision holds (`cataloged`
+  in `/segments`), or that a node with a lower ID holds.
+  So of the peers holding a segment no root holds, the one with the lowest
+  ID never evicts it, and two peers evicting at once cannot both drop the
+  last copy. Each peer's `/segments` says what it holds; a peer that does
+  not answer is taken to hold nothing.
+
+An evicted segment's blocks go back to the filesystem (a hole punched in
+the file, on Linux and macOS; elsewhere the space stays charged); a file
+with nothing left held is removed. Eviction forgets only the consumer
+checksums over the evicted segment, so a request for another range of the
+file stays ready.
+
+A revision the catalog no longer names, and that no saved request or
+selection entry on this node names, is retired. At every tick, with a
+budget, its segments are evicted by the same fleet rule, except that no
+node can fetch it again, roots included: a node drops a retired segment
+only if a node with a lower ID holds it. Once nothing of it is held its
+files, state and manifest are removed (only its own files: a revision
+named `refs/pr/1` lives under the directory of one named `refs`). So the
+lowest-ID holder keeps one copy of a retired revision, until removed by
+hand: another node's catalog may still name it, and as discovery can miss
+nodes no node can tell that every catalog in the fleet dropped it. Without
+a budget nothing is evicted or removed.
+
 ## Network protocol
 
 Every node, root or peer, runs the same small HTTP server (see

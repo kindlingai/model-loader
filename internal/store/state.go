@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -38,6 +39,9 @@ type FileState struct {
 	// Checked lists the consumer checksums (RangeCheck.Key) that matched
 	// the bytes held, so each is checked once, not on every pass.
 	Checked []string `json:"checked,omitempty"`
+	// Used[i] is when segment i was last fetched or served, in Unix
+	// seconds; 0 if never recorded. Eviction removes the oldest first.
+	Used []int64 `json:"used,omitempty"`
 	// WholeFailed means every segment was held and the whole file did not
 	// match its sha256, yet the segments matched the manifest's segment
 	// hashes, so fetching them again cannot help: the manifest disagrees
@@ -122,6 +126,9 @@ func (fs FileState) clone() FileState {
 	if fs.Checked != nil {
 		fs.Checked = append([]string(nil), fs.Checked...)
 	}
+	if fs.Used != nil {
+		fs.Used = append([]int64(nil), fs.Used...)
+	}
 	return fs
 }
 
@@ -151,6 +158,20 @@ func (fs *FileState) fit(n int) {
 	if fs.Trust != nil && len(fs.Trust) != n {
 		fs.Trust = resizeS(fs.Trust)
 	}
+	if fs.Used != nil && len(fs.Used) != n {
+		out := make([]int64, n)
+		copy(out, fs.Used)
+		fs.Used = out
+	}
+}
+
+// LastUsed returns when segment i was last fetched or served, in Unix
+// seconds, or 0 if never recorded.
+func (fs FileState) LastUsed(i int) int64 {
+	if i < len(fs.Used) {
+		return fs.Used[i]
+	}
+	return 0
 }
 
 // BytesDone estimates completed bytes for progress reporting, treating each
@@ -317,6 +338,7 @@ func (rs *RevisionState) update(fm FileManifest, fn func(*FileState)) {
 func (rs *RevisionState) MarkSegment(fm FileManifest, i int, sum, trust string) {
 	rs.update(fm, func(fs *FileState) {
 		fs.SegmentsDone[i] = true
+		fs.touch(i, time.Now().Unix())
 		if !fm.Hashed() {
 			// Kept whatever the trust: it is all a later copier or a
 			// re-verify has to check this segment against.
@@ -332,6 +354,26 @@ func (rs *RevisionState) MarkSegment(fm FileManifest, i int, sum, trust string) 
 			fs.Trust = make([]string, len(fs.SegmentsDone))
 		}
 		fs.Trust[i] = trust
+	})
+}
+
+func (fs *FileState) touch(i int, now int64) {
+	if fs.Used == nil {
+		fs.Used = make([]int64, len(fs.SegmentsDone))
+	}
+	if i < len(fs.Used) {
+		fs.Used[i] = now
+	}
+}
+
+// Touch records segments first to last of fm as used now, as when they
+// are served. The time is kept in memory until the state is next saved.
+func (rs *RevisionState) Touch(fm FileManifest, first, last int) {
+	now := time.Now().Unix()
+	rs.update(fm, func(fs *FileState) {
+		for i := max(first, 0); i <= last && i < len(fs.SegmentsDone); i++ {
+			fs.touch(i, now)
+		}
 	})
 }
 
@@ -369,6 +411,32 @@ func (rs *RevisionState) DropSegment(fm FileManifest, i int) {
 	rs.update(fm, func(fs *FileState) {
 		fs.SegmentsDone[i], fs.Complete, fs.WholeFailed = false, false, false
 		fs.Checked = nil
+		if i < len(fs.SegmentSHA256) {
+			fs.SegmentSHA256[i] = ""
+		}
+		if i < len(fs.Trust) {
+			fs.Trust[i] = ""
+		}
+	})
+}
+
+// EvictSegment records segment i of fm as not held because eviction
+// removed it, not because it was bad: only the checks that cover it are
+// forgotten, so a request whose checked range is elsewhere in the file
+// stays ready.
+func (rs *RevisionState) EvictSegment(fm FileManifest, i int) {
+	start, end := fm.SegmentBounds(i)
+	rs.update(fm, func(fs *FileState) {
+		fs.SegmentsDone[i], fs.Complete = false, false
+		kept := fs.Checked[:0]
+		for _, k := range fs.Checked {
+			var off, n int64
+			if _, err := fmt.Sscanf(k, "%d+%d=", &off, &n); err == nil && (RangeCheck{Offset: off, Length: n}).Overlaps(start, end) {
+				continue
+			}
+			kept = append(kept, k)
+		}
+		fs.Checked = kept
 		if i < len(fs.SegmentSHA256) {
 			fs.SegmentSHA256[i] = ""
 		}

@@ -13,6 +13,14 @@ import (
 type SegmentsResponse struct {
 	Model    string `json:"model"`
 	Revision string `json:"revision"`
+	// NodeID is the answering node's ID, as in /status. Eviction uses it
+	// to decide which of two holders keeps a segment (see docs/design.md).
+	NodeID string `json:"node_id,omitempty"`
+	// Cataloged says whether the answering node's catalog names the
+	// revision; nil from a node too old to say. A root's copy lets a peer
+	// evict its own only while this is not false: a root whose catalog
+	// dropped the revision cannot fetch it again.
+	Cataloged *bool `json:"cataloged,omitempty"`
 	// Roles are the node's roles, as in /status, so a node choosing
 	// sources can prefer a peer to a root with one request.
 	Roles []string                `json:"roles"`
@@ -89,7 +97,12 @@ func HeldRanges(done []bool) [][2]int {
 
 func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	model, revision := r.PathValue("model"), r.PathValue("revision")
-	resp := SegmentsResponse{Model: model, Revision: revision, Roles: s.status.Status().Roles, Files: map[string]FileSegments{}}
+	st := s.status.Status()
+	resp := SegmentsResponse{Model: model, Revision: revision, NodeID: st.NodeID, Roles: st.Roles, Files: map[string]FileSegments{}}
+	if c, ok := s.status.(Cataloger); ok {
+		named := c.Cataloged(model, revision)
+		resp.Cataloged = &named
+	}
 	m, err := s.store.LoadManifest(model, revision)
 	if err != nil {
 		// No manifest: this node holds nothing of it. That is an answer,

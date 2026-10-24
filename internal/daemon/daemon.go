@@ -87,6 +87,10 @@ type Config struct {
 	// Requests, if set, holds the named requests of local consumers. Their
 	// pieces are wanted along with the selection's.
 	Requests *request.Registry
+
+	// DiskBudget is the most the store may hold, in bytes. Fetches evict
+	// what they may to stay under it (see disk.go). 0 means no budget.
+	DiskBudget int64
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -97,11 +101,20 @@ type Daemon struct {
 	availSlots chan struct{}     // see availabilityQueries
 	kick       chan struct{}     // see Kick
 	wantsGen   atomic.Uint64     // see Kick
-	onPass     func()            // tests: called as each Run pass starts
+
+	diskMu   sync.Mutex              // serializes making room and evicting
+	reserved map[string]*reservation // room held for fetches; diskMu guards
+	pinMu    sync.Mutex              // orders request changes and eviction
+	bsOnce   sync.Once               // see blockSize
+	bs       int64
+	useMu    sync.Mutex     // guards serving
+	serving  map[string]int // segments being served; see useKey
+	onPass   func()         // tests: called as each Run pass starts
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
-	change   chan struct{} // closed and replaced on every status change
+	disk     *server.DiskStatus // see diskPass
+	change   chan struct{}      // closed and replaced on every status change
 	verified map[string]bool
 
 	stateMu sync.Mutex
@@ -132,6 +145,8 @@ func New(cfg Config) *Daemon {
 		limit:      transfer.NewLimiter(cfg.MaxConcurrentTransfers),
 		availSlots: make(chan struct{}, availabilityQueries),
 		kick:       make(chan struct{}, 1),
+		reserved:   make(map[string]*reservation),
+		serving:    make(map[string]int),
 		change:     make(chan struct{}),
 		statuses:   make(map[string]server.ModelStatus),
 		verified:   make(map[string]bool),
@@ -160,6 +175,10 @@ func (d *Daemon) Status() server.StatusResponse {
 	resp := server.StatusResponse{NodeID: d.cfg.NodeID, Roles: d.cfg.Roles, Models: []server.ModelStatus{}}
 	for _, ms := range d.statuses {
 		resp.Models = append(resp.Models, ms)
+	}
+	if d.disk != nil {
+		ds := *d.disk
+		resp.Disk = &ds
 	}
 	return resp
 }
@@ -198,6 +217,14 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 		if err != nil {
 			onErr(err)
 		}
+		if _, running := busy.LoadOrStore(diskPassKey, true); !running {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer busy.Delete(diskPassKey)
+				d.diskPass(ctx)
+			}()
+		}
 		for _, w := range wants {
 			key := want.Key(w.Model.Name, w.Model.Revision)
 			if _, running := busy.LoadOrStore(key, true); running {
@@ -224,6 +251,10 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 		}
 	}
 }
+
+// diskPassKey keys the disk pass in Run's busy map; no model key has a
+// NUL in it.
+const diskPassKey = "\x00disk"
 
 // Reconcile runs one pass over every catalog entry this node's Selection
 // wants, bringing each one's manifest and files up to date. Models are
@@ -276,9 +307,11 @@ func (d *Daemon) reloadSelection() error {
 	if err != nil {
 		return err
 	}
+	d.pinMu.Lock() // see PutRequest
 	d.mu.Lock()
 	d.cfg.Selection = sel
 	d.mu.Unlock()
+	d.pinMu.Unlock()
 	return nil
 }
 
@@ -375,6 +408,25 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 
 	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
 
+	var needs []spaceNeed
+	for _, fm := range manifest.Files {
+		if fn := need.Files[fm.Path]; fn != nil {
+			for i, n := range fn.Segments {
+				if n && rs.SegmentTrust(fm, i) == "" {
+					needs = append(needs, segmentNeed(manifest, rs, fm, i, d.blockSize()))
+				}
+			}
+		}
+	}
+	release, err := d.makeRoom(ctx, needs)
+	if err != nil {
+		ms := progress(w, manifest, need, rs, server.StateError)
+		ms.Error = err.Error()
+		d.setStatus(ms)
+		return err
+	}
+	defer release()
+
 	// A root holding a manifest it published for pull-through fetches what
 	// it needs itself the same way it does for a peer: from the origin, one
 	// fetch per segment however many ask.
@@ -398,6 +450,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			continue
 		}
 		var err error
+		done := d.writing(m.Name, m.Revision, fm)
 		if pull {
 			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
 		} else {
@@ -405,6 +458,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 				Need: fn.Segments, Order: srcs.order(fm.Path), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
 			})
 		}
+		done()
 		if err != nil {
 			// Go on with the other files: one bad piece (a consumer
 			// checksum that does not match, say) must not hold back

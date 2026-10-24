@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"strings"
 )
 
 // DefaultSegmentSize is the granularity at which a file's integrity is
@@ -70,6 +72,38 @@ type Manifest struct {
 	Model    string         `json:"model"`
 	Revision string         `json:"revision"`
 	Files    []FileManifest `json:"files"`
+}
+
+// Validate checks that m is self-consistent: every path is a clean,
+// relative, slash-separated path inside the revision and appears once, and
+// every file has one segment hash per SegmentSize bytes. A manifest comes
+// from another node, so a bad one must fail here rather than index out of
+// range or write outside the store later.
+func (m *Manifest) Validate() error {
+	seen := make(map[string]bool, len(m.Files))
+	for _, f := range m.Files {
+		if f.Path == "" || path.IsAbs(f.Path) || path.Clean(f.Path) != f.Path || f.Path == ".." || strings.HasPrefix(f.Path, "../") || strings.Contains(f.Path, "\\") {
+			return fmt.Errorf("manifest %s@%s: invalid path %q", m.Model, m.Revision, f.Path)
+		}
+		if seen[f.Path] {
+			return fmt.Errorf("manifest %s@%s: duplicate path %q", m.Model, m.Revision, f.Path)
+		}
+		seen[f.Path] = true
+		if f.Size < 0 {
+			return fmt.Errorf("manifest %s@%s: %s: negative size", m.Model, m.Revision, f.Path)
+		}
+		want := 0
+		if f.Size > 0 {
+			if f.SegmentSize <= 0 {
+				return fmt.Errorf("manifest %s@%s: %s: no segment size", m.Model, m.Revision, f.Path)
+			}
+			want = int((f.Size + f.SegmentSize - 1) / f.SegmentSize)
+		}
+		if len(f.SegmentSHA256) != want {
+			return fmt.Errorf("manifest %s@%s: %s: %d segment hashes, want %d", m.Model, m.Revision, f.Path, len(f.SegmentSHA256), want)
+		}
+	}
+	return nil
 }
 
 // TotalSize sums every file's size.

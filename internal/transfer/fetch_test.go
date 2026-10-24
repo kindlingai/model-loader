@@ -371,3 +371,33 @@ func TestFetchFilePartialAlreadyHeld(t *testing.T) {
 		t.Fatalf("FetchFile: %v", err)
 	}
 }
+
+// Every segment held but the file not yet marked complete (a crash before
+// the whole-file check was saved): the check runs with no sources at all.
+func TestFetchFileAllHeldChecksWholeWithoutSources(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("k"), 25)
+	fm := buildManifestFile("w.bin", content, 10)
+	f, err := st.EnsureFile("m", "r1", fm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(content, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	fs := rs.FileState(fm)
+	fs.SegmentsDone = []bool{true, true, true}
+	rs.SetFileState(fs)
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, nil, []bool{false, true, false}); err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if !rs.FileState(fm).Complete {
+		t.Fatal("file not marked complete")
+	}
+}

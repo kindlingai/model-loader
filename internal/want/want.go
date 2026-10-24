@@ -76,6 +76,9 @@ type FileNeed struct {
 // m. It fails for a range that names a file m does not have, or that runs
 // past the end of its file.
 func Resolve(m *store.Manifest, w Want) (*Need, error) {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
 	n := &Need{Whole: w.Whole, Files: make(map[string]*FileNeed)}
 	for _, fm := range m.Files {
 		if w.Whole || wholeFile(w.Pieces, fm.Path) {

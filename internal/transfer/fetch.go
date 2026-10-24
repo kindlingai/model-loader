@@ -82,7 +82,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if missing == 0 && !allDone(fileState.SegmentsDone) {
 		return nil // every needed segment is already held.
 	}
-	if len(fetchers) == 0 {
+	if missing > 0 && len(fetchers) == 0 {
 		return fmt.Errorf("fetch %s: no sources available", fm.Path)
 	}
 

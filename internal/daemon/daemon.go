@@ -80,7 +80,7 @@ type Daemon struct {
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
-	visited  map[string]bool
+	verified map[string]bool
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -98,7 +98,7 @@ func New(cfg Config) *Daemon {
 		cfg:      cfg,
 		sem:      make(chan struct{}, cfg.MaxConcurrentTransfers),
 		statuses: make(map[string]server.ModelStatus),
-		visited:  make(map[string]bool),
+		verified: make(map[string]bool),
 	}
 }
 
@@ -297,11 +297,12 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
-	if d.cfg.VerifyOnStart && d.firstVisit(want.Key(m.Name, m.Revision)) {
+	if key := want.Key(m.Name, m.Revision); d.cfg.VerifyOnStart && !d.visited(key) {
 		dropped, err := d.cfg.Store.Reverify(manifest, rs)
 		if err != nil {
 			return fmt.Errorf("re-verify: %w", err)
 		}
+		d.markVisited(key)
 		if dropped > 0 {
 			log.Printf("model-loader: %s@%s: re-verify dropped %d segments that no longer match the manifest", m.Name, m.Revision, dropped)
 		}
@@ -340,13 +341,15 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	return nil
 }
 
-// firstVisit reports whether key has not been seen before by this process.
-func (d *Daemon) firstVisit(key string) bool {
+// visited reports whether this process has re-verified key already.
+func (d *Daemon) visited(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.visited[key] {
-		return false
-	}
-	d.visited[key] = true
-	return true
+	return d.verified[key]
+}
+
+func (d *Daemon) markVisited(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.verified[key] = true
 }

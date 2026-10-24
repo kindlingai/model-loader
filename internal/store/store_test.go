@@ -281,3 +281,28 @@ func TestReverifyDropsCorruptSegment(t *testing.T) {
 		t.Fatalf("Reverify of a deleted file = %d, %v; want 2 dropped", dropped, err)
 	}
 }
+
+func TestManifestValidate(t *testing.T) {
+	ok := FileManifest{Path: "dir/a.bin", Size: 25, SegmentSize: 10, SegmentSHA256: []string{"h0", "h1", "h2"}}
+	if err := (&Manifest{Files: []FileManifest{ok, {Path: "empty", Size: 0}}}).Validate(); err != nil {
+		t.Fatalf("Validate(good) = %v", err)
+	}
+	for name, fm := range map[string]FileManifest{
+		"too few hashes": {Path: "a", Size: 25, SegmentSize: 10, SegmentSHA256: []string{"h0", "h1"}},
+		"no seg size":    {Path: "a", Size: 25, SegmentSHA256: []string{"h0"}},
+		"negative size":  {Path: "a", Size: -1},
+		"dotdot":         {Path: "../etc/passwd", Size: 0},
+		"inner dotdot":   {Path: "a/../../b", Size: 0},
+		"absolute":       {Path: "/etc/passwd", Size: 0},
+		"unclean":        {Path: "a//b", Size: 0},
+		"empty path":     {Path: "", Size: 0},
+		"backslash":      {Path: "a\\..\\b", Size: 0},
+	} {
+		if err := (&Manifest{Files: []FileManifest{fm}}).Validate(); err == nil {
+			t.Errorf("%s: Validate = nil, want an error", name)
+		}
+	}
+	if err := (&Manifest{Files: []FileManifest{ok, ok}}).Validate(); err == nil {
+		t.Error("duplicate path: Validate = nil, want an error")
+	}
+}

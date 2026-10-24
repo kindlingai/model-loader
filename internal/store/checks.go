@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -90,3 +91,9 @@ func ParseChecks(v string) ([]RangeCheck, error) {
 	}
 	return out, nil
 }
+
+// ErrCheckFailed means a consumer's checksum did not match the bytes held
+// for its range. It is about that range, not the source: a source that
+// answers with it is not at fault, and other segments may still come
+// from it.
+var ErrCheckFailed = errors.New("consumer checksum does not match")

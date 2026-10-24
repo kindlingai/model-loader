@@ -274,10 +274,13 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
 // unix socket, PATH relative to storeDir unless absolute; anything else is
 // a TCP host:port.
 //
-// A socket left by an earlier run is removed first, but only a socket that
-// nothing answers on: a path that is not a socket, or one another
-// model-loader is serving, is an error. The socket is mode 0660, so the
-// owner and its group (the consumer's, in a deployment) can use it.
+// For a socket, an exclusive lock on PATH.lock is taken first and held
+// until the listener closes, so two processes starting at once cannot both
+// remove and bind the path. With the lock held, a socket left by an
+// earlier run is removed, but only a socket that nothing answers on: a
+// path that is not a socket, or one an older model-loader without the
+// lock is serving, is an error. The socket is mode 0660, so the owner and
+// its group (the consumer's, in a deployment) can use it.
 func listenLocal(addr, storeDir string) (net.Listener, error) {
 	path, ok := strings.CutPrefix(addr, "unix:")
 	if !ok {
@@ -286,6 +289,23 @@ func listenLocal(addr, storeDir string) (net.Listener, error) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(storeDir, path)
 	}
+	lock, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("local api: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("local api: %s is in use by another process", path)
+	}
+	ln, err := listenSocket(path)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return &lockedListener{Listener: ln, lock: lock}, nil
+}
+
+func listenSocket(path string) (net.Listener, error) {
 	if info, err := os.Lstat(path); err == nil {
 		if info.Mode()&fs.ModeSocket == 0 {
 			return nil, fmt.Errorf("local api: %s exists and is not a socket", path)
@@ -309,4 +329,16 @@ func listenLocal(addr, storeDir string) (net.Listener, error) {
 		return nil, fmt.Errorf("local api: %w", err)
 	}
 	return ln, nil
+}
+
+// lockedListener releases its socket's lock once it is closed.
+type lockedListener struct {
+	net.Listener
+	lock *os.File
+}
+
+func (l *lockedListener) Close() error {
+	err := l.Listener.Close()
+	l.lock.Close()
+	return err
 }

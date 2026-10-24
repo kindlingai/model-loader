@@ -212,24 +212,30 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	}
 	close(queue)
 	wg.Wait()
-	if firstErr != nil {
-		return firstErr
+	if firstErr != nil && (ctx.Err() != nil || len(PendingChecks(fm, rs, opts.Checks)) == 0) {
+		return firstErr // nothing that landed is left to judge.
 	}
 
 	f, err := openFile()
 	if err != nil {
-		return err
+		return errors.Join(firstErr, err)
 	}
 	defer f.Close()
 	if err := syncAndUncache(f); err != nil {
-		return fmt.Errorf("fetch %s: %w", fm.Path, err)
+		return errors.Join(firstErr, fmt.Errorf("fetch %s: %w", fm.Path, err))
 	}
+	// Checks run even when a segment failed: a check over segments that
+	// did land (another request's range, say) is judged now, not held
+	// back by the one that failed.
 	err = ApplyChecks(f, fm, rs, opts.Checks)
 	if serr := st.SaveState(rs); err == nil && serr != nil {
 		err = serr
 	}
 	if err != nil {
-		return fmt.Errorf("fetch %s: %w", fm.Path, err)
+		err = fmt.Errorf("fetch %s: %w", fm.Path, err)
+	}
+	if err := errors.Join(firstErr, err); err != nil {
+		return err
 	}
 	return FinishFile(st, f, fm, rs)
 }
@@ -339,9 +345,9 @@ func ApplyChecks(f *os.File, fm store.FileManifest, rs *store.RevisionState, che
 		case ok:
 			rs.AddChecked(fm, c)
 		case err != nil:
-			errs = append(errs, fmt.Errorf("range offset %d length %d: %w", c.Offset, c.Length, err))
+			errs = append(errs, fmt.Errorf("range offset %d length %d: %w: %w", c.Offset, c.Length, store.ErrCheckFailed, err))
 		default:
-			errs = append(errs, fmt.Errorf("range offset %d length %d does not match its xxh64 %s", c.Offset, c.Length, xxh64.Format(c.XXH64)))
+			errs = append(errs, fmt.Errorf("range offset %d length %d: %w: xxh64 %s", c.Offset, c.Length, store.ErrCheckFailed, xxh64.Format(c.XXH64)))
 		}
 	}
 	return errors.Join(errs...)
@@ -389,8 +395,9 @@ func syncAndUncache(f *os.File) error {
 
 // fetchSegment tries the fetchers order names, in turn, for segment i,
 // returning at the first success the segment's sha256 and how it was
-// verified. A fetcher reporting ErrRangeUnavailable is skipped for this
-// segment only. One that fails outright (a peer that went away mid-copy, a
+// verified. A fetcher reporting ErrRangeUnavailable, or a consumer
+// checksum that failed (store.ErrCheckFailed), is skipped for this segment
+// only. One that fails outright (a peer that went away mid-copy, a
 // dropped connection, data that fails verification) is marked in dead and
 // skipped for the rest of the file, so the copy fails over to the next peer
 // or the root instead of failing, and doesn't wait on a dead address again
@@ -425,7 +432,9 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 		} else {
 			rc, err = fetchers[k].Open(ctx, fm.Path, start, length)
 		}
-		if errors.Is(err, ErrRangeUnavailable) {
+		if errors.Is(err, ErrRangeUnavailable) || errors.Is(err, store.ErrCheckFailed) {
+			// Not this source's fault: a checksum that failed is about
+			// that range, so the source stays usable for other segments.
 			lastErr = err
 			continue
 		}

@@ -46,6 +46,25 @@ type Puller interface {
 	Pull(ctx context.Context, model, revision, path string, start, end int64, checks []store.RangeCheck) error
 }
 
+// HeaderPriority, on a blob request, is the priority of the request it
+// serves on the asking node (see the local request API). A root asks for a
+// pull-through slot at it, so a higher one fetched through the root is
+// not stuck behind lower ones there either.
+const HeaderPriority = "X-Priority"
+
+type priorityKey struct{}
+
+// WithPriority marks ctx with the priority p of the work it is for.
+func WithPriority(ctx context.Context, p int) context.Context {
+	return context.WithValue(ctx, priorityKey{}, p)
+}
+
+// Priority returns the priority ctx was marked with, or 0.
+func Priority(ctx context.Context) int {
+	p, _ := ctx.Value(priorityKey{}).(int)
+	return p
+}
+
 // SetPuller makes s fetch from the origin, through p, a manifest or range
 // it does not hold yet, instead of answering 404 or 416.
 func (s *Server) SetPuller(p Puller) { s.puller = p }

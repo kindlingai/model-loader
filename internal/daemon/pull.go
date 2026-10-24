@@ -344,15 +344,14 @@ func (d *Daemon) pullSegment(ctx context.Context, m catalog.Model, fm store.File
 		if rs.SegmentTrust(fm, i) != "" {
 			return nil, nil // another call fetched it just now.
 		}
-		// Wait for a slot as long as the caller does; once the fetch has
+		// Wait for a slot, at the caller's priority (the first caller's,
+		// for a segment many want), as long as the caller does; once the fetch has
 		// started it finishes even if the caller goes away, as others may
 		// be waiting on it (see pullTimeout).
-		select {
-		case d.pullSlots <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if err := d.pullLimit.Acquire(ctx, server.Priority(ctx)); err != nil {
+			return nil, err
 		}
-		defer func() { <-d.pullSlots }()
+		defer d.pullLimit.Release()
 		pctx, cancel := context.WithTimeout(transfer.WithNoPull(context.WithoutCancel(ctx)), pullTimeout)
 		defer cancel()
 		need := make([]bool, fm.NumSegments())

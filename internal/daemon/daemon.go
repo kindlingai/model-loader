@@ -110,7 +110,7 @@ type Daemon struct {
 	pullMu    sync.Mutex
 	pulls     map[string]*pullCall // see once
 	pullSrcs  map[string]cachedSources
-	pullSlots chan struct{}
+	pullLimit *transfer.Limiter // pull-through segment fetches, by priority
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -138,7 +138,7 @@ func New(cfg Config) *Daemon {
 		states:     make(map[string]*store.RevisionState),
 		pulls:      make(map[string]*pullCall),
 		pullSrcs:   make(map[string]cachedSources),
-		pullSlots:  make(chan struct{}, cfg.PullWorkers),
+		pullLimit:  transfer.NewLimiter(cfg.PullWorkers),
 	}
 }
 
@@ -388,6 +388,9 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		srcs = d.buildSources(ctx, m, manifest, peers)
 	}
 
+	// Transfers this pass makes ask for slots at the want's priority, here
+	// and, through the priority header, at a root pulling through.
+	ctx = server.WithPriority(ctx, w.Priority)
 	var errs []error
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]

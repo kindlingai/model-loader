@@ -37,6 +37,7 @@ type fakeOrigin struct {
 	conns     atomic.Int32 // connections opened
 	delay     time.Duration
 	digest    func(name string, sum string) string // rewrites a file's sha256 in manifest.json
+	onRange   func(path, rangeHeader string)       // called for each file request
 }
 
 func newFakeOrigin(t *testing.T, files map[string][]byte) *fakeOrigin {
@@ -82,6 +83,9 @@ func (o *fakeOrigin) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	o.ranges.Add(1)
+	if o.onRange != nil {
+		o.onRange(p, r.Header.Get("Range"))
+	}
 	if o.delay > 0 {
 		time.Sleep(o.delay)
 	}

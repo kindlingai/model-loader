@@ -101,9 +101,11 @@ request for an unverified range gets `416 Range Not Satisfiable` rather
 than partial/unverified data.
 
 On a root, a range it does not hold yet is fetched from the model's origin
-first (pull-through; see `docs/design.md`). A failure there, such as an
-origin error or a checksum mismatch, is a `502` with the reason in the
-body.
+first (pull-through; see `docs/design.md`). A consumer checksum that does
+not match the origin's bytes is a `422`: the checksum is wrong, not the
+root, so the requester still asks this root for other ranges. Any other
+failure there, such as an origin error, is a `502`. Both have the reason
+in the body.
 
 Request header:
 
@@ -115,6 +117,9 @@ Request header:
 - `X-No-Pull: 1`: serve only what this node holds; do not fetch from the
   origin. A root sends it when it fills its own pull from LAN nodes, so
   two roots never wait on each other's pulls.
+- `X-Priority: N`: the priority of the request this range is for on the
+  asking node. A root pulling through gives a free pull slot to the
+  highest waiting priority first. Default 0.
 
 Response headers, for a request of exactly one segment that this node
 holds a sha256 for (the requester's manifest may have no `segment_sha256`
@@ -133,8 +138,10 @@ named request. The API is served apart from the LAN API, on
 store directory; `host:port` serves it over TCP instead, and an empty value
 turns it off. It has no authentication: anything that can reach it can pin
 and release pieces, so keep it on the socket or on localhost. The socket is
-mode 0660: its owner and group may use it. model-loader will not start on a
-socket path that is not a socket, or that another process answers on.
+mode 0660: its owner and group may use it. model-loader holds a lock on
+`PATH.lock` while it serves the socket, and will not start on a socket
+path whose lock another process holds, that is not a socket, or that
+another process answers on.
 
 ### `PUT /requests/{name}`
 
@@ -165,7 +172,9 @@ of one catalog model revision, as an entry of the selection file's
   applied (see `docs/design.md`).
 - `priority`: models with a higher-priority request start first, and when
   a transfer slot (`-max-concurrent-transfers`) comes free, a waiting
-  segment of the highest-priority model takes it. It does not stop a
+  segment of the highest-priority model takes it. Blob requests for it
+  carry the priority in `X-Priority`, so a root pulling through admits
+  them the same way to its `-pull-workers` slots. It does not stop a
   transfer already running. Default 0, as for the selection file.
 
 Answers `200` with the request's status (below), or `400` for a body that

@@ -233,11 +233,12 @@ func checksPending(m *store.Manifest, need *want.Need, rs *store.RevisionState) 
 // resolveEach resolves w against m piece by piece, leaving out any piece
 // that does not resolve (a range past the end of its file, say), so one
 // bad request does not stop the node fetching every other piece of the
-// model. It returns why each piece left out failed.
+// model, or the whole model when w is Whole. It returns why each piece
+// left out failed.
 func resolveEach(m *store.Manifest, w want.Want) (*want.Need, error) {
 	need, err := want.Resolve(m, w)
-	if err == nil || w.Whole {
-		return need, err
+	if err == nil {
+		return need, nil
 	}
 	var ok []catalog.Pieces
 	var errs []error

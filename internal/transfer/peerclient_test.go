@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/server"
@@ -207,5 +208,24 @@ func TestSegmentsBodyLimited(t *testing.T) {
 	defer ts.Close()
 	if _, err := NewPeerClient(nil).Segments(context.Background(), ts.Listener.Addr().String(), "m", "r1"); err == nil {
 		t.Fatal("Segments = nil error for an answer past the limit")
+	}
+}
+
+// A blob request made for work with a priority sends it to the peer.
+func TestOpenBlobSendsPriority(t *testing.T) {
+	got := make(chan string, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Get(server.HeaderPriority)
+		w.Write([]byte("x"))
+	}))
+	defer ts.Close()
+	c := NewPeerClient(nil)
+	rc, err := c.OpenBlob(server.WithPriority(context.Background(), 7), strings.TrimPrefix(ts.URL, "http://"), "m", "r", "f", 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	if p := <-got; p != "7" {
+		t.Fatalf("X-Priority = %q, want 7", p)
 	}
 }

@@ -59,10 +59,19 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	// A root pulls what it does not hold from the origin, and checks a
 	// consumer's checksums before it serves a range it fetched from there.
 	if s.puller != nil && r.Header.Get(HeaderNoPull) == "" && fm.Size > 0 && (len(checks) > 0 || !rangeIsReady(fileState.ReadyRanges(fm), start, end+1)) {
-		if err := s.puller.Pull(r.Context(), model, revision, relPath, start, end+1, checks); err != nil {
-			if errors.Is(err, ErrNotPullable) {
+		pctx := r.Context()
+		if p, err := strconv.Atoi(r.Header.Get(HeaderPriority)); err == nil {
+			pctx = WithPriority(pctx, p)
+		}
+		if err := s.puller.Pull(pctx, model, revision, relPath, start, end+1, checks); err != nil {
+			switch {
+			case errors.Is(err, ErrNotPullable):
 				rangeNotSatisfiable(w, fm.Size)
-			} else {
+			case errors.Is(err, store.ErrCheckFailed):
+				// The range's bytes are the origin's; the checksum is
+				// what is wrong. Say so apart from a failing root.
+				http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			default:
 				http.Error(w, err.Error(), http.StatusBadGateway)
 			}
 			return

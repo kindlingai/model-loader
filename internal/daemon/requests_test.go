@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
+	"github.com/kindlingai/model-loader/internal/transfer"
 	"github.com/kindlingai/model-loader/internal/want"
 	"github.com/kindlingai/model-loader/internal/xxh64"
 )
@@ -406,5 +409,104 @@ func TestKickDuringPass(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if extra := passes.Load() - n; extra > 1 {
 		t.Fatalf("%d more passes with nothing changed: passes wake each other", extra)
+	}
+}
+
+// A bad checksum on one range of a file does not stop another request's
+// range of the same file: the root's 422 is about the range, not the root,
+// so the peer still fetches other segments from it.
+func TestBadChecksumSameFileDoesNotBlock(t *testing.T) {
+	content := pattern(40, 's')
+	pf := newPullFleet(t, map[string][]byte{"a.bin": content}, nil)
+	peer, _ := pf.peer(&catalog.Selection{})
+	peer.cfg.MaxConcurrentTransfers = 1
+	peer.limit = transfer.NewLimiter(1)
+	reg, err := request.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer.cfg.Requests = reg
+	put := func(name string, off int64, sum string) {
+		t.Helper()
+		if _, err := peer.PutRequest(request.Request{Name: name, Pieces: catalog.Pieces{Model: "glm",
+			Ranges: []catalog.FileRanges{{Path: "a.bin", Ranges: []catalog.ByteRange{{Offset: off, Length: 10, XXH64: sum}}}}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("bad", 0, "0123456789abcdef")
+	put("good", 20, xxh64.Format(xxh64.Sum64(content[20:30])))
+	if err := peer.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile = nil with a bad checksum")
+	}
+	st, _ := peer.RequestStatus("good")
+	if st.State != server.StateReady {
+		t.Fatalf("good request: %s %d/%d (%s), want ready", st.State, st.BytesDone, st.BytesTotal, st.Error)
+	}
+	if st.Error != "" {
+		t.Fatalf("ready request carries an error: %s", st.Error)
+	}
+}
+
+// An invalid request does not stop a selection that wants the model
+// whole, nor a good request.
+func TestInvalidRequestWithWholeSelection(t *testing.T) {
+	f := newRequestFleet(t)
+	d := f.node(t.TempDir())
+	d.cfg.Selection = &catalog.Selection{Wanted: []string{"glm"}}
+	if _, err := d.PutRequest(rankRequest("bad", 95, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PutRequest(rankRequest("good", 0, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.reconcile(d); n != 12 { // all of w.bin and config.json
+		t.Fatalf("fetched %d segments, want the whole model's 12", n)
+	}
+	f.ready(d, "good")
+	if st, _ := d.RequestStatus("bad"); st.State != server.StateInvalid {
+		t.Fatalf("bad request: %s, want invalid", st.State)
+	}
+	if ms := d.Status().Models; len(ms) != 1 || ms[0].State != server.StateReady {
+		t.Fatalf("status = %+v, want the whole model ready", ms)
+	}
+}
+
+// A root admits queued pull-through fetches by the priority the asking
+// node sends, highest first.
+func TestPullThroughPriority(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	pf := newPullFleet(t, map[string][]byte{"a.bin": pattern(40, 'p')}, nil, func(o *fakeOrigin) {
+		o.onRange = func(_, rng string) {
+			mu.Lock()
+			order = append(order, rng)
+			mu.Unlock()
+		}
+	})
+	if _, err := pf.root.Manifest(context.Background(), "glm", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	pf.root.pullLimit = transfer.NewLimiter(1)
+	pf.root.pullLimit.Acquire(context.Background(), 0) // every slot busy
+	var wg sync.WaitGroup
+	get := func(start int64, prio string) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest("GET", pf.rootTS.URL+"/blob/glm/r1/a.bin", nil)
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+9))
+			req.Header.Set(server.HeaderPriority, prio)
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				resp.Body.Close()
+			}
+		}()
+		time.Sleep(50 * time.Millisecond) // queue in this order
+	}
+	get(0, "0")
+	get(20, "10")
+	pf.root.pullLimit.Release()
+	wg.Wait()
+	if len(order) != 2 || order[0] != "bytes=20-29" {
+		t.Fatalf("origin fetches in order %v, want the priority-10 range first", order)
 	}
 }

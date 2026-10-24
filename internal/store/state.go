@@ -38,6 +38,39 @@ type FileState struct {
 	// Checked lists the consumer checksums (RangeCheck.Key) that matched
 	// the bytes held, so each is checked once, not on every pass.
 	Checked []string `json:"checked,omitempty"`
+	// WholeFailed means every segment was held and the whole file did not
+	// match its sha256, yet the segments matched the manifest's segment
+	// hashes, so fetching them again cannot help: the manifest disagrees
+	// with itself. Nothing of the file is served while it is set.
+	WholeFailed bool `json:"whole_failed,omitempty"`
+}
+
+// SegmentTrust returns how held segment i of fm was verified, or "" if it
+// is not held, without copying the file's state.
+func (rs *RevisionState) SegmentTrust(fm FileManifest, i int) string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if fs := rs.find(fm.Path); fs != nil {
+		return fs.TrustOf(i)
+	}
+	return ""
+}
+
+// SetWholeFailed records that fm failed its whole-file check with every
+// segment still held.
+func (rs *RevisionState) SetWholeFailed(fm FileManifest) {
+	rs.update(fm, func(fs *FileState) {
+		fs.WholeFailed = allDone(fs.SegmentsDone)
+	})
+}
+
+func allDone(done []bool) bool {
+	for _, d := range done {
+		if !d {
+			return false
+		}
+	}
+	return true
 }
 
 // HasChecked reports whether c matched the held bytes before.
@@ -138,6 +171,9 @@ func (fs FileState) BytesDone(fm FileManifest) int64 {
 // peer: runs of consecutive verified segments, coalesced into one range
 // each.
 func (fs FileState) ReadyRanges(fm FileManifest) []Range {
+	if fs.WholeFailed {
+		return nil
+	}
 	var ranges []Range
 	var cur *Range
 	for i, done := range fs.SegmentsDone {
@@ -281,6 +317,14 @@ func (rs *RevisionState) update(fm FileManifest, fn func(*FileState)) {
 func (rs *RevisionState) MarkSegment(fm FileManifest, i int, sum, trust string) {
 	rs.update(fm, func(fs *FileState) {
 		fs.SegmentsDone[i] = true
+		if !fm.Hashed() {
+			// Kept whatever the trust: it is all a later copier or a
+			// re-verify has to check this segment against.
+			if fs.SegmentSHA256 == nil {
+				fs.SegmentSHA256 = make([]string, len(fs.SegmentsDone))
+			}
+			fs.SegmentSHA256[i] = sum
+		}
 		if trust == TrustManifest && fs.Trust == nil {
 			return // the default; keep state small for whole models.
 		}
@@ -288,12 +332,6 @@ func (rs *RevisionState) MarkSegment(fm FileManifest, i int, sum, trust string) 
 			fs.Trust = make([]string, len(fs.SegmentsDone))
 		}
 		fs.Trust[i] = trust
-		if !fm.Hashed() {
-			if fs.SegmentSHA256 == nil {
-				fs.SegmentSHA256 = make([]string, len(fs.SegmentsDone))
-			}
-			fs.SegmentSHA256[i] = sum
-		}
 	})
 }
 
@@ -329,7 +367,7 @@ func (rs *RevisionState) AddChecked(fm FileManifest, c RangeCheck) {
 // complete. Checks that matched are forgotten, as the bytes will change.
 func (rs *RevisionState) DropSegment(fm FileManifest, i int) {
 	rs.update(fm, func(fs *FileState) {
-		fs.SegmentsDone[i], fs.Complete = false, false
+		fs.SegmentsDone[i], fs.Complete, fs.WholeFailed = false, false, false
 		fs.Checked = nil
 		if i < len(fs.SegmentSHA256) {
 			fs.SegmentSHA256[i] = ""

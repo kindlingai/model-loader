@@ -413,6 +413,13 @@ func (d *Daemon) applyPendingChecks(m *store.Manifest, need *want.Need, rs *stor
 		changed = true
 		f, err := os.Open(d.cfg.Store.FilePath(m.Model, m.Revision, fm.Path))
 		if err != nil {
+			// The file is gone: nothing the checks cover is held.
+			for _, c := range transfer.PendingChecks(fm, rs, fn.Checks) {
+				first, last := c.Segments(fm)
+				for i := first; i <= last; i++ {
+					rs.DropSegment(fm, i)
+				}
+			}
 			errs = append(errs, err)
 			continue
 		}

@@ -558,3 +558,72 @@ func TestCompletedLazyFileTrustsOrigin(t *testing.T) {
 		t.Fatal("origin refetched bytes that matched its own digest")
 	}
 }
+
+// A root whose LAN source sends a bad copy (consistent with its own
+// recorded sha256) gets the segment from the origin when a consumer
+// checksum shows it is wrong.
+func TestPullThroughBadLANCopyRetriesOrigin(t *testing.T) {
+	content := pattern(100, 'b')
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
+	first, _ := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 40, Length: 5}))
+	if err := first.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the first root's copy of segment 4 and its recorded hash.
+	bad := bytes.Repeat([]byte("Z"), 10)
+	fp := f.rootSt.FilePath("glm", "r1", "w.bin")
+	fh, _ := os.OpenFile(fp, os.O_WRONLY, 0)
+	fh.WriteAt(bad, 40)
+	fh.Close()
+	mf, _ := f.rootSt.LoadManifest("glm", "r1")
+	rs, _ := f.root.revState(mf)
+	sum := sha256.Sum256(bad)
+	rs.MarkSegment(mf.Files[0], 4, hex.EncodeToString(sum[:]), store.TrustOrigin)
+	f.rootSt.SaveState(rs)
+
+	st2, _ := store.Open(t.TempDir())
+	root2 := New(Config{
+		NodeID: "nas2", Roles: []string{"root"}, Store: st2,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{f.model}}, Selection: &catalog.Selection{},
+		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic([]string{f.rootTS.Listener.Addr().String()}),
+		SegmentSize: 10,
+	})
+	srv2 := server.New(st2, root2)
+	srv2.SetPuller(root2)
+	ts2 := httptest.NewServer(srv2)
+	t.Cleanup(ts2.Close)
+	if _, err := root2.Manifest(context.Background(), "glm", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	served := f.origin.bytes.Load()
+	check := store.FormatChecks([]store.RangeCheck{{Offset: 40, Length: 10, XXH64: xxh64.Sum64(content[40:50])}})
+	if code := blobGet(t, ts2.Listener.Addr().String(), "w.bin", 40, 50, check); code != http.StatusPartialContent {
+		t.Fatalf("GET = %d, want 206 after an origin retry", code)
+	}
+	if f.origin.bytes.Load() == served {
+		t.Fatal("no origin fetch after the LAN copy failed the checksum")
+	}
+	checkHeld(t, st2, "w.bin", content, []bool{false, false, false, false, true, false, false, false, false, false}, store.TrustRequester)
+}
+
+// A new checksum for a held range whose file was cut short drops what it
+// covers, and the range is fetched again.
+func TestNewChecksumForTruncatedFile(t *testing.T) {
+	content := pattern(100, 'k')
+	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
+	peer, st := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 12, Length: 6}))
+	if err := peer.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	os.Truncate(st.FilePath("glm", "r1", "w.bin"), 0)
+	cfg := peer.cfg
+	cfg.Selection = rangeSel("w.bin", catalog.ByteRange{Offset: 12, Length: 6, XXH64: xxh64.Format(xxh64.Sum64(content[12:18]))})
+	again := New(cfg)
+	if err := again.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got, _ := os.ReadFile(st.FilePath("glm", "r1", "w.bin"))
+	if len(got) < 20 || !bytes.Equal(got[10:20], content[10:20]) {
+		t.Fatal("the range was not fetched again")
+	}
+}

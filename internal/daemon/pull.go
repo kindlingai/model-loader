@@ -52,7 +52,7 @@ func (d *Daemon) onceTry(ctx context.Context, key string, fn func() (any, error)
 		d.pullMu.Unlock()
 		select {
 		case <-c.done:
-			if c.err != nil && errors.Is(c.err, context.Canceled) && ctx.Err() == nil {
+			if c.err != nil && (errors.Is(c.err, context.Canceled) || errors.Is(c.err, context.DeadlineExceeded)) && ctx.Err() == nil {
 				return nil, nil, true
 			}
 			return c.val, c.err, false
@@ -254,6 +254,9 @@ func (d *Daemon) pullFile(ctx context.Context, m catalog.Model, mf *store.Manife
 		if err == nil || attempt == 1 {
 			return err
 		}
+		// What failed may have come from a LAN node with a bad copy: get
+		// it from the origin this time.
+		srcs = d.originSources(m)
 	}
 }
 
@@ -287,6 +290,15 @@ func (d *Daemon) pullSources(ctx context.Context, m catalog.Model, mf *store.Man
 	d.pullSrcs[key] = cachedSources{srcs, time.Now()}
 	d.pullMu.Unlock()
 	return srcs
+}
+
+// originSources returns m's origin as its only source.
+func (d *Daemon) originSources(m catalog.Model) *sources {
+	s := &sources{holdersOnly: true}
+	if src, err := d.cfg.Sources.For(m); err == nil {
+		s.fetchers = append(s.fetchers, transfer.WANFetcher{Source: src, Model: m})
+	}
+	return s
 }
 
 // pullSegments fetches the segments segs marks that rs does not hold, with
@@ -329,7 +341,7 @@ loop:
 func (d *Daemon) pullSegment(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, i int, srcs *sources) error {
 	key := fmt.Sprintf("segment %s %s %d", want.Key(m.Name, m.Revision), fm.Path, i)
 	_, err := d.once(ctx, key, func() (any, error) {
-		if rs.FileState(fm).TrustOf(i) != "" {
+		if rs.SegmentTrust(fm, i) != "" {
 			return nil, nil // another call fetched it just now.
 		}
 		// Wait for a slot as long as the caller does; once the fetch has

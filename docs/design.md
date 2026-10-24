@@ -113,12 +113,15 @@ Each held segment records how it was verified (its trust mode):
   range inside it matched. gr8 has one for every expert half in its index
   slices. Give it as `xxh64` on a selection range; a peer passes it on to
   the root in `X-Range-XXH64`, and the root checks it before it serves the
-  range. A range that does not match is dropped and fetched from the origin
-  once more; failing again, the request fails.
+  range. A range that does not match is dropped and fetched once more, from
+  the origin only (the first copy may have come from a LAN node with a bad
+  copy); failing again, the request fails.
 
 Once every segment of a file is held it is checked against the origin's
 sha256. If it fails, every segment not verified against the manifest is
-dropped and fetched again. If it matches, every segment becomes
+dropped and fetched again. If segments the manifest verified are left,
+the manifest disagrees with itself: nothing of the file is served, and the
+model is in error until the manifest changes. If it matches, every segment becomes
 `manifest`: the bytes are the origin's, and a consumer checksum that does
 not match them is not applied. A file with no origin digest and no segment
 hashes is complete once every segment is held, as nothing more is known to

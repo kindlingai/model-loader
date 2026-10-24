@@ -478,3 +478,14 @@ func TestStateSaved(t *testing.T) {
 	}
 	_ = m
 }
+
+// A segment of a hashless file keeps its sha256 whatever its trust, so a
+// copier or a re-verify can check it.
+func TestMarkSegmentKeepsHashForManifestTrust(t *testing.T) {
+	fm := FileManifest{Path: "a", Size: 20, SegmentSize: 10}
+	rs := NewRevisionState(&Manifest{Files: []FileManifest{fm}})
+	rs.MarkSegment(fm, 1, "abc", TrustManifest)
+	if got := rs.FileState(fm).SegmentHash(fm, 1); got != "abc" {
+		t.Fatalf("SegmentHash = %q, want abc", got)
+	}
+}

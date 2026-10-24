@@ -15,12 +15,13 @@ const (
 	// that fetches the range from its origin checks them before it serves
 	// it.
 	HeaderRangeXXH64 = "X-Range-XXH64"
-	// HeaderSegmentSHA256, on a blob response for exactly one segment of a
-	// file with no segment hashes in the manifest, is the sha256 the node
-	// holds for that segment.
+	// HeaderSegmentSHA256, on a blob response for whole segments (at most
+	// MaxClaimSegments) of a file, is the sha256 the node holds for each,
+	// comma-separated, in order. It is left out if the node has none for
+	// one of them.
 	HeaderSegmentSHA256 = "X-Segment-SHA256"
 	// HeaderSegmentTrust goes with HeaderSegmentSHA256: how the node
-	// verified the segment, one of the store.Trust constants.
+	// verified each segment, one of the store.Trust constants, in order.
 	HeaderSegmentTrust = "X-Segment-Trust"
 	// HeaderNoPull, on a blob request, asks a root to serve only what it
 	// holds and not to fetch from its origin. A root filling its own
@@ -28,6 +29,10 @@ const (
 	// each other's pulls.
 	HeaderNoPull = "X-No-Pull"
 )
+
+// MaxClaimSegments is the most segments a blob response vouches for in
+// HeaderSegmentSHA256: about 17 KiB of header.
+const MaxClaimSegments = 256
 
 // ErrNotPullable means a Puller will not fetch that model or range: it is
 // not in its catalog, or it is being downloaded whole and is published

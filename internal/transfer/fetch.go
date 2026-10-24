@@ -2,11 +2,15 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/source"
@@ -36,16 +40,19 @@ func (w WANFetcher) Open(ctx context.Context, path string, offset, length int64)
 	if err != nil {
 		return nil, err
 	}
-	return claimed{rc, "", store.TrustOrigin}, nil
+	return claimed{ReadCloser: rc, origin: true}, nil
 }
 
-// claimed is a reader with a source's claim about the segment it reads.
+// claimed is a reader with a source's claims about the segments it reads:
+// one sha256 and trust mode per segment, from a peer, or that this node
+// is reading them from the model's origin itself.
 type claimed struct {
 	io.ReadCloser
-	sum, trust string
+	sums, trusts []string
+	origin       bool
 }
 
-func (c claimed) Claim() (string, string) { return c.sum, c.trust }
+func (c claimed) Claims() ([]string, []string, bool) { return c.sums, c.trusts, c.origin }
 
 // PeerFetcher adapts a PeerClient bound to one peer address and
 // model/revision to the Fetcher interface.
@@ -89,13 +96,24 @@ type Options struct {
 	Checks []store.RangeCheck
 }
 
-// Claimer is implemented by a reader whose source vouches for a segment:
-// the sha256 it holds for it and how it verified it (a store.Trust
-// constant). A source that fetched it from the model's origin itself
-// claims "" and store.TrustOrigin.
+// Claimer is implemented by a reader whose source vouches for the
+// segments it reads: for each, in order, the sha256 it holds for it and
+// how it verified it (a store.Trust constant); "" for one it does not
+// vouch for. origin means this node reads them from the model's origin
+// itself, over TLS: they are TrustOrigin with no sha256 to match.
 type Claimer interface {
-	Claim() (sha256, trust string)
+	Claims() (sha256s, trusts []string, origin bool)
 }
+
+// maxRunSegments bounds how many segments one transfer asks a source for
+// at once (see FetchFile), so a source's claims for them fit in a header.
+const maxRunSegments = 256
+
+// errUnclaimed is a run of several segments of a file with no segment
+// hashes, from a source that vouched for none of them. A source too old to
+// vouch for several segments at once does so for one; the run is fetched
+// again segment by segment.
+var errUnclaimed = errors.New("no segment hash in the manifest, and the source claims none")
 
 // CheckedFetcher is a Fetcher that can pass a consumer's checksums for
 // ranges inside the requested one on to its source, so the source checks
@@ -105,7 +123,10 @@ type CheckedFetcher interface {
 }
 
 // FetchFile downloads the not-yet-done segments of fm that opts.Need marks
-// into the store. For each segment it tries the fetchers opts.Order names,
+// into the store. Consecutive segments of one chunk (see store.ChunkSize)
+// with the same sources are fetched as one range, at most maxRunSegments;
+// a run that fails is fetched again segment by segment. For each segment
+// (or run) it tries the fetchers opts.Order names,
 // falling back to the next one when a fetcher doesn't have it yet or
 // fails. Each segment is verified as soon as it lands: against the
 // manifest when fm has segment hashes, else against the sha256 its source
@@ -159,7 +180,8 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if opts.Limit != nil {
 		workers = opts.Limit.Cap()
 	}
-	workers = min(workers, max(1, len(todo)))
+	runs := groupRuns(fm, todo, order)
+	workers = min(workers, max(1, len(runs)))
 
 	var (
 		mu       sync.Mutex // guards dead and firstErr
@@ -174,12 +196,43 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		}
 		mu.Unlock()
 	}
-	queue := make(chan int)
+	// A file of small segments saves its state at most once a second as
+	// segments land (see store.SaveStateSoon), and once at the end.
+	save := st.SaveState
+	if fm.Small() {
+		save = st.SaveStateSoon
+	}
+	var marked atomic.Bool
+	// fetch fetches segments first to first+n-1 and marks them held.
+	fetch := func(f *os.File, first, n int) error {
+		start, _ := fm.SegmentBounds(first)
+		_, end := fm.SegmentBounds(first + n - 1)
+		sums, trusts, err := fetchRun(ctx, f, fm, first, n, fetchers, order(first), checksOverlapping(opts.Checks, start, end), dead, &mu)
+		if err != nil {
+			return err
+		}
+		if fm.Small() && !fm.Hashed() {
+			// The sha256 of each is what a later copier or re-verify
+			// checks it against: on disk before the segment is held.
+			if err := st.WriteSegmentHashes(model, revision, fm, first, sums); err != nil {
+				return fmt.Errorf("save segment hashes: %w", err)
+			}
+		}
+		for k := range n {
+			rs.MarkSegment(fm, first+k, hex.EncodeToString(sums[k][:]), trusts[k])
+		}
+		marked.Store(true)
+		if err := save(rs); err != nil {
+			return fmt.Errorf("save state: %w", err)
+		}
+		return nil
+	}
+	queue := make(chan [2]int)
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range queue {
+			for r := range queue {
 				if opts.Limit != nil {
 					if err := opts.Limit.Acquire(ctx, opts.Priority); err != nil {
 						fail(err)
@@ -187,32 +240,41 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 					}
 				}
 				f, err := openFile()
-				var sum, trust string
 				if err == nil {
-					start, end := fm.SegmentBounds(i)
-					sum, trust, err = fetchSegment(ctx, f, fm, i, fetchers, order(i), checksOverlapping(opts.Checks, start, end), dead, &mu)
+					err = fetch(f, r[0], r[1]-r[0])
+					if err != nil && r[1]-r[0] > 1 && ctx.Err() == nil {
+						// One at a time: a source too old to vouch for a
+						// run, or one bad segment, fails only that one.
+						var errs []error
+						for i := r[0]; i < r[1]; i++ {
+							if rs.SegmentTrust(fm, i) == "" {
+								if err := fetch(f, i, 1); err != nil {
+									errs = append(errs, fmt.Errorf("segment %d: %w", i, err))
+								}
+							}
+						}
+						err = errors.Join(errs...)
+					}
 					f.Close()
 				}
 				if opts.Limit != nil {
 					opts.Limit.Release()
 				}
 				if err != nil {
-					fail(fmt.Errorf("fetch %s segment %d: %w", fm.Path, i, err))
-					continue
-				}
-				rs.MarkSegment(fm, i, sum, trust)
-				if err := st.SaveState(rs); err != nil {
-					fail(fmt.Errorf("fetch %s: save state: %w", fm.Path, err))
+					fail(fmt.Errorf("fetch %s segments %d-%d: %w", fm.Path, r[0], r[1]-1, err))
 				}
 			}
 		}()
 	}
-	for _, i := range todo {
-		queue <- i
+	for _, r := range runs {
+		queue <- r
 	}
 	close(queue)
 	wg.Wait()
 	if firstErr != nil && (ctx.Err() != nil || len(PendingChecks(fm, rs, opts.Checks)) == 0) {
+		if marked.Load() && fm.Small() {
+			_ = st.SaveState(rs) // what landed, before giving up.
+		}
 		return firstErr // nothing that landed is left to judge.
 	}
 
@@ -393,22 +455,44 @@ func syncAndUncache(f *os.File) error {
 	return nil
 }
 
-// fetchSegment tries the fetchers order names, in turn, for segment i,
-// returning at the first success the segment's sha256 and how it was
-// verified. A fetcher reporting ErrRangeUnavailable, or a consumer
-// checksum that failed (store.ErrCheckFailed), is skipped for this segment
-// only. One that fails outright (a peer that went away mid-copy, a
-// dropped connection, data that fails verification) is marked in dead and
-// skipped for the rest of the file, so the copy fails over to the next peer
-// or the root instead of failing, and doesn't wait on a dead address again
-// for every segment. mu guards dead.
+// groupRuns groups todo, ascending segment indices, into half-open runs of
+// consecutive segments in one chunk with the same sources, at most
+// maxRunSegments each. A file of 64 MiB segments has one segment a chunk,
+// so one segment a run.
+func groupRuns(fm store.FileManifest, todo []int, order func(int) []int) [][2]int {
+	var runs [][2]int
+	var cur []int // the order of the last run
+	for _, i := range todo {
+		if n := len(runs); n > 0 {
+			r := &runs[n-1]
+			if r[1] == i && fm.ChunkOf(i) == fm.ChunkOf(r[0]) && i-r[0] < maxRunSegments && slices.Equal(cur, order(i)) {
+				r[1] = i + 1
+				continue
+			}
+		}
+		runs = append(runs, [2]int{i, i + 1})
+		cur = order(i)
+	}
+	return runs
+}
+
+// fetchRun tries the fetchers order names, in turn, for segments first
+// to first+n-1, returning at the first success each segment's sha256 and
+// how it was verified. A fetcher reporting ErrRangeUnavailable, or a
+// consumer checksum that failed (store.ErrCheckFailed), is skipped for
+// this run only. One that fails outright (a peer that went away mid-copy,
+// a dropped connection, data that fails verification) is marked in dead
+// and skipped for the rest of the file, so the copy fails over to the
+// next peer or the root instead of failing, and doesn't wait on a dead
+// address again for every segment. mu guards dead.
 //
-// At most the segment's own bytes are written, so a source that sends too
+// At most the run's own bytes are written, so a source that sends too
 // much cannot overwrite a neighbouring segment another worker holds. The
-// segment is synced before it is verified, so verifying drops its pages
-// from page cache.
-func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex) (string, string, error) {
-	start, end := fm.SegmentBounds(i)
+// run is synced before it is verified, so verifying drops its pages from
+// page cache.
+func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex) ([][sha256.Size]byte, []string, error) {
+	start, _ := fm.SegmentBounds(first)
+	_, end := fm.SegmentBounds(first + n - 1)
 	length := end - start
 	isDead := func(k int) bool {
 		mu.Lock()
@@ -443,15 +527,14 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 			lastErr = err
 			continue
 		}
-		var claimSum, claimTrust string
-		claimed := false
+		var claimSums, claimTrusts []string
+		origin := false
 		if c, ok := rc.(Claimer); ok {
-			claimSum, claimTrust = c.Claim()
-			claimed = true
+			claimSums, claimTrusts, origin = c.Claims()
 		}
 
-		// Write at most the segment's own bytes, so a source that sends
-		// too much cannot overwrite a neighbouring segment that is held.
+		// Write at most the run's own bytes, so a source that sends too
+		// much cannot overwrite a neighbouring segment that is held.
 		copied, copyErr := io.Copy(io.NewOffsetWriter(f, start), io.LimitReader(rc, length))
 		extra := 0
 		if copyErr == nil && copied == length {
@@ -478,43 +561,58 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 		}
 
 		if err := f.Sync(); err != nil {
-			return "", "", fmt.Errorf("sync: %w", err)
+			return nil, nil, fmt.Errorf("sync: %w", err)
 		}
-		sum, err := store.HashSegment(f, fm, i)
+		sums, err := store.HashSegments(f, fm, first, n)
 		if err != nil {
-			return "", "", err
+			return nil, nil, err
 		}
-		var trust string
-		switch {
-		case fm.Hashed():
-			if sum == fm.SegmentSHA256[i] {
-				trust = store.TrustManifest
-			} else {
-				bad = errors.New("segment failed hash verification")
+		trusts := make([]string, n)
+		for j := range n {
+			i := first + j
+			sum := hex.EncodeToString(sums[j][:])
+			var claimSum, claimTrust string
+			if j < len(claimSums) && j < len(claimTrusts) {
+				claimSum, claimTrust = claimSums[j], claimTrusts[j]
 			}
-		case claimed && claimSum != "":
-			if sum == claimSum {
-				trust = claimTrust
-			} else {
-				bad = errors.New("segment does not match the sha256 its source claims")
+			switch {
+			case fm.Hashed():
+				if sum == fm.SegmentSHA256[i] {
+					trusts[j] = store.TrustManifest
+				} else {
+					bad = fmt.Errorf("segment %d failed hash verification", i)
+				}
+			case claimSum != "":
+				if sum == claimSum {
+					trusts[j] = claimTrust
+				} else {
+					bad = fmt.Errorf("segment %d does not match the sha256 its source claims", i)
+				}
+			case origin:
+				trusts[j] = store.TrustOrigin // fetched from the origin by this node.
+			case n > 1:
+				// Not the source's fault yet: it may vouch for one
+				// segment at a time.
+				return nil, nil, errUnclaimed
+			default:
+				bad = errUnclaimed
 			}
-		case claimed && claimTrust == store.TrustOrigin:
-			trust = store.TrustOrigin // fetched from the origin by this node.
-		default:
-			bad = errors.New("no segment hash in the manifest, and the source claims none")
+			if bad != nil {
+				break
+			}
+			if trusts[j] == "" {
+				trusts[j] = store.TrustOrigin
+			}
 		}
 		if bad != nil {
 			kill(k)
 			lastErr = bad
 			continue
 		}
-		if trust == "" {
-			trust = store.TrustOrigin
-		}
-		return sum, trust, nil
+		return sums, trusts, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no source left to try")
 	}
-	return "", "", lastErr
+	return nil, nil, lastErr
 }

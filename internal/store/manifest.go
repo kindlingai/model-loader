@@ -25,6 +25,21 @@ import (
 // re-served before it completes.
 const DefaultSegmentSize int64 = 64 << 20 // 64 MiB
 
+// ChunkSize is the unit of a node's own bookkeeping for a file with
+// segments smaller than it (see FileManifest.Small): when each was last
+// used, what is evicted together, what one transfer may span. A file whose
+// segments are this size or larger keeps all of that per segment, as
+// before. It is this node's choice, not part of the manifest: other nodes
+// see only segments. Tests set it to 1 to keep per-segment bookkeeping
+// with tiny segments.
+var ChunkSize = DefaultSegmentSize
+
+// MinSegmentSize and MaxSegmentSize bound a catalog segment size rule.
+const (
+	MinSegmentSize int64 = 4 << 10
+	MaxSegmentSize       = DefaultSegmentSize
+)
+
 // FileManifest describes one file within a model revision.
 type FileManifest struct {
 	Path string `json:"path"`
@@ -60,6 +75,36 @@ func (f FileManifest) SegmentBounds(i int) (start, end int64) {
 	}
 	end = start + min(size, f.Size-start)
 	return start, end
+}
+
+// ChunkSegments returns how many segments make up one chunk of f (see
+// ChunkSize): one for a file of 64 MiB segments.
+func (f FileManifest) ChunkSegments() int {
+	if f.SegmentSize <= 0 || f.SegmentSize >= ChunkSize {
+		return 1
+	}
+	return int(ChunkSize / f.SegmentSize)
+}
+
+// Small reports whether f's segments are smaller than a chunk. Such a
+// file keeps its segments' sha256 in a side file rather than in its state
+// (see Store.WriteSegmentHashes), and its use times per chunk.
+func (f FileManifest) Small() bool { return f.ChunkSegments() > 1 }
+
+// NumChunks returns how many chunks f has.
+func (f FileManifest) NumChunks() int {
+	n := f.NumSegments()
+	c := f.ChunkSegments()
+	return (n + c - 1) / c
+}
+
+// ChunkOf returns the chunk segment i is in.
+func (f FileManifest) ChunkOf(i int) int { return i / f.ChunkSegments() }
+
+// ChunkBounds returns the first and one past the last segment of chunk c.
+func (f FileManifest) ChunkBounds(c int) (first, end int) {
+	k := f.ChunkSegments()
+	return c * k, min((c+1)*k, f.NumSegments())
 }
 
 // SegmentIndex returns the segment that holds byte off.
@@ -189,11 +234,15 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 	return nil
 }
 
-// HashFile computes the segment hashes and whole-file hash of f's first
-// size bytes, as BuildSegmentHashes does, dropping each segment from page
-// cache once hashed and calling progress with the bytes hashed so far.
-func HashFile(f *os.File, size int64, progress func(int64)) (segments []string, whole string, err error) {
-	return hashSegments(f, size, DefaultSegmentSize, func(off, n int64) error {
+// HashFile computes the segment hashes, segSize bytes each (64 MiB if 0),
+// and whole-file hash of f's first size bytes, as BuildSegmentHashes does,
+// dropping each segment from page cache once hashed and calling progress
+// with the bytes hashed so far.
+func HashFile(f *os.File, size, segSize int64, progress func(int64)) (segments []string, whole string, err error) {
+	if segSize <= 0 {
+		segSize = DefaultSegmentSize
+	}
+	return hashSegments(f, size, segSize, func(off, n int64) error {
 		progress(off + n)
 		return Uncache(f, off, n)
 	})
@@ -229,7 +278,19 @@ func hashSegments(r io.Reader, size, segSize int64, hashed func(off, n int64) er
 // only once the write is complete, so a reader never observes a partial
 // manifest or state file.
 func marshalJSONAtomic(path string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
+	return writeJSONAtomic(path, v, true)
+}
+
+// writeJSONAtomic is marshalJSONAtomic, indented or not. A state file
+// with many held extents is kept compact.
+func writeJSONAtomic(path string, v any, indent bool) error {
+	var data []byte
+	var err error
+	if indent {
+		data, err = json.MarshalIndent(v, "", "  ")
+	} else {
+		data, err = json.Marshal(v)
+	}
 	if err != nil {
 		return err
 	}

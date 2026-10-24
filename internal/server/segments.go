@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"sort"
 
 	"github.com/kindlingai/model-loader/internal/store"
 )
@@ -44,14 +45,10 @@ type FileSegments struct {
 	Held     [][2]int `json:"held"`
 }
 
-// Has reports whether segment i is held.
+// Has reports whether segment i is held. Held is sorted (see Valid).
 func (f FileSegments) Has(i int) bool {
-	for _, r := range f.Held {
-		if i >= r[0] && i < r[1] {
-			return true
-		}
-	}
-	return false
+	k := sort.Search(len(f.Held), func(k int) bool { return f.Held[k][1] > i })
+	return k < len(f.Held) && f.Held[k][0] <= i
 }
 
 // Valid reports whether r is an answer about model@revision whose files
@@ -69,9 +66,9 @@ func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
 		if n, ok := segs[path]; !ok || fs.Segments != n {
 			return false
 		}
-		for _, h := range fs.Held {
-			if h[0] < 0 || h[0] >= h[1] || h[1] > fs.Segments {
-				return false
+		for k, h := range fs.Held {
+			if h[0] < 0 || h[0] >= h[1] || h[1] > fs.Segments || (k > 0 && h[0] < fs.Held[k-1][1]) {
+				return false // not well formed, or not sorted (see Has).
 			}
 		}
 	}
@@ -79,21 +76,7 @@ func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
 }
 
 // HeldRanges packs done into half-open index ranges.
-func HeldRanges(done []bool) [][2]int {
-	var out [][2]int
-	for i := 0; i < len(done); i++ {
-		if !done[i] {
-			continue
-		}
-		j := i
-		for j < len(done) && done[j] {
-			j++
-		}
-		out = append(out, [2]int{i, j})
-		i = j
-	}
-	return out
-}
+func HeldRanges(done []bool) [][2]int { return store.Runs(done) }
 
 func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	model, revision := r.PathValue("model"), r.PathValue("revision")
@@ -110,17 +93,20 @@ func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	rs, err := s.store.LoadState(m)
+	rs, err := s.revisionState(m)
 	if err != nil {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
 		return
 	}
 	for _, fm := range m.Files {
-		done := rs.FileState(fm).SegmentsDone
-		if len(done) > fm.NumSegments() {
-			done = done[:fm.NumSegments()] // stale state; see transfer.FetchFile.
-		}
-		held := HeldRanges(done)
+		var held [][2]int
+		rs.View(fm, func(fs *store.FileState) {
+			done := fs.SegmentsDone
+			if len(done) > fm.NumSegments() {
+				done = done[:fm.NumSegments()] // stale state; see transfer.FetchFile.
+			}
+			held = HeldRanges(done)
+		})
 		if len(held) == 0 {
 			continue
 		}

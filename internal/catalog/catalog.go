@@ -47,6 +47,39 @@ type Model struct {
 	// not authoritative; the manifest's per-file sizes are.
 	SizeHint int64  `yaml:"size_hint,omitempty"`
 	Notes    string `yaml:"notes,omitempty"`
+	// SegmentSizes sets the segment size of the files whose path matches
+	// a rule's glob, the first rule that matches; every other file has
+	// 64 MiB segments. Only a root reads it, when it makes the manifest:
+	// every other node takes the segment size from the manifest. A
+	// smaller segment lets a node hold a byte range at close to its own
+	// size (see docs/design.md, "Partial selection").
+	SegmentSizes []SegmentSizeRule `yaml:"segment_sizes,omitempty"`
+}
+
+// SegmentSizeRule gives the files Path matches segments of Size bytes.
+type SegmentSizeRule struct {
+	// Path is a glob over manifest paths, as in a partial selection.
+	Path string `yaml:"path"`
+	// Size is a multiple of 4 KiB, from 4 KiB to 64 MiB.
+	Size int64 `yaml:"size"`
+}
+
+// Segment size bounds. A segment is a whole number of 4 KiB filesystem
+// blocks, so evicting it frees its blocks, and at most the 64 MiB default.
+const (
+	minSegmentSize = 4 << 10
+	maxSegmentSize = 64 << 20
+)
+
+// SegmentSizeFor returns the segment size a rule gives the file at path,
+// or 0 when none matches (the default, 64 MiB).
+func (m Model) SegmentSizeFor(path string) int64 {
+	for _, r := range m.SegmentSizes {
+		if MatchPath(r.Path, path) {
+			return r.Size
+		}
+	}
+	return 0
 }
 
 // Catalog is the full fleet-wide desired state.
@@ -115,6 +148,14 @@ func (c *Catalog) Validate() error {
 			return fmt.Errorf("catalog: model %q: source.type is required", m.Name)
 		default:
 			return fmt.Errorf("catalog: model %q: unknown source type %q", m.Name, m.Source.Type)
+		}
+		for _, r := range m.SegmentSizes {
+			if err := ValidateGlob(r.Path); err != nil {
+				return fmt.Errorf("catalog: model %q: segment_sizes: %w", m.Name, err)
+			}
+			if r.Size < minSegmentSize || r.Size > maxSegmentSize || r.Size%minSegmentSize != 0 {
+				return fmt.Errorf("catalog: model %q: segment_sizes: %s: size %d is not a multiple of 4 KiB from 4 KiB to 64 MiB", m.Name, r.Path, r.Size)
+			}
 		}
 	}
 	return nil

@@ -411,11 +411,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	var needs []spaceNeed
 	for _, fm := range manifest.Files {
 		if fn := need.Files[fm.Path]; fn != nil {
-			for i, n := range fn.Segments {
-				if n && rs.SegmentTrust(fm, i) == "" {
-					needs = append(needs, segmentNeed(manifest, rs, fm, i, d.blockSize()))
-				}
-			}
+			needs = append(needs, segmentNeeds(manifest, rs, fm, fn.Segments, d.blockSize())...)
 		}
 	}
 	release, err := d.makeRoom(ctx, needs)

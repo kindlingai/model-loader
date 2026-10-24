@@ -55,16 +55,15 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		defer u.BeginUse(model, revision, fm, start, end+1)()
 	}
 
-	state, err := s.store.LoadState(manifest)
+	state, err := s.revisionState(manifest)
 	if err != nil {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
 		return
 	}
-	fileState := state.FileState(fm)
 
 	// A root pulls what it does not hold from the origin, and checks a
 	// consumer's checksums before it serves a range it fetched from there.
-	if s.puller != nil && r.Header.Get(HeaderNoPull) == "" && fm.Size > 0 && (len(checks) > 0 || !rangeIsReady(fileState.ReadyRanges(fm), start, end+1)) {
+	if s.puller != nil && r.Header.Get(HeaderNoPull) == "" && fm.Size > 0 && (len(checks) > 0 || !state.RangeReady(fm, start, end+1)) {
 		pctx := r.Context()
 		if p, err := strconv.Atoi(r.Header.Get(HeaderPriority)); err == nil {
 			pctx = WithPriority(pctx, p)
@@ -82,29 +81,24 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		if state, err = s.store.LoadState(manifest); err != nil {
+		if state, err = s.revisionState(manifest); err != nil {
 			http.Error(w, "state unavailable", http.StatusInternalServerError)
 			return
 		}
-		fileState = state.FileState(fm)
 	}
 
-	if !rangeIsReady(fileState.ReadyRanges(fm), start, end+1) {
+	if !state.RangeReady(fm, start, end+1) {
 		rangeNotSatisfiable(w, fm.Size)
 		return
 	}
 	if fm.NumSegments() > 0 {
-		// Say what this node holds for the segment, so a requester whose
-		// manifest has no hash for it can verify it. This node's manifest
-		// may have hashes (a root holding the full release) where the
-		// requester's, from a pull-through root, does not.
-		if i := fm.SegmentIndex(start); i == fm.SegmentIndex(end) {
-			if s0, e0 := fm.SegmentBounds(i); s0 == start && e0 == end+1 {
-				if sum := fileState.SegmentHash(fm, i); sum != "" {
-					w.Header().Set(HeaderSegmentSHA256, sum)
-					w.Header().Set(HeaderSegmentTrust, fileState.TrustOf(i))
-				}
-			}
+		// Say what this node holds for the segments, so a requester whose
+		// manifest has no hash for them can verify them. This node's
+		// manifest may have hashes (a root holding the full release) where
+		// the requester's, from a pull-through root, does not.
+		if sums, trusts := s.claims(manifest, fm, state, start, end+1); sums != nil {
+			w.Header().Set(HeaderSegmentSHA256, strings.Join(sums, ","))
+			w.Header().Set(HeaderSegmentTrust, strings.Join(trusts, ","))
 		}
 	}
 
@@ -133,18 +127,83 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, io.NewSectionReader(f, start, length))
 }
 
+// claims returns the sha256 and trust this node holds for each segment of
+// [start, end), when it is whole segments, at most MaxClaimSegments, and
+// it has a sha256 for every one; nil otherwise.
+func (s *Server) claims(m *store.Manifest, fm store.FileManifest, rs *store.RevisionState, start, end int64) ([]string, []string) {
+	first, last := fm.SegmentIndex(start), fm.SegmentIndex(end-1)
+	n := last - first + 1
+	if s0, _ := fm.SegmentBounds(first); s0 != start || n > MaxClaimSegments {
+		return nil, nil
+	}
+	if _, e0 := fm.SegmentBounds(last); e0 != end {
+		return nil, nil
+	}
+	sums, trusts := make([]string, n), make([]string, n)
+	complete := false
+	rs.View(fm, func(fs *store.FileState) {
+		complete = fs.Complete
+		for k := range n {
+			sums[k], trusts[k] = fs.SegmentHash(fm, first+k), fs.TrustOf(first+k)
+		}
+	})
+	if fm.Small() && !fm.Hashed() {
+		side := s.store.SegmentSums(m.Model, m.Revision, fm, first, n)
+		for k := range n {
+			if sums[k] == "" {
+				sums[k] = side[k]
+			}
+		}
+	}
+	f := (*os.File)(nil)
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+	}()
+	for k := range n {
+		if sums[k] != "" {
+			continue
+		}
+		if !complete {
+			return nil, nil
+		}
+		// A file verified whole that recorded no segment hash (a root's
+		// whole download of a file of small segments): its bytes are the
+		// origin's, so hash them now.
+		if f == nil {
+			var err error
+			if f, err = os.Open(s.store.FilePath(m.Model, m.Revision, fm.Path)); err != nil {
+				return nil, nil
+			}
+		}
+		h, err := store.HashSegment(f, fm, first+k)
+		if err != nil {
+			return nil, nil
+		}
+		sums[k] = h
+	}
+	return sums, trusts
+}
+
+// StateSource, when the StatusProvider implements it, returns the state
+// the node keeps in memory for a revision, so a blob request need not read
+// the state file. The state in memory never holds a segment before its
+// bytes and segment hash are on disk.
+type StateSource interface {
+	RevisionState(m *store.Manifest) (*store.RevisionState, error)
+}
+
+func (s *Server) revisionState(m *store.Manifest) (*store.RevisionState, error) {
+	if src, ok := s.status.(StateSource); ok {
+		return src.RevisionState(m)
+	}
+	return s.store.LoadState(m)
+}
+
 func rangeNotSatisfiable(w http.ResponseWriter, size int64) {
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
 	w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-}
-
-func rangeIsReady(ranges []store.Range, start, end int64) bool {
-	for _, r := range ranges {
-		if r.Contains(start, end) {
-			return true
-		}
-	}
-	return false
 }
 
 // parseRange parses a single-range "Range: bytes=..." header as sent by our

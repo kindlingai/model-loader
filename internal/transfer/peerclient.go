@@ -174,7 +174,9 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
 		if sum := resp.Header.Get(server.HeaderSegmentSHA256); sum != "" {
-			return claimed{resp.Body, sum, resp.Header.Get(server.HeaderSegmentTrust)}, nil
+			// One sha256 and trust per segment, in order, for a request
+			// of whole segments (see server.HeaderSegmentSHA256).
+			return claimed{ReadCloser: resp.Body, sums: splitList(sum), trusts: splitList(resp.Header.Get(server.HeaderSegmentTrust))}, nil
 		}
 		return resp.Body, nil
 	case http.StatusNotFound, http.StatusRequestedRangeNotSatisfiable:
@@ -194,6 +196,15 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 		}
 		return nil, fmt.Errorf("peer %s: blob %s: %s", addr, path, resp.Status)
 	}
+}
+
+// splitList splits a comma-separated header value.
+func splitList(v string) []string {
+	parts := strings.Split(v, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }
 
 // checkFailed is a peer's answer that a consumer checksum did not match;

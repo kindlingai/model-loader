@@ -57,6 +57,11 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: 1
+              # The RoCE devices (/dev/infiniband), from an RDMA device
+              # plugin such as k8s-rdma-shared-dev-plugin. hostNetwork gives
+              # the interfaces, not the device nodes. The resource name is
+              # the plugin's configuration; rdma/spark_roce is one cluster's.
+              rdma/spark_roce: 1
           volumeMounts:
             # Read-only: model-loader alone writes the store. gr8 still opens
             # the socket in it, which a read-only mount allows.

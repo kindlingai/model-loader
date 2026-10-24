@@ -20,7 +20,9 @@ takes this directory; nothing here runs on its own.
 ## On each box
 
 1. Install spark-os with `--mounts /var/lib/model-loader`, so the store is
-   on the DGX OS disk and lasts across boots.
+   on the DGX OS disk and lasts across boots. The unit waits for that mount
+   (`RequiresMountsFor=`); a store elsewhere needs a drop-in that waits for
+   its own.
 2. Write `/etc/spark/model-loader.env` from `model-loader.env.example`.
    Until it is there the unit does not start (`ConditionPathExists`), rather
    than fail.

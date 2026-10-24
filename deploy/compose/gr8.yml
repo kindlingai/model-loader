@@ -54,7 +54,7 @@ services:
     volumes:
       # Read-only: model-loader alone writes the store. gr8 still opens the
       # socket in it, which a read-only mount allows.
-      - ${MODEL_LOADER_STORE:-store}:/var/lib/model-loader:ro
+      - ${MODEL_LOADER_STORE:-model-loader-store}:/var/lib/model-loader:ro
       - gr8-home:/var/lib/gr8/home
 
 volumes:

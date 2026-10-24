@@ -19,6 +19,12 @@
 Description=model-loader node daemon
 After=network.target NetworkManager.service mentatd.service
 ConditionPathExists=/etc/spark/model-loader.env
+# The store is bound from the DGX OS disk by a nofail mount, which boot does
+# not wait for. Without this, model-loader could start on the image's
+# overlay: its store lost at the next boot, and its socket hidden from gr8
+# once the bind lands. A MODEL_LOADER_STORE elsewhere needs a drop-in with
+# its own RequiresMountsFor=.
+RequiresMountsFor=/var/lib/model-loader
 # Keeps retrying, with no start limit, as mentatd.service does.
 StartLimitIntervalSec=0
 

@@ -10,7 +10,14 @@ curl http://localhost:7762/status
 ```
 
 It uses the host's network, so other boxes reach it at the box's LAN
-address, and its node ID is the box's hostname.
+address, and its node ID is the box's hostname. `MODEL_LOADER_PORT` is the
+port it listens on and, with `MODEL_LOADER_DISCOVERY=mentat`, the port it
+takes every other box to listen on.
+
+An earlier version of this file published port 7762 from docker's own
+network rather than use the host's. Its project and store volume keep the
+same names, so `docker compose up -d` replaces the container and keeps the
+store.
 
 ## With gr8
 

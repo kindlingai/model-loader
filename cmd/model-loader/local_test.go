@@ -3,8 +3,10 @@ package main
 import (
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -142,7 +144,18 @@ func TestCheckFlag(t *testing.T) {
 	if err != nil || cfg.check != "unix:/run/x.sock" {
 		t.Fatalf("parseFlags: %+v, %v", cfg, err)
 	}
-	if err := run([]string{"-check", "127.0.0.1:1"}); err == nil {
-		t.Fatal("run -check passed with nothing listening")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/requests" {
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	if err := run([]string{"-check", addr}); err != nil {
+		t.Fatalf("run -check of a served API: %v", err)
+	}
+	ts.Close()
+	if err := run([]string{"-check", addr}); err == nil || !strings.Contains(err.Error(), "check "+addr) {
+		t.Fatalf("run -check with nothing listening: %v, want a check error", err)
 	}
 }

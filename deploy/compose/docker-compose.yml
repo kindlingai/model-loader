@@ -7,7 +7,10 @@
 #
 # Unset, the box runs -mode=both: its own root and peer, holding every
 # model in catalog.yaml. That is a complete setup on one machine.
-name: model-loader
+#
+# No top-level name: the project stays "compose", after this directory, and
+# the store volume "compose_model-loader-store", as before, so an upgrade
+# keeps the running deployment and its store.
 services:
   model-loader:
     image: ${MODEL_LOADER_IMAGE:-ghcr.io/kindlingai/model-loader:latest}
@@ -44,6 +47,7 @@ services:
         -listen=:$${MODEL_LOADER_PORT:-7762}
         -local-listen=unix:model-loader.sock
         -discovery="$$MODEL_LOADER_DISCOVERY"
+        -mentat-port=$${MODEL_LOADER_PORT:-7762}
         -peers="$$MODEL_LOADER_PEERS"
         -disk-budget="$$MODEL_LOADER_DISK_BUDGET"
         -node-id="$$MODEL_LOADER_NODE_ID"
@@ -51,7 +55,7 @@ services:
       - ./catalog.yaml:/etc/model-loader/catalog.yaml:ro
       # The store. Unset, a named volume; set MODEL_LOADER_STORE to a host
       # directory to keep it outside docker (a NAS's master copy, say).
-      - ${MODEL_LOADER_STORE:-store}:/var/lib/model-loader
+      - ${MODEL_LOADER_STORE:-model-loader-store}:/var/lib/model-loader
     # Healthy once the local request API answers on its socket: gr8 (gr8.yml)
     # starts only then.
     healthcheck:
@@ -62,4 +66,4 @@ services:
       start_interval: 1s
 
 volumes:
-  store:
+  model-loader-store:

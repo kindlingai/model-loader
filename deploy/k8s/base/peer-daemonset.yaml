@@ -24,6 +24,15 @@ spec:
             - -discovery=k8s
             - -k8s-service=model-loader-headless
             - -k8s-port=7762
+            # The node's name, not the Pod's: a replaced Pod keeps its ID.
+            # Eviction keeps a copy on the lowest-ID holder, so an ID that
+            # changed under a live store could let two nodes each think the
+            # other keeps the last copy.
+            - -node-id=$(NODE_NAME)
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
           ports:
             - name: http
               containerPort: 7762

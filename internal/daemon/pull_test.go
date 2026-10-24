@@ -631,3 +631,16 @@ func TestNewChecksumForTruncatedFile(t *testing.T) {
 		t.Fatal("the range was not fetched again")
 	}
 }
+
+// A root builds a manifest it does not hold to the end even when the peer
+// that asked gives up, and saves it, so the next asking finds it rather
+// than starting the build over.
+func TestLazyManifestOutlivesTheAsker(t *testing.T) {
+	f := newPullFleet(t, map[string][]byte{"w.bin": pattern(20, 'w')}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.root.Manifest(ctx, "glm", "r1")
+	if _, err := f.rootSt.LoadManifest("glm", "r1"); err != nil {
+		t.Fatalf("no manifest saved after the asker went away: %v", err)
+	}
+}

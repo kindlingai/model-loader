@@ -299,9 +299,7 @@ func run(args []string) error {
 // mentatd, which holds none, has it back within this.
 const mentatPublishInterval = 5 * time.Second
 
-// mentatUnpublishTimeout bounds deleting the record at shutdown. mentatd
-// takes a change once per status push, 2 s by default, so this outlasts a
-// refusal for a change just made.
+// mentatUnpublishTimeout bounds deleting the record at shutdown.
 const mentatUnpublishTimeout = 5 * time.Second
 
 // publishToMentat keeps this box's record in its mentatd current until
@@ -325,25 +323,12 @@ func publishToMentat(ctx context.Context, m *discovery.Mentat, port int, d *daem
 	}
 }
 
-// unpublish deletes the record, trying again while mentatd refuses the
-// change for one just made, for up to mentatUnpublishTimeout.
+// unpublish deletes the record. mentatd always takes a delete.
 func unpublish(m *discovery.Mentat) {
 	ctx, cancel := context.WithTimeout(context.Background(), mentatUnpublishTimeout)
 	defer cancel()
-	for {
-		err := m.Publish(ctx, nil)
-		if !errors.Is(err, discovery.ErrMentatBusy) {
-			if err != nil {
-				log.Printf("model-loader: %v", err)
-			}
-			return
-		}
-		select {
-		case <-ctx.Done():
-			log.Printf("model-loader: %v", err)
-			return
-		case <-time.After(250 * time.Millisecond):
-		}
+	if err := m.Publish(ctx, nil); err != nil {
+		log.Printf("model-loader: %v", err)
 	}
 }
 

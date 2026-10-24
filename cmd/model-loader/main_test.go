@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"sync/atomic"
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/discovery"
@@ -194,30 +193,5 @@ func TestMentatRecord(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mentatRecord = %+v, want %+v", got, want)
-	}
-}
-
-// At shutdown the record is deleted, tried again while mentatd refuses it
-// for a change just made (429).
-func TestUnpublishRetriesWhileBusy(t *testing.T) {
-	var calls atomic.Int32
-	mentatd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete || r.URL.Path != "/records/model-loader" {
-			t.Errorf("%s %s", r.Method, r.URL.Path)
-		}
-		if calls.Add(1) < 3 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer mentatd.Close()
-	m, err := discovery.NewMentat(mentatd.URL, 7762)
-	if err != nil {
-		t.Fatal(err)
-	}
-	unpublish(m)
-	if n := calls.Load(); n != 3 {
-		t.Fatalf("%d DELETEs, want 3", n)
 	}
 }

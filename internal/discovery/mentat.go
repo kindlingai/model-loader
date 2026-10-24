@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -333,10 +332,6 @@ func (m *Mentat) choose(id string, hosts []string, port int) string {
 	return host
 }
 
-// ErrMentatBusy is mentatd refusing a record change (429) because the
-// record changed within its last status push. A later try is taken.
-var ErrMentatBusy = errors.New("mentatd takes one change per status push")
-
 // MentatRecordName is the name model-loader publishes its record under in
 // mentatd, PUT /records/model-loader.
 const MentatRecordName = "model-loader"
@@ -406,9 +401,6 @@ func (m *Mentat) send(ctx context.Context, method string, body []byte) (int, err
 		return 0, fmt.Errorf("mentat record: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return resp.StatusCode, fmt.Errorf("mentat record: %s %s: %w", method, m.recordURL, ErrMentatBusy)
-	}
 	if resp.StatusCode != http.StatusNoContent {
 		why, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return resp.StatusCode, fmt.Errorf("mentat record: %s %s: %s: %s", method, m.recordURL, resp.Status, strings.TrimSpace(string(why)))

@@ -13,10 +13,12 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/discovery"
+	"github.com/kindlingai/model-loader/internal/request"
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
@@ -81,6 +83,10 @@ type Config struct {
 	// pull-through. Defaults to store.DefaultSegmentSize; tests set it
 	// small.
 	SegmentSize int64
+
+	// Requests, if set, holds the named requests of local consumers. Their
+	// pieces are wanted along with the selection's.
+	Requests *request.Registry
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -89,9 +95,12 @@ type Daemon struct {
 	cfg        Config
 	sem        chan struct{}
 	availSlots chan struct{} // see availabilityQueries
+	kick       chan struct{} // see Kick
+	kicks      atomic.Uint64
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
+	change   chan struct{} // closed and replaced on every status change
 	verified map[string]bool
 
 	stateMu sync.Mutex
@@ -121,6 +130,8 @@ func New(cfg Config) *Daemon {
 		cfg:        cfg,
 		sem:        make(chan struct{}, cfg.MaxConcurrentTransfers),
 		availSlots: make(chan struct{}, availabilityQueries),
+		kick:       make(chan struct{}, 1),
+		change:     make(chan struct{}),
 		statuses:   make(map[string]server.ModelStatus),
 		verified:   make(map[string]bool),
 		states:     make(map[string]*store.RevisionState),
@@ -156,6 +167,7 @@ func (d *Daemon) setStatus(ms server.ModelStatus) {
 	ms.UpdatedAt = time.Now().UTC()
 	d.mu.Lock()
 	d.statuses[want.Key(ms.Model, ms.Revision)] = ms
+	d.notifyLocked()
 	d.mu.Unlock()
 }
 
@@ -189,9 +201,14 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer busy.Delete(key)
-				if err := d.reconcileModel(ctx, w); err != nil {
+				kicks := d.kicks.Load()
+				err := d.reconcileModel(ctx, w)
+				busy.Delete(key)
+				if err != nil {
 					onErr(fmt.Errorf("model %s: %w", key, err))
+				}
+				if d.kicks.Load() != kicks {
+					d.Kick() // wants changed mid-pass: look again now.
 				}
 			}()
 		}
@@ -199,6 +216,7 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-d.kick:
 		}
 	}
 }
@@ -236,7 +254,9 @@ func (d *Daemon) refreshWants() ([]want.Want, error) {
 	d.mu.Lock()
 	sel := d.cfg.Selection
 	d.mu.Unlock()
+	sel, prio := d.withRequests(sel)
 	wants, err := want.FromSelection(d.cfg.Catalog, sel)
+	sortByPriority(wants, prio)
 	d.pruneStatuses(wants)
 	return wants, errors.Join(selErr, err)
 }
@@ -312,7 +332,10 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		}
 	}
 
-	need, err := want.Resolve(manifest, w)
+	need, err := resolveEach(manifest, w)
+	if errors.Is(err, errSomePieces) {
+		err = nil // the rest are fetched; requestStatus reports the bad one.
+	}
 	if err != nil {
 		d.setStatus(server.ModelStatus{
 			Model: m.Name, Revision: m.Revision, State: server.StateError,

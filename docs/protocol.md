@@ -125,6 +125,102 @@ for it, as one from a pull-through root has none):
 - `X-Segment-Trust`: how this node verified it: `manifest`, `origin` or
   `requester`.
 
+## Local request API
+
+A local consumer (gr8) tells model-loader which pieces it needs with a
+named request. The API is served apart from the LAN API, on
+`-local-listen`: by default the unix socket `model-loader.sock` in the
+store directory; `host:port` serves it over TCP instead, and an empty value
+turns it off. It has no authentication: anything that can reach it can pin
+and release pieces, so keep it on the socket or on localhost.
+
+### `PUT /requests/{name}`
+
+Create the request `name`, or replace it. `name` is 1 to 128 of
+`[A-Za-z0-9._-]`, starting with a letter or digit. The body names pieces
+of one catalog model revision, as an entry of the selection file's
+`partial` list does, plus a priority:
+
+```json
+{
+  "model": "glm-5.3",
+  "revision": "abc1234",
+  "include": ["config.json", "dense/*.safetensors"],
+  "exclude": [],
+  "ranges": [
+    {"path": "experts/layer-03.safetensors",
+     "ranges": [{"offset": 1048576, "length": 4194304, "xxh64": "9f2c0e5b7a1d3c44"}]}
+  ],
+  "priority": 10
+}
+```
+
+- `revision` may be left out when the catalog has one revision of `model`.
+- `xxh64` is optional: the consumer's XXH64 (seed 0) of exactly that range.
+  The request is ready only once every one matches (see `docs/design.md`).
+- `priority`: models with a higher-priority request start first and take
+  transfer slots first. It does not stop a transfer already running.
+  Default 0, as for the selection file.
+
+Answers `200` with the request's status (below), or `400` for a body that
+is not well formed or names no catalog model revision. Unknown fields are
+an error.
+
+Replacing a request keeps every piece it shares with the old one: only
+the new pieces are fetched. Pieces only the old request named stay on disk
+until eviction removes them (they are no longer pinned).
+
+### `GET /requests/{name}`
+
+The request's status:
+
+```json
+{
+  "name": "gr8-rank0",
+  "model": "glm-5.3",
+  "revision": "abc1234",
+  "include": ["config.json"],
+  "ranges": [ ... ],
+  "priority": 10,
+  "created": "2026-10-24T15:00:00Z",
+  "updated": "2026-10-24T15:05:00Z",
+  "state": "downloading",
+  "bytes_total": 21474836480,
+  "bytes_done": 5368709120,
+  "dir": "/var/lib/model-loader/models/glm-5.3/abc1234",
+  "error": ""
+}
+```
+
+- `state`: `pending` (no manifest yet), `downloading`, `ready` (every
+  piece held and verified), or `invalid` (the manifest shows a file or
+  range the request names does not exist; it will never be ready, and the
+  rest of the model is fetched as usual).
+- `bytes_total` and `bytes_done` count the request's pieces, rounded out to
+  whole segments.
+- `dir` holds the revision's files by their manifest paths. A piece is at
+  its original offset in its file; bytes outside the pieces held read as
+  zeros.
+- `error`: the last failure fetching the model (it is retried), or why
+  the request is invalid.
+
+With `?wait=DURATION` (such as `?wait=5m`, at most 30m) it answers once the
+request is ready (`200`) or invalid (`422`), or the wait is over (`504`,
+with the status then). 404 if there is no such request.
+
+### `GET /requests`
+
+Every request's status, highest priority first.
+
+### `DELETE /requests/{name}`
+
+Release the request: `204`, or `404` if there was none. Its pieces are no
+longer pinned.
+
+Requests are saved in `requests/` in the store, one file each, and hold
+across restarts of model-loader. A pinned piece is one any request or the
+selection file names; eviction never removes one.
+
 ## Errors
 
 Standard HTTP status codes. `503` means "ask someone else" (overloaded or

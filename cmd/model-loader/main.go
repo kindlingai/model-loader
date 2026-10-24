@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/daemon"
 	"github.com/kindlingai/model-loader/internal/discovery"
+	"github.com/kindlingai/model-loader/internal/request"
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
@@ -58,6 +60,7 @@ type config struct {
 	maxConcurrent     int
 	pullWorkers       int
 	verifyOnStart     bool
+	localListen       string
 }
 
 func parseFlags(args []string) (*config, error) {
@@ -77,6 +80,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous segment transfers")
 	fs.IntVar(&cfg.pullWorkers, "pull-workers", 4, "root only: maximum segments fetched from origins at once for pull-through")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
+	fs.StringVar(&cfg.localListen, "local-listen", "unix:model-loader.sock", "where to serve the local request API: unix:PATH (relative to -store) or host:port; empty to turn it off")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -160,6 +164,14 @@ func run(args []string) error {
 		return err
 	}
 
+	reqs, err := request.Open(filepath.Join(cfg.storeDir, "requests"))
+	if err != nil {
+		if reqs == nil {
+			return err
+		}
+		log.Printf("model-loader: warning: %v", err) // the rest still load.
+	}
+
 	disc, err := buildDiscoverer(cfg)
 	if err != nil {
 		return err
@@ -179,6 +191,7 @@ func run(args []string) error {
 		MaxConcurrentTransfers: cfg.maxConcurrent,
 		PullWorkers:            cfg.pullWorkers,
 		VerifyOnStart:          cfg.verifyOnStart,
+		Requests:               reqs,
 	})
 
 	srv := server.New(st, d)
@@ -192,7 +205,7 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		log.Printf("model-loader %s: node %q (%s) serving on %s", version, nodeID, strings.Join(roles, "+"), cfg.listen)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -201,6 +214,21 @@ func run(args []string) error {
 		}
 		errCh <- nil
 	}()
+
+	if cfg.localListen != "" {
+		ln, err := listenLocal(cfg.localListen, cfg.storeDir)
+		if err != nil {
+			return err
+		}
+		localSrv := &http.Server{Handler: server.NewLocal(d)}
+		defer localSrv.Close()
+		go func() {
+			log.Printf("model-loader: local request API on %s", ln.Addr())
+			if err := localSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("local api: %w", err)
+			}
+		}()
+	}
 
 	go d.Run(ctx, cfg.reconcileInterval, func(err error) {
 		log.Printf("model-loader: reconcile: %v", err)
@@ -240,4 +268,25 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, error) {
 		}
 		return discovery.NewStatic(addrs), nil
 	}
+}
+
+// listenLocal listens on addr for the local request API: "unix:PATH" is a
+// unix socket, PATH relative to storeDir unless absolute; anything else is
+// a TCP host:port. A stale socket from an earlier run is removed first.
+func listenLocal(addr, storeDir string) (net.Listener, error) {
+	path, ok := strings.CutPrefix(addr, "unix:")
+	if !ok {
+		return net.Listen("tcp", addr)
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(storeDir, path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("local api: remove stale socket: %w", err)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("local api: %w", err)
+	}
+	return ln, nil
 }

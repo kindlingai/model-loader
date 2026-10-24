@@ -65,9 +65,10 @@ internal/store/     local content store, manifests, integrity
 internal/source/    download sources (http, huggingface)
 internal/transfer/  resumable range-fetch engine
 internal/want/      what a node must hold: selection to needed segments
+internal/request/   named requests from local consumers (gr8), saved in the store
 internal/xxh64/     XXH64 (seed 0), for consumer range checksums
 internal/discovery/ peer discovery backends (static, k8s DNS)
-internal/server/    LAN-facing HTTP server (status/manifest/blob)
+internal/server/    LAN-facing HTTP server (status/manifest/blob), local request API
 internal/daemon/    reconcile loop tying it together
 deploy/k8s/         Kustomize manifests
 deploy/compose/     docker-compose.yml

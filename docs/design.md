@@ -42,6 +42,47 @@ node with a smaller disk doesn't have to hold the whole fleet's catalog.
 The selection file is re-read on every reconcile, and a missing one selects
 nothing: a node no one has picked models for yet still serves `/status`.
 
+### Partial selection
+
+A node can also hold only part of a revision. `partial` entries in the
+selection name a model, an optional revision (empty means every catalog
+revision of that name), and the pieces to hold:
+
+```yaml
+wanted: ["small-model"]
+partial:
+  - model: glm-5.3
+    revision: abc1234
+    include: ["*.json", "dense/**"]   # whole files, by glob
+    exclude: ["dense/vision-*"]
+    ranges:                           # byte ranges of single files
+      - path: experts/exlr8-layer-003.k4.safetensors
+        ranges:
+          - {offset: 0, length: 4096}
+          - {offset: 1048576, length: 65536}
+```
+
+- Globs match manifest paths. `*` matches inside one path segment and `**`
+  matches any number of segments.
+- The files an entry names are those `include` matches and `exclude` does
+  not, plus every file in `ranges`. With no `include` and no `ranges`, the
+  entry names every file but its excludes. A file in `ranges` is never
+  excluded.
+- A model that `wanted` matches is held whole, whatever `partial` says.
+- A byte range rounds out to whole 64 MiB segments, so the manifest's
+  segment hashes verify every byte the node holds.
+- A file the node holds only in part is a sparse file at its full size.
+  Every held segment is at its original offset, so a reader can use the
+  absolute offsets from the file's own index. Bytes outside held segments
+  are holes and read as zeros; only the ranges asked for are meaningful.
+- A file is checked against its whole-file sha256, and marked complete,
+  once every one of its segments is held.
+- `-verify-on-start` re-hashes every held segment of each model once when
+  the process starts, and fetches again any segment that no longer matches.
+
+A root still downloads a whole revision from its origin before it publishes
+the manifest; a partial selection on a root limits nothing yet.
+
 ## Store
 
 The materialized file tree is the canonical store — there is no separate

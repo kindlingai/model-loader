@@ -3,10 +3,13 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -20,11 +23,14 @@ import (
 // manifests and state are small JSON side files, not meant for consumers.
 type Store struct {
 	root string
+
+	unsavedMu sync.Mutex
+	unsaved   map[string]bool // state paths whose last save failed
 }
 
 // Open prepares a store rooted at dir, creating it if necessary.
 func Open(dir string) (*Store, error) {
-	s := &Store{root: dir}
+	s := &Store{root: dir, unsaved: make(map[string]bool)}
 	for _, sub := range []string{"manifests", "models", "state"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("open store: %w", err)
@@ -76,13 +82,33 @@ func (s *Store) HasManifest(model, revision string) bool {
 }
 
 // SaveState writes revision state, replacing any existing one atomically.
+//
+// If it fails, StateSaved reports false for the revision until a save
+// succeeds: what is on disk may still mark held bytes this node found bad,
+// and must not be served.
 func (s *Store) SaveState(rs *RevisionState) error {
 	rs.UpdatedAt = time.Now().UTC()
 	path := s.statePath(rs.Model, rs.Revision)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+	err := os.MkdirAll(filepath.Dir(path), 0o755)
+	if err == nil {
+		err = marshalJSONAtomic(path, rs)
 	}
-	return marshalJSONAtomic(path, rs)
+	s.unsavedMu.Lock()
+	defer s.unsavedMu.Unlock()
+	if err != nil {
+		s.unsaved[path] = true
+	} else {
+		delete(s.unsaved, path)
+	}
+	return err
+}
+
+// StateSaved reports whether the last SaveState of the revision, if any,
+// succeeded.
+func (s *Store) StateSaved(model, revision string) bool {
+	s.unsavedMu.Lock()
+	defer s.unsavedMu.Unlock()
+	return !s.unsaved[s.statePath(model, revision)]
 }
 
 // LoadState reads previously saved revision state, or returns fresh empty
@@ -162,6 +188,89 @@ func VerifySegment(f *os.File, fm FileManifest, i int) (bool, error) {
 		return false, fmt.Errorf("%s segment %d: %w", fm.Path, i, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)) == fm.SegmentSHA256[i], nil
+}
+
+// openRegular opens path read-write, failing if it is a symlink or not a
+// regular file.
+func openRegular(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	return f, nil
+}
+
+// Reverify hashes every segment rs records as done against m, and marks
+// any that no longer match (or whose file is gone or cannot be opened) as
+// not done, along with its file's completeness, so the next fetch gets it
+// again. A file that is not exactly its manifest size is put back to that
+// size and is no longer complete, so it is checked whole again once every
+// segment is held. It saves rs, even when it fails part way, so nothing it
+// found bad stays marked held, and returns how many segments it dropped.
+func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
+	dropped := 0
+	var errs []error
+	for _, fm := range m.Files {
+		fs := rs.FileState(fm)
+		held := fs.Complete
+		for _, done := range fs.SegmentsDone {
+			held = held || done
+		}
+		if !held {
+			continue
+		}
+		// The file is opened without following a symlink, and its size is
+		// put back through the same descriptor, so nothing outside the
+		// store is read or truncated. Anything but a regular file is gone.
+		f, err := openRegular(s.FilePath(m.Model, m.Revision, fm.Path))
+		if err != nil {
+			f = nil // gone or unreadable: nothing in it can be trusted.
+		}
+		if f != nil {
+			if info, err := f.Stat(); err != nil || info.Size() != fm.Size {
+				fs.Complete = false
+				if err == nil {
+					if err := f.Truncate(fm.Size); err != nil {
+						errs = append(errs, fmt.Errorf("%s: restore size: %w", fm.Path, err))
+					}
+				}
+			}
+		}
+		for i, done := range fs.SegmentsDone {
+			if !done {
+				continue
+			}
+			ok := false
+			if f != nil {
+				if ok, err = VerifySegment(f, fm, i); err != nil {
+					ok = false // a short file: the segment is gone.
+				}
+			}
+			if !ok {
+				fs.SegmentsDone[i], fs.Complete = false, false
+				dropped++
+			}
+		}
+		if f != nil && fs.Complete && fm.NumSegments() == 0 {
+			if ok, err := VerifyWholeFile(f, fm); err != nil || !ok {
+				fs.Complete = false
+			}
+		}
+		if f == nil {
+			fs.Complete = false
+		} else {
+			f.Close()
+		}
+		rs.SetFileState(fs)
+	}
+	if err := s.SaveState(rs); err != nil {
+		errs = append(errs, err)
+	}
+	return dropped, errors.Join(errs...)
 }
 
 // VerifyWholeFile reports whether the file is exactly fm.Size bytes and

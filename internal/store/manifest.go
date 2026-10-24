@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"strings"
 )
 
 // DefaultSegmentSize is the granularity at which a file's integrity is
@@ -50,11 +52,22 @@ func (f FileManifest) SegmentBounds(i int) (start, end int64) {
 		size = f.Size
 	}
 	start = int64(i) * size
-	end = start + size
-	if end > f.Size || len(f.SegmentSHA256) == 0 {
+	if start > f.Size || start < 0 {
+		return f.Size, f.Size // past the end: no bytes, never an overflow
+	}
+	end = start + min(size, f.Size-start)
+	if len(f.SegmentSHA256) == 0 {
 		end = f.Size
 	}
 	return start, end
+}
+
+// SegmentIndex returns the segment that holds byte off.
+func (f FileManifest) SegmentIndex(off int64) int {
+	if f.SegmentSize <= 0 {
+		return 0
+	}
+	return int(off / f.SegmentSize)
 }
 
 // Manifest describes every file in a model revision.
@@ -62,6 +75,38 @@ type Manifest struct {
 	Model    string         `json:"model"`
 	Revision string         `json:"revision"`
 	Files    []FileManifest `json:"files"`
+}
+
+// Validate checks that m is self-consistent: every path is a clean,
+// relative, slash-separated path inside the revision and appears once, and
+// every file has one segment hash per SegmentSize bytes. A manifest comes
+// from another node, so a bad one must fail here rather than index out of
+// range or write outside the store later.
+func (m *Manifest) Validate() error {
+	seen := make(map[string]bool, len(m.Files))
+	for _, f := range m.Files {
+		if f.Path == "" || path.IsAbs(f.Path) || path.Clean(f.Path) != f.Path || f.Path == ".." || strings.HasPrefix(f.Path, "../") || strings.Contains(f.Path, "\\") {
+			return fmt.Errorf("manifest %s@%s: invalid path %q", m.Model, m.Revision, f.Path)
+		}
+		if seen[f.Path] {
+			return fmt.Errorf("manifest %s@%s: duplicate path %q", m.Model, m.Revision, f.Path)
+		}
+		seen[f.Path] = true
+		if f.Size < 0 {
+			return fmt.Errorf("manifest %s@%s: %s: negative size", m.Model, m.Revision, f.Path)
+		}
+		want := 0
+		if f.Size > 0 {
+			if f.SegmentSize <= 0 {
+				return fmt.Errorf("manifest %s@%s: %s: no segment size", m.Model, m.Revision, f.Path)
+			}
+			want = int(1 + (f.Size-1)/f.SegmentSize) // no overflow near MaxInt64
+		}
+		if len(f.SegmentSHA256) != want {
+			return fmt.Errorf("manifest %s@%s: %s: %d segment hashes, want %d", m.Model, m.Revision, f.Path, len(f.SegmentSHA256), want)
+		}
+	}
+	return nil
 }
 
 // TotalSize sums every file's size.
@@ -84,9 +129,11 @@ func (m *Manifest) Find(path string) (FileManifest, bool) {
 }
 
 // BuildSegmentHashes computes SegmentSHA256 for every file by reading it
-// from disk at root. When openFile returns an *os.File, each segment is dropped from page cache
-// as soon as it is hashed, so hashing a multi-hundred-GB model keeps at most
-// one segment resident.
+// from disk at root, in segments of each file's SegmentSize, or
+// DefaultSegmentSize where that is not set. When openFile returns an
+// *os.File, each segment is dropped from page cache as soon as it is
+// hashed, so hashing a multi-hundred-GB model keeps at most one segment
+// resident.
 func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadCloser, error)) error {
 	for i := range m.Files {
 		f := &m.Files[i]
@@ -98,7 +145,10 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 		if file, ok := rc.(*os.File); ok {
 			hashed = func(off, n int64) error { return Uncache(file, off, n) }
 		}
-		hashes, whole, err := hashSegments(rc, f.Size, DefaultSegmentSize, hashed)
+		if f.SegmentSize <= 0 {
+			f.SegmentSize = DefaultSegmentSize
+		}
+		hashes, whole, err := hashSegments(rc, f.Size, f.SegmentSize, hashed)
 		closeErr := rc.Close()
 		if err != nil {
 			return fmt.Errorf("hash %s: %w", f.Path, err)
@@ -106,7 +156,6 @@ func (m *Manifest) BuildSegmentHashes(openFile func(relPath string) (io.ReadClos
 		if closeErr != nil {
 			return fmt.Errorf("close %s: %w", f.Path, closeErr)
 		}
-		f.SegmentSize = DefaultSegmentSize
 		f.SegmentSHA256 = hashes
 		f.SHA256 = whole
 	}

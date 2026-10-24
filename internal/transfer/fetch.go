@@ -48,19 +48,41 @@ func (p PeerFetcher) Open(ctx context.Context, path string, offset, length int64
 // are dropped once they're durable.
 const uncacheEvery = store.DefaultSegmentSize
 
-// FetchFile downloads every not-yet-complete segment of fm into the store,
-// trying fetchers in order for each segment and falling back to the next
-// one when a fetcher doesn't have it yet or fails. Each segment is verified
-// against the manifest as soon as it lands, and the whole file is verified
-// once more when every segment is done. rs is mutated and persisted to st
-// as progress is made, so a restart resumes from the last saved segment
-// rather than from scratch.
-func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm store.FileManifest, rs *store.RevisionState, fetchers []Fetcher) error {
+// FetchFile downloads the not-yet-done segments of fm that need marks
+// into the store; a nil need means every segment. It tries fetchers in
+// order for each segment, falling back to the next one when a fetcher
+// doesn't have it yet or fails. Each segment is verified against the
+// manifest as soon as it lands. Once every segment of the file is done,
+// needed or not, the whole file is verified once more and marked complete;
+// until then the file is partial, a sparse file with every held segment at
+// its own offset. rs is mutated and persisted to st as progress is made,
+// so a restart resumes from the last saved segment rather than from
+// scratch.
+func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm store.FileManifest, rs *store.RevisionState, fetchers []Fetcher, need []bool) error {
 	fileState := rs.FileState(fm)
 	if fileState.Complete {
 		return nil
 	}
-	if len(fetchers) == 0 {
+	if len(fileState.SegmentsDone) != fm.NumSegments() {
+		// State that does not match the manifest's segments: keep what
+		// lines up, and fetch the rest.
+		done := make([]bool, fm.NumSegments())
+		copy(done, fileState.SegmentsDone)
+		fileState.SegmentsDone = done
+	}
+	if need != nil && len(need) != fm.NumSegments() {
+		return fmt.Errorf("fetch %s: need has %d segments, manifest %d", fm.Path, len(need), fm.NumSegments())
+	}
+	missing := 0
+	for i, done := range fileState.SegmentsDone {
+		if !done && (need == nil || need[i]) {
+			missing++
+		}
+	}
+	if missing == 0 && !allDone(fileState.SegmentsDone) {
+		return nil // every needed segment is already held.
+	}
+	if missing > 0 && len(fetchers) == 0 {
 		return fmt.Errorf("fetch %s: no sources available", fm.Path)
 	}
 
@@ -73,7 +95,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	dead := make([]bool, len(fetchers))
 	var sinceSync int64
 	for i := 0; i < fm.NumSegments(); i++ {
-		if i < len(fileState.SegmentsDone) && fileState.SegmentsDone[i] {
+		if fileState.SegmentsDone[i] || (need != nil && !need[i]) {
 			continue
 		}
 		start, end := fm.SegmentBounds(i)
@@ -102,6 +124,9 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if err := syncAndUncache(f); err != nil {
 		return fmt.Errorf("fetch %s: %w", fm.Path, err)
 	}
+	if !allDone(fileState.SegmentsDone) {
+		return nil // partial: the rest of the file is not needed.
+	}
 
 	ok, err := store.VerifyWholeFile(f, fm)
 	if err != nil {
@@ -113,6 +138,15 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	fileState.Complete = true
 	rs.SetFileState(fileState)
 	return st.SaveState(rs)
+}
+
+func allDone(segments []bool) bool {
+	for _, done := range segments {
+		if !done {
+			return false
+		}
+	}
+	return true
 }
 
 // syncAndUncache fsyncs f, then advises the kernel to drop its page cache.
@@ -155,8 +189,17 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 			continue
 		}
 
+		// Write at most the segment's own bytes, so a source that sends
+		// too much cannot overwrite a neighbouring segment that is held.
 		w := io.NewOffsetWriter(f, start)
-		copied, copyErr := io.Copy(w, rc)
+		copied, copyErr := io.Copy(w, io.LimitReader(rc, length))
+		if copyErr == nil && copied == length {
+			// Only a full, good copy is probed for more: a failed one is
+			// dropped at once, not held open waiting on the source.
+			if extra, _ := rc.Read(make([]byte, 1)); extra > 0 {
+				copyErr = fmt.Errorf("source sent more than the %d bytes asked for", length)
+			}
+		}
 		closeErr := rc.Close()
 		if copyErr != nil {
 			dead[k], lastErr = true, copyErr

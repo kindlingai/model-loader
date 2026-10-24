@@ -24,6 +24,12 @@ func (d *Daemon) acquireManifest(ctx context.Context, m catalog.Model) (*store.M
 			if err != nil {
 				continue
 			}
+			if mf.Model != m.Name || mf.Revision != m.Revision {
+				continue
+			}
+			if err := mf.Validate(); err != nil {
+				continue // a broken peer; ask the next one.
+			}
 			if err := d.cfg.Store.SaveManifest(mf); err != nil {
 				return nil, fmt.Errorf("save manifest from peer %s: %w", p.Addr, err)
 			}

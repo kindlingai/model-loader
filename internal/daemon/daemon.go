@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
 	"github.com/kindlingai/model-loader/internal/transfer"
+	"github.com/kindlingai/model-loader/internal/want"
 )
 
 // defaultMaxConcurrentTransfers caps simultaneous file downloads per node.
@@ -63,6 +65,11 @@ type Config struct {
 	// StallTimeout bounds how long a download from a model's origin may go
 	// without receiving any bytes. Defaults to defaultStallTimeout.
 	StallTimeout time.Duration
+
+	// VerifyOnStart re-hashes every held segment of a model the first time
+	// this process reconciles it, and fetches again any that no longer
+	// match the manifest.
+	VerifyOnStart bool
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -73,6 +80,7 @@ type Daemon struct {
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
+	verified map[string]bool
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -90,6 +98,7 @@ func New(cfg Config) *Daemon {
 		cfg:      cfg,
 		sem:      make(chan struct{}, cfg.MaxConcurrentTransfers),
 		statuses: make(map[string]server.ModelStatus),
+		verified: make(map[string]bool),
 	}
 }
 
@@ -115,23 +124,21 @@ func (d *Daemon) Status() server.StatusResponse {
 	return resp
 }
 
-func statusKey(model, revision string) string { return model + "@" + revision }
-
 func (d *Daemon) setStatus(ms server.ModelStatus) {
 	ms.UpdatedAt = time.Now().UTC()
 	d.mu.Lock()
-	d.statuses[statusKey(ms.Model, ms.Revision)] = ms
+	d.statuses[want.Key(ms.Model, ms.Revision)] = ms
 	d.mu.Unlock()
 }
 
 // Run reconciles every wanted model immediately, then again every interval,
-// until ctx is canceled. Each tick starts every model that isn't still busy
-// from an earlier tick, so a model whose fetch failed (say, its source peer
-// restarted) retries with freshly discovered peers on the next tick instead
-// of waiting for every other model's transfer to finish. A failure is
-// passed to onErr, which may be called concurrently, and does not stop the
-// loop -- a transient WAN or peer failure for one model shouldn't take the
-// whole node out of service.
+// until ctx is canceled. Each tick re-reads the selection file and starts
+// every wanted model that isn't still busy from an earlier tick, so a model
+// whose fetch failed (say, its source peer restarted) retries with freshly
+// discovered peers on the next tick instead of waiting for every other
+// model's transfer to finish. A failure is passed to onErr, which may be
+// called concurrently, and does not stop the loop -- a transient WAN or peer
+// failure for one model shouldn't take the whole node out of service.
 func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(error)) {
 	if onErr == nil {
 		onErr = func(error) {}
@@ -142,8 +149,12 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		for _, m := range d.cfg.Catalog.Wanted(d.cfg.Selection) {
-			key := statusKey(m.Name, m.Revision)
+		wants, err := d.refreshWants()
+		if err != nil {
+			onErr(err)
+		}
+		for _, w := range wants {
+			key := want.Key(w.Model.Name, w.Model.Revision)
 			if _, running := busy.LoadOrStore(key, true); running {
 				continue
 			}
@@ -151,8 +162,8 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 			go func() {
 				defer wg.Done()
 				defer busy.Delete(key)
-				if err := d.reconcileModel(ctx, m); err != nil {
-					onErr(fmt.Errorf("model %s@%s: %w", m.Name, m.Revision, err))
+				if err := d.reconcileModel(ctx, w); err != nil {
+					onErr(fmt.Errorf("model %s: %w", key, err))
 				}
 			}()
 		}
@@ -170,24 +181,36 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 // cheap); actual file transfers are bounded by MaxConcurrentTransfers
 // regardless of how many models are in flight.
 func (d *Daemon) Reconcile(ctx context.Context) error {
-	selErr := d.reloadSelection()
-	wanted := d.cfg.Catalog.Wanted(d.cfg.Selection)
-	d.pruneStatuses(wanted)
+	wants, selErr := d.refreshWants()
 
 	var wg sync.WaitGroup
-	errs := make([]error, len(wanted))
-	for i, m := range wanted {
+	errs := make([]error, len(wants))
+	for i, w := range wants {
 		wg.Add(1)
-		go func(i int, m catalog.Model) {
+		go func(i int, w want.Want) {
 			defer wg.Done()
-			if err := d.reconcileModel(ctx, m); err != nil {
-				errs[i] = fmt.Errorf("model %s@%s: %w", m.Name, m.Revision, err)
+			if err := d.reconcileModel(ctx, w); err != nil {
+				errs[i] = fmt.Errorf("model %s: %w", want.Key(w.Model.Name, w.Model.Revision), err)
 			}
-		}(i, m)
+		}(i, w)
 	}
 	wg.Wait()
 
 	return errors.Join(append(errs, selErr)...)
+}
+
+// refreshWants re-reads the selection file and returns what this node
+// wants now, dropping models it no longer wants from /status. A selection
+// file that fails to parse leaves the last good selection in place; its
+// error is returned with the wants.
+func (d *Daemon) refreshWants() ([]want.Want, error) {
+	selErr := d.reloadSelection()
+	d.mu.Lock()
+	sel := d.cfg.Selection
+	d.mu.Unlock()
+	wants, err := want.FromSelection(d.cfg.Catalog, sel)
+	d.pruneStatuses(wants)
+	return wants, errors.Join(selErr, err)
 }
 
 func (d *Daemon) reloadSelection() error {
@@ -201,16 +224,18 @@ func (d *Daemon) reloadSelection() error {
 	if err != nil {
 		return err
 	}
+	d.mu.Lock()
 	d.cfg.Selection = sel
+	d.mu.Unlock()
 	return nil
 }
 
 // pruneStatuses drops models the selection no longer wants, so /status
 // doesn't keep advertising them after the selection file changes.
-func (d *Daemon) pruneStatuses(wanted []catalog.Model) {
-	keep := make(map[string]bool, len(wanted))
-	for _, m := range wanted {
-		keep[statusKey(m.Name, m.Revision)] = true
+func (d *Daemon) pruneStatuses(wants []want.Want) {
+	keep := make(map[string]bool, len(wants))
+	for _, w := range wants {
+		keep[want.Key(w.Model.Name, w.Model.Revision)] = true
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -221,35 +246,73 @@ func (d *Daemon) pruneStatuses(wanted []catalog.Model) {
 	}
 }
 
-func (d *Daemon) reconcileModel(ctx context.Context, m catalog.Model) error {
+// progress builds the status of w from its need and rs: ready once the
+// whole revision is held, partial once every needed piece of a partial
+// want is held, and downloading (or the given state) until then.
+func progress(w want.Want, m *store.Manifest, need *want.Need, rs *store.RevisionState, state string) server.ModelStatus {
+	ms := server.ModelStatus{
+		Model: w.Model.Name, Revision: w.Model.Revision, State: state,
+		BytesTotal: need.Bytes(m), BytesDone: need.BytesDone(m, rs),
+	}
+	if !w.Whole {
+		ms.Selection = server.SelectionPartial
+	}
+	switch {
+	case rs.Complete():
+		ms.State = server.StateReady
+	case state != server.StateError && need.Satisfied(m, rs):
+		ms.State = server.StatePartial
+	}
+	return ms
+}
+
+func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
+	m := w.Model
 	manifest, err := d.cfg.Store.LoadManifest(m.Name, m.Revision)
 	if err != nil {
 		manifest, err = d.acquireManifest(ctx, m)
 		if err != nil {
-			d.setStatus(server.ModelStatus{
+			ms := server.ModelStatus{
 				Model: m.Name, Revision: m.Revision, State: server.StatePending,
 				Error: err.Error(),
-			})
+			}
+			if !w.Whole {
+				ms.Selection = server.SelectionPartial
+			}
+			d.setStatus(ms)
 			return nil // no source has it yet; retry on the next tick, not fatal.
 		}
+	}
+
+	need, err := want.Resolve(manifest, w)
+	if err != nil {
+		d.setStatus(server.ModelStatus{
+			Model: m.Name, Revision: m.Revision, State: server.StateError,
+			Selection: server.SelectionPartial, Error: err.Error(),
+		})
+		return err
 	}
 
 	rs, err := d.cfg.Store.LoadState(manifest)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
-	if rs.Complete() {
-		d.setStatus(server.ModelStatus{
-			Model: m.Name, Revision: m.Revision, State: server.StateReady,
-			BytesTotal: manifest.TotalSize(), BytesDone: manifest.TotalSize(),
-		})
+	if key := want.Key(m.Name, m.Revision); d.cfg.VerifyOnStart && !d.visited(key) {
+		dropped, err := d.cfg.Store.Reverify(manifest, rs)
+		if err != nil {
+			return fmt.Errorf("re-verify: %w", err)
+		}
+		d.markVisited(key)
+		if dropped > 0 {
+			log.Printf("model-loader: %s@%s: re-verify dropped %d segments that no longer match the manifest", m.Name, m.Revision, dropped)
+		}
+	}
+	if rs.Complete() || need.Satisfied(manifest, rs) {
+		d.setStatus(progress(w, manifest, need, rs, server.StateReady))
 		return nil
 	}
 
-	d.setStatus(server.ModelStatus{
-		Model: m.Name, Revision: m.Revision, State: server.StateDownloading,
-		BytesTotal: manifest.TotalSize(), BytesDone: rs.BytesDone(manifest),
-	})
+	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
 
 	peers, err := d.cfg.Discoverer.Peers(ctx)
 	if err != nil {
@@ -258,29 +321,35 @@ func (d *Daemon) reconcileModel(ctx context.Context, m catalog.Model) error {
 	fetchers := d.buildFetchers(m, peers)
 
 	for _, fm := range manifest.Files {
-		if rs.FileState(fm).Complete {
+		fn := need.Files[fm.Path]
+		if fn == nil || rs.FileState(fm).Complete {
 			continue
 		}
 		d.sem <- struct{}{}
-		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, fetchers)
+		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, fetchers, fn.Segments)
 		<-d.sem
 		if err != nil {
-			d.setStatus(server.ModelStatus{
-				Model: m.Name, Revision: m.Revision, State: server.StateError,
-				BytesTotal: manifest.TotalSize(), BytesDone: rs.BytesDone(manifest),
-				Error: err.Error(),
-			})
+			ms := progress(w, manifest, need, rs, server.StateError)
+			ms.Error = err.Error()
+			d.setStatus(ms)
 			return fmt.Errorf("fetch %s: %w", fm.Path, err)
 		}
-		d.setStatus(server.ModelStatus{
-			Model: m.Name, Revision: m.Revision, State: server.StateDownloading,
-			BytesTotal: manifest.TotalSize(), BytesDone: rs.BytesDone(manifest),
-		})
+		d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
 	}
 
-	d.setStatus(server.ModelStatus{
-		Model: m.Name, Revision: m.Revision, State: server.StateReady,
-		BytesTotal: manifest.TotalSize(), BytesDone: manifest.TotalSize(),
-	})
+	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
 	return nil
+}
+
+// visited reports whether this process has re-verified key already.
+func (d *Daemon) visited(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.verified[key]
+}
+
+func (d *Daemon) markVisited(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.verified[key] = true
 }

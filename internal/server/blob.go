@@ -31,6 +31,12 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.store.StateSaved(model, revision) {
+		// This node found held bytes bad and could not record it: serve
+		// nothing from the revision until it can.
+		http.Error(w, "state could not be saved", http.StatusServiceUnavailable)
+		return
+	}
 	state, err := s.store.LoadState(manifest)
 	if err != nil {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)

@@ -59,6 +59,11 @@ partially). 404 if this node has never started it — ask a different peer.
 }
 ```
 
+A root publishes a manifest for pull-through the first time one is asked
+for, for a catalog model it does not want whole. Its files have
+`segment_size` but no `segment_sha256`. Each segment is then verified as
+described under `/blob`.
+
 ## `GET /segments/{model}/{revision}`
 
 Which segments of each file this node holds, verified, as half-open ranges
@@ -91,9 +96,28 @@ hold it.
 ## `GET /blob/{model}/{revision}/{path}`
 
 Serves the file at `path`, honoring `Range` requests (`Accept-Ranges: bytes`).
-Only byte ranges whose covering segments have been verified against the
-manifest's `segment_sha256` are served; a request for an unverified range
-gets `416 Range Not Satisfiable` rather than partial/unverified data.
+Only byte ranges whose covering segments have been verified are served; a
+request for an unverified range gets `416 Range Not Satisfiable` rather
+than partial/unverified data.
+
+On a root, a range it does not hold yet is fetched from the model's origin
+first (pull-through; see `docs/design.md`). A failure there, such as an
+origin error or a checksum mismatch, is a `502` with the reason in the
+body.
+
+Request header:
+
+- `X-Range-XXH64: offset+length=xxh64,...`: a consumer's XXH64 (seed 0, 16
+  hex digits) for ranges inside the requested one. A root checks each
+  against the bytes before it serves them. At most 4096 entries.
+
+Response headers, for a request of exactly one segment of a file that has
+no `segment_sha256` in the manifest:
+
+- `X-Segment-SHA256`: the sha256 this node holds for the segment. The
+  requester checks the bytes against it.
+- `X-Segment-Trust`: how this node verified it: `manifest`, `origin` or
+  `requester`.
 
 ## Errors
 

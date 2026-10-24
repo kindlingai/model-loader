@@ -108,6 +108,12 @@ func defaultClient() *http.Client {
 		// the transport below.
 		Transport: &http.Transport{
 			ResponseHeaderTimeout: 30 * time.Second,
+			// A root serving pull-through issues many range GETs to one
+			// host (or its CDN). Keep enough connections alive for every
+			// pull worker, so ranges reuse them instead of each opening a
+			// new connection and DNS lookup (kindlingai/gr8#147).
+			MaxIdleConnsPerHost: 32,
+			IdleConnTimeout:     90 * time.Second,
 		},
 	}
 }

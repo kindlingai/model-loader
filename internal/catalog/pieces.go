@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/kindlingai/model-loader/internal/xxh64"
 )
 
 // Pieces names part of one catalog model: some files, whole, and some byte
@@ -40,6 +42,10 @@ type FileRanges struct {
 type ByteRange struct {
 	Offset int64 `yaml:"offset" json:"offset"`
 	Length int64 `yaml:"length" json:"length"`
+	// XXH64, if set, is the XXH64 (seed 0) of exactly these bytes, in hex.
+	// A node checks the range against it before it holds or serves it
+	// (see store.TrustRequester).
+	XXH64 string `yaml:"xxh64,omitempty" json:"xxh64,omitempty"`
 }
 
 // AllFiles reports whether p names every file of its model, before Exclude.
@@ -68,6 +74,9 @@ func (p Pieces) Validate() error {
 		for _, r := range fr.Ranges {
 			if r.Offset < 0 || r.Length <= 0 || r.Offset+r.Length < r.Offset {
 				return fmt.Errorf("ranges: %s: invalid range offset %d length %d", fr.Path, r.Offset, r.Length)
+			}
+			if _, err := r.Checksum(); err != nil {
+				return fmt.Errorf("ranges: %s: offset %d: %w", fr.Path, r.Offset, err)
 			}
 		}
 	}
@@ -122,4 +131,12 @@ func matchSegments(g, p []string) bool {
 		g, p = g[1:], p[1:]
 	}
 	return len(p) == 0
+}
+
+// Checksum returns r's XXH64 and whether it has one.
+func (r ByteRange) Checksum() (sum uint64, err error) {
+	if r.XXH64 == "" {
+		return 0, nil
+	}
+	return xxh64.Parse(r.XXH64)
 }

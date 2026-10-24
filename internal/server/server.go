@@ -6,6 +6,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -58,6 +59,7 @@ type StatusProvider interface {
 type Server struct {
 	store  *store.Store
 	status StatusProvider
+	puller Puller // nil unless pull-through is on; see SetPuller
 	mux    *http.ServeMux
 }
 
@@ -86,6 +88,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	model, revision := r.PathValue("model"), r.PathValue("revision")
 	m, err := s.store.LoadManifest(model, revision)
+	if err != nil && s.puller != nil {
+		m, err = s.puller.Manifest(r.Context(), model, revision)
+		if err != nil && !errors.Is(err, ErrNotPullable) {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+	}
 	if err != nil {
 		http.NotFound(w, r)
 		return

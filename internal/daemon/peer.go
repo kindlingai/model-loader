@@ -12,6 +12,7 @@ import (
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/store"
 	"github.com/kindlingai/model-loader/internal/transfer"
+	"github.com/kindlingai/model-loader/internal/want"
 )
 
 // acquireManifest gets m's manifest onto this node for the first time,
@@ -20,7 +21,13 @@ import (
 // pulling" the design doc calls for, so two root-eligible nodes booting at
 // once don't both hit WAN for the same new catalog entry if one of them (or
 // a plain peer that already mirrored it) answers first.
-func (d *Daemon) acquireManifest(ctx context.Context, m catalog.Model) (*store.Manifest, error) {
+//
+// A root without the manifest downloads a model it wants whole from the
+// origin and publishes the manifest when done, as before; for one it wants
+// only part of it publishes a manifest for pull-through at once (see
+// Manifest).
+func (d *Daemon) acquireManifest(ctx context.Context, w want.Want) (*store.Manifest, error) {
+	m := w.Model
 	peers, err := d.cfg.Discoverer.Peers(ctx)
 	if err == nil {
 		for _, p := range peers {
@@ -43,6 +50,9 @@ func (d *Daemon) acquireManifest(ctx context.Context, m catalog.Model) (*store.M
 
 	if !d.IsWANEligible() {
 		return nil, fmt.Errorf("no peer has %s@%s yet, and this node is not WAN-eligible", m.Name, m.Revision)
+	}
+	if !w.Whole {
+		return d.Manifest(ctx, m.Name, m.Revision)
 	}
 
 	d.sem <- struct{}{}
@@ -139,21 +149,26 @@ func (d *Daemon) olderPeerHasAll(ctx context.Context, addr string, m catalog.Mod
 // the plain peers that hold it, then the roots that hold it, each group
 // starting at a different node for each segment so that consecutive
 // segments come from different nodes at once; then peers that did not say
-// what they hold; then the other peers, in case they gained it since they
+// what they hold; then roots that do not hold it (a root can pull it from
+// the origin); then the other peers, in case they gained it since they
 // were asked; and last this node's own WAN source.
 func (s *sources) order(path string) func(i int) []int {
 	return func(i int) []int {
-		var peerHolders, rootHolders, unknown, others []int
+		var peerHolders, rootHolders, unknown, roots, others []int
 		for k := 0; k < s.peers; k++ {
-			switch a := s.avail[k]; {
+			a := s.avail[k]
+			has := s.whole[k] || (a != nil && a.Files[path].Has(i))
+			switch {
 			case s.whole[k]:
 				peerHolders = append(peerHolders, k)
 			case a == nil:
 				unknown = append(unknown, k)
-			case a.Files[path].Has(i) && a.IsRoot():
+			case has && a.IsRoot():
 				rootHolders = append(rootHolders, k)
-			case a.Files[path].Has(i):
+			case has:
 				peerHolders = append(peerHolders, k)
+			case a.IsRoot():
+				roots = append(roots, k)
 			default:
 				others = append(others, k)
 			}
@@ -162,6 +177,7 @@ func (s *sources) order(path string) func(i int) []int {
 		out = appendRotated(out, peerHolders, i)
 		out = appendRotated(out, rootHolders, i)
 		out = append(out, unknown...)
+		out = append(out, roots...)
 		out = append(out, others...)
 		for k := s.peers; k < len(s.fetchers); k++ {
 			out = append(out, k)

@@ -307,13 +307,17 @@ func TestManifestValidate(t *testing.T) {
 	}
 }
 
-// Sizes near MaxInt64 must not overflow the segment count into a manifest
-// that passes Validate with no segments.
+// Sizes near MaxInt64 must not overflow the segment count, and a file may
+// not have so many segments that per-segment state has no bound.
 func TestManifestValidateOverflow(t *testing.T) {
 	const max = int64(^uint64(0) >> 1)
 	m := &Manifest{Files: []FileManifest{{Path: "a", Size: max, SegmentSize: max}}}
+	if err := m.Validate(); err != nil || m.Files[0].NumSegments() != 1 {
+		t.Fatalf("Validate = %v, NumSegments = %d; want one segment", err, m.Files[0].NumSegments())
+	}
+	m = &Manifest{Files: []FileManifest{{Path: "a", Size: max, SegmentSize: 1}}}
 	if err := m.Validate(); err == nil {
-		t.Fatal("Validate = nil for a huge file with no segment hashes")
+		t.Fatal("Validate = nil for a file with MaxInt64 segments")
 	}
 }
 

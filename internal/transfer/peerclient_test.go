@@ -90,7 +90,7 @@ func TestPeerClientManifestNotFound(t *testing.T) {
 func TestPeerClientOpenBlobFullFile(t *testing.T) {
 	addr, _, m := newTestPeer(t)
 	c := NewPeerClient(nil)
-	rc, err := c.OpenBlob(context.Background(), addr, m.Model, m.Revision, "a.txt", 0, 0)
+	rc, err := c.OpenBlob(context.Background(), addr, m.Model, m.Revision, "a.txt", 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestPeerClientOpenBlobFullFile(t *testing.T) {
 func TestPeerClientOpenBlobRange(t *testing.T) {
 	addr, _, m := newTestPeer(t)
 	c := NewPeerClient(nil)
-	rc, err := c.OpenBlob(context.Background(), addr, m.Model, m.Revision, "a.txt", 0, 5)
+	rc, err := c.OpenBlob(context.Background(), addr, m.Model, m.Revision, "a.txt", 0, 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestPeerClientOpenBlobUnreadyRange(t *testing.T) {
 	defer ts.Close()
 
 	c := NewPeerClient(nil)
-	_, err = c.OpenBlob(context.Background(), ts.Listener.Addr().String(), "m", "r1", "a.bin", 0, 4)
+	_, err = c.OpenBlob(context.Background(), ts.Listener.Addr().String(), "m", "r1", "a.bin", 0, 4, nil)
 	if err != ErrRangeUnavailable {
 		t.Fatalf("err = %v, want ErrRangeUnavailable", err)
 	}
@@ -183,7 +183,7 @@ func TestPeerClientOpenBlobEscapesPath(t *testing.T) {
 	defer ts.Close()
 
 	c := NewPeerClient(nil)
-	rc, err := c.OpenBlob(context.Background(), ts.Listener.Addr().String(), "m", "r1", "dir with space/file.bin", 0, 0)
+	rc, err := c.OpenBlob(context.Background(), ts.Listener.Addr().String(), "m", "r1", "dir with space/file.bin", 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

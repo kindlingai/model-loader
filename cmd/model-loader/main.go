@@ -56,6 +56,7 @@ type config struct {
 
 	reconcileInterval time.Duration
 	maxConcurrent     int
+	pullWorkers       int
 	verifyOnStart     bool
 }
 
@@ -74,6 +75,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
 	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous segment transfers")
+	fs.IntVar(&cfg.pullWorkers, "pull-workers", 4, "root only: maximum segments fetched from origins at once for pull-through")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -175,10 +177,16 @@ func run(args []string) error {
 		Sources:                source.New(nil, strings.TrimSpace(os.Getenv("HF_TOKEN"))),
 		Discoverer:             disc,
 		MaxConcurrentTransfers: cfg.maxConcurrent,
+		PullWorkers:            cfg.pullWorkers,
 		VerifyOnStart:          cfg.verifyOnStart,
 	})
 
 	srv := server.New(st, d)
+	if d.IsWANEligible() {
+		// A root fetches from the origin what a peer asks it for and it
+		// does not hold yet.
+		srv.SetPuller(d)
+	}
 	httpSrv := &http.Server{Addr: cfg.listen, Handler: srv}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

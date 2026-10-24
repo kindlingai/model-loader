@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +38,17 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "state could not be saved", http.StatusServiceUnavailable)
 		return
 	}
+	start, end, hasRange, err := parseRange(r.Header.Get("Range"), fm.Size)
+	if err != nil {
+		rangeNotSatisfiable(w, fm.Size)
+		return
+	}
+	checks, err := store.ParseChecks(r.Header.Get(HeaderRangeXXH64))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	state, err := s.store.LoadState(manifest)
 	if err != nil {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
@@ -44,15 +56,37 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	}
 	fileState := state.FileState(fm)
 
-	start, end, hasRange, err := parseRange(r.Header.Get("Range"), fm.Size)
-	if err != nil {
-		rangeNotSatisfiable(w, fm.Size)
-		return
+	// A root pulls what it does not hold from the origin, and checks a
+	// consumer's checksums before it serves a range it fetched from there.
+	if s.puller != nil && fm.Size > 0 && (len(checks) > 0 || !rangeIsReady(fileState.ReadyRanges(fm), start, end+1)) {
+		if err := s.puller.Pull(r.Context(), model, revision, relPath, start, end+1, checks); err != nil {
+			if errors.Is(err, ErrNotPullable) {
+				rangeNotSatisfiable(w, fm.Size)
+			} else {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+			}
+			return
+		}
+		if state, err = s.store.LoadState(manifest); err != nil {
+			http.Error(w, "state unavailable", http.StatusInternalServerError)
+			return
+		}
+		fileState = state.FileState(fm)
 	}
 
 	if !rangeIsReady(fileState.ReadyRanges(fm), start, end+1) {
 		rangeNotSatisfiable(w, fm.Size)
 		return
+	}
+	if !fm.Hashed() && fm.NumSegments() > 0 {
+		// Say what this node holds for the segment, so the requester can
+		// verify a segment the manifest has no hash for.
+		if i := fm.SegmentIndex(start); i == fm.SegmentIndex(end) {
+			if s0, e0 := fm.SegmentBounds(i); s0 == start && e0 == end+1 {
+				w.Header().Set(HeaderSegmentSHA256, fileState.SegmentHash(fm, i))
+				w.Header().Set(HeaderSegmentTrust, fileState.TrustOf(i))
+			}
+		}
 	}
 
 	f, err := os.Open(s.store.FilePath(model, revision, relPath))

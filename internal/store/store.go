@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
-	"time"
 )
 
 // Store is the local on-disk content store rooted at a directory:
@@ -87,11 +86,13 @@ func (s *Store) HasManifest(model, revision string) bool {
 // succeeds: what is on disk may still mark held bytes this node found bad,
 // and must not be served.
 func (s *Store) SaveState(rs *RevisionState) error {
-	rs.UpdatedAt = time.Now().UTC()
-	path := s.statePath(rs.Model, rs.Revision)
+	rs.saveMu.Lock()
+	defer rs.saveMu.Unlock()
+	snap := rs.snapshot()
+	path := s.statePath(snap.Model, snap.Revision)
 	err := os.MkdirAll(filepath.Dir(path), 0o755)
 	if err == nil {
-		err = marshalJSONAtomic(path, rs)
+		err = marshalJSONAtomic(path, snap)
 	}
 	s.unsavedMu.Lock()
 	defer s.unsavedMu.Unlock()
@@ -114,15 +115,15 @@ func (s *Store) StateSaved(model, revision string) bool {
 // LoadState reads previously saved revision state, or returns fresh empty
 // state derived from the manifest if none has been saved yet.
 func (s *Store) LoadState(m *Manifest) (*RevisionState, error) {
-	var rs RevisionState
-	err := unmarshalJSONFile(s.statePath(m.Model, m.Revision), &rs)
+	rs := &RevisionState{}
+	err := unmarshalJSONFile(s.statePath(m.Model, m.Revision), rs)
 	if os.IsNotExist(err) {
 		return NewRevisionState(m), nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &rs, nil
+	return rs, nil
 }
 
 // EnsureFile makes sure the destination file for fm exists (creating parent
@@ -204,13 +205,14 @@ func openRegular(path string) (*os.File, error) {
 	return f, nil
 }
 
-// Reverify hashes every segment rs records as done against m, and marks
-// any that no longer match (or whose file is gone or cannot be opened) as
-// not done, along with its file's completeness, so the next fetch gets it
-// again. A file that is not exactly its manifest size is put back to that
-// size and is no longer complete, so it is checked whole again once every
-// segment is held. It saves rs, even when it fails part way, so nothing it
-// found bad stays marked held, and returns how many segments it dropped.
+// Reverify hashes every segment rs records as done against the sha256 it
+// must match (see FileState.SegmentHash), and marks any that no longer
+// match (or whose file is gone or cannot be opened) as not done, along
+// with its file's completeness, so the next fetch gets it again. A file
+// that is not exactly its manifest size is put back to that size and is no
+// longer complete, so it is checked whole again once every segment is
+// held. It saves rs, even when it fails part way, so nothing it found bad
+// stays marked held, and returns how many segments it dropped.
 func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 	dropped := 0
 	var errs []error
@@ -232,7 +234,7 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 		}
 		if f != nil {
 			if info, err := f.Stat(); err != nil || info.Size() != fm.Size {
-				fs.Complete = false
+				rs.update(fm, func(fs *FileState) { fs.Complete = false })
 				if err == nil {
 					if err := f.Truncate(fm.Size); err != nil {
 						errs = append(errs, fmt.Errorf("%s: restore size: %w", fm.Path, err))
@@ -241,31 +243,25 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 			}
 		}
 		for i, done := range fs.SegmentsDone {
-			if !done {
+			if !done || i >= fm.NumSegments() {
 				continue
 			}
 			ok := false
-			if f != nil {
-				if ok, err = VerifySegment(f, fm, i); err != nil {
-					ok = false // a short file: the segment is gone.
-				}
+			if want := fs.SegmentHash(fm, i); f != nil && want != "" {
+				sum, err := HashSegment(f, fm, i)
+				ok = err == nil && sum == want // an error is a short file: the segment is gone.
 			}
 			if !ok {
-				fs.SegmentsDone[i], fs.Complete = false, false
+				rs.DropSegment(fm, i)
 				dropped++
 			}
 		}
-		if f != nil && fs.Complete && fm.NumSegments() == 0 {
-			if ok, err := VerifyWholeFile(f, fm); err != nil || !ok {
-				fs.Complete = false
-			}
+		if fs.Complete && (f == nil || (fm.NumSegments() == 0 && !wholeFileOK(f, fm))) {
+			rs.update(fm, func(fs *FileState) { fs.Complete = false })
 		}
-		if f == nil {
-			fs.Complete = false
-		} else {
+		if f != nil {
 			f.Close()
 		}
-		rs.SetFileState(fs)
 	}
 	if err := s.SaveState(rs); err != nil {
 		errs = append(errs, err)
@@ -273,11 +269,34 @@ func (s *Store) Reverify(m *Manifest, rs *RevisionState) (int, error) {
 	return dropped, errors.Join(errs...)
 }
 
+func wholeFileOK(f *os.File, fm FileManifest) bool {
+	ok, err := VerifyWholeFile(f, fm)
+	return err == nil && ok
+}
+
+// HashSegment returns the sha256 of segment i of fm as it is on disk,
+// dropping its pages from page cache afterwards.
+func HashSegment(f *os.File, fm FileManifest, i int) (string, error) {
+	start, end := fm.SegmentBounds(i)
+	h := sha256.New()
+	if err := hashUncached(f, start, end-start, h); err != nil {
+		return "", fmt.Errorf("%s segment %d: %w", fm.Path, i, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // VerifyWholeFile reports whether the file is exactly fm.Size bytes and
 // matches the manifest's whole-file hash. It is the final authority on
 // correctness, used once every segment is believed done. Pages are dropped
 // from page cache chunk by chunk as they are hashed.
 func VerifyWholeFile(f *os.File, fm FileManifest) (bool, error) {
+	if fm.SHA256 == "" && !fm.Hashed() {
+		// A file the origin gave no digest for, held without segment
+		// hashes: every segment was checked as it landed, and there is
+		// nothing more to check it against.
+		info, err := f.Stat()
+		return err == nil && info.Size() == fm.Size, err
+	}
 	info, err := f.Stat()
 	if err != nil {
 		return false, err

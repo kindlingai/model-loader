@@ -62,8 +62,9 @@ partially). 404 if this node has never started it — ask a different peer.
 ## `GET /segments/{model}/{revision}`
 
 Which segments of each file this node holds, verified, as half-open ranges
-of segment indices. A file it holds nothing of is left out. 404 if this
-node has no manifest for the revision.
+of segment indices. A file it holds nothing of is left out, and a revision
+it has no manifest for answers with no files. A 404 means a node too old to
+have this endpoint; a fetching node treats what it holds as unknown.
 
 ```json
 {

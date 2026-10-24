@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -78,13 +77,10 @@ func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, peers []disc
 			defer wg.Done()
 			qctx, cancel := context.WithTimeout(ctx, availabilityTimeout)
 			defer cancel()
-			resp, err := d.cfg.Peers.Segments(qctx, p.Addr, m.Name, m.Revision)
-			switch {
-			case err == nil:
+			// On any error (an older peer, a timeout) avail[k] stays nil:
+			// unknown, which ranks it behind every holder.
+			if resp, err := d.cfg.Peers.Segments(qctx, p.Addr, m.Name, m.Revision); err == nil {
 				s.avail[k] = resp
-			case errors.Is(err, transfer.ErrRangeUnavailable):
-				// No manifest there: it holds nothing of m.
-				s.avail[k] = &server.SegmentsResponse{Files: map[string]server.FileSegments{}}
 			}
 		}()
 	}

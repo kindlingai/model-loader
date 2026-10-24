@@ -104,6 +104,9 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	}
 	defer f.Close()
 
+	if opts.Slots != nil && cap(opts.Slots) == 0 {
+		opts.Slots = nil // an unbuffered channel would block every send.
+	}
 	order := opts.Order
 	if order == nil {
 		all := make([]int, len(fetchers))

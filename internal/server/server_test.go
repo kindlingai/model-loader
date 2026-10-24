@@ -318,7 +318,8 @@ func TestHandleSegments(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/segments/m/nope", nil))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("unknown revision: status = %d, want 404", rec.Code)
+	resp = SegmentsResponse{}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); rec.Code != http.StatusOK || err != nil || len(resp.Files) != 0 {
+		t.Fatalf("unknown revision: status = %d, %+v, %v; want 200 with no files (404 means an older node)", rec.Code, resp, err)
 	}
 }

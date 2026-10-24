@@ -6,7 +6,8 @@ import (
 
 // SegmentsResponse is the body of GET /segments/{model}/{revision}: which
 // segments of each file this node holds, verified. A file the node holds
-// nothing of is left out.
+// nothing of is left out, and a revision it has no manifest for has no
+// files.
 type SegmentsResponse struct {
 	Model    string `json:"model"`
 	Revision string `json:"revision"`
@@ -62,9 +63,12 @@ func HeldRanges(done []bool) [][2]int {
 
 func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	model, revision := r.PathValue("model"), r.PathValue("revision")
+	resp := SegmentsResponse{Model: model, Revision: revision, Roles: s.status.Status().Roles, Files: map[string]FileSegments{}}
 	m, err := s.store.LoadManifest(model, revision)
 	if err != nil {
-		http.NotFound(w, r)
+		// No manifest: this node holds nothing of it. That is an answer,
+		// not a 404, so a 404 means only "too old to have /segments".
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 	rs, err := s.store.LoadState(m)
@@ -72,10 +76,12 @@ func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
 		return
 	}
-	resp := SegmentsResponse{Model: model, Revision: revision, Roles: s.status.Status().Roles, Files: map[string]FileSegments{}}
 	for _, fm := range m.Files {
-		fs := rs.FileState(fm)
-		held := HeldRanges(fs.SegmentsDone)
+		done := rs.FileState(fm).SegmentsDone
+		if len(done) > fm.NumSegments() {
+			done = done[:fm.NumSegments()] // stale state; see transfer.FetchFile.
+		}
+		held := HeldRanges(done)
 		if len(held) == 0 {
 			continue
 		}

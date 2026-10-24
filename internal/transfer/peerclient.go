@@ -93,8 +93,12 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	return &m, nil
 }
 
+// ErrNoSegments means a peer predates GET /segments, so what it holds is
+// unknown.
+var ErrNoSegments = errors.New("peer does not report segments")
+
 // Segments fetches which segments of model/revision a peer holds. It
-// returns ErrRangeUnavailable if the peer has no manifest for it (404).
+// returns ErrNoSegments if the peer is too old to answer (404).
 func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string) (*server.SegmentsResponse, error) {
 	u := fmt.Sprintf("http://%s/segments/%s/%s", addr, url.PathEscape(model), url.PathEscape(revision))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -107,7 +111,7 @@ func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrRangeUnavailable
+		return nil, ErrNoSegments
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("peer %s: segments: %s", addr, resp.Status)

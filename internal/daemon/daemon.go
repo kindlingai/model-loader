@@ -23,7 +23,8 @@ import (
 	"github.com/kindlingai/model-loader/internal/want"
 )
 
-// defaultMaxConcurrentTransfers caps simultaneous file downloads per node.
+// defaultMaxConcurrentTransfers caps simultaneous segment transfers per
+// node.
 // home-ops hit real OOMs at 4 concurrent Hugging Face downloads; 2 is a safe
 // default for a box that may also be serving an LLM workload.
 const defaultMaxConcurrentTransfers = 2
@@ -58,8 +59,8 @@ type Config struct {
 	// wrapping http.DefaultClient.
 	Peers *transfer.PeerClient
 
-	// MaxConcurrentTransfers bounds simultaneous file downloads across all
-	// models. Defaults to defaultMaxConcurrentTransfers.
+	// MaxConcurrentTransfers bounds simultaneous segment transfers across
+	// all files and models. Defaults to defaultMaxConcurrentTransfers.
 	MaxConcurrentTransfers int
 
 	// StallTimeout bounds how long a download from a model's origin may go

@@ -5,8 +5,9 @@
 # Flags are passed through a shell wrapper rather than the binary reading
 # the environment itself, so the same catalog.yaml and binary work unchanged
 # across the k8s, compose and spark-os deploy targets; only this unit's
-# env-to-flag mapping is spark-os's. The one exception is HF_TOKEN, which
-# the binary reads from its environment like huggingface_hub does. "$$"
+# env-to-flag mapping is spark-os's. The exceptions are the secrets HF_TOKEN
+# (as huggingface_hub reads it) and MODEL_LOADER_LOCAL_TOKEN, which the
+# binary reads from its environment to keep them out of argv. "$$"
 # passes a "$" through to the shell; with one, systemd would substitute the
 # variable itself and know no "${VAR:-default}", so every default would be
 # empty.

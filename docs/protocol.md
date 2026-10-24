@@ -164,15 +164,21 @@ A local consumer (gr8) tells model-loader which pieces it needs with a
 named request. The API is served apart from the LAN API, on
 `-local-listen`: by default the unix socket `model-loader.sock` in the
 store directory; `host:port` serves it over TCP instead, and an empty value
-turns it off. It has no authentication: anything that can reach it can pin
-and release pieces, so keep it on the socket or on localhost. The socket is
+turns it off. Anything that can reach it can pin and release pieces. On
+the socket, filesystem permissions are the boundary. Over TCP it needs a
+token: model-loader will not serve `host:port` unless
+`MODEL_LOADER_LOCAL_TOKEN` is set in its environment, and then answers 401
+to every request without `Authorization: Bearer <token>`, on the socket
+too. The token authenticates the consumer; it does not encrypt. Plain HTTP
+is fine on the box or a link you trust, as the weights never cross this
+API: the consumer reads them from the store. The socket is
 mode 0660: its owner and group may use it. model-loader holds a lock on
 `PATH.lock` while it serves the socket, and will not start on a socket
 path whose lock another process holds, that is not a socket, or that
 another process answers on.
 
 `model-loader -check ADDR` (ADDR as `-local-listen` takes it) sends
-`GET /requests` to the local API and exits 0 if it answers 200, 1 if not,
+`GET /requests` to the local API, with `MODEL_LOADER_LOCAL_TOKEN` if set, and exits 0 if it answers 200, 1 if not,
 within 3 s. Health checks, and consumers waiting for model-loader to start,
 use it.
 

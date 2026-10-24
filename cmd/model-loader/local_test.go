@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/kindlingai/model-loader/internal/server"
 )
 
 func TestListenLocal(t *testing.T) {
@@ -157,5 +159,35 @@ func TestCheckFlag(t *testing.T) {
 	ts.Close()
 	if err := run([]string{"-check", addr}); err == nil || !strings.Contains(err.Error(), "check "+addr) {
 		t.Fatalf("run -check with nothing listening: %v, want a check error", err)
+	}
+}
+
+// A TCP local API needs a token, and then answers only requests that
+// carry it; -check sends it.
+func TestLocalToken(t *testing.T) {
+	t.Setenv(localTokenEnv, "")
+	args := []string{"-mode=both", "-catalog=/tmp/catalog.yaml", "-local-listen=127.0.0.1:0"}
+	if _, err := parseFlags(args); err == nil || !strings.Contains(err.Error(), localTokenEnv) {
+		t.Fatalf("TCP -local-listen with no token: %v, want an error naming %s", err, localTokenEnv)
+	}
+	if _, err := parseFlags(append(args, "-local-listen=unix:s.sock")); err != nil {
+		t.Fatalf("unix -local-listen with no token: %v", err)
+	}
+	t.Setenv(localTokenEnv, "s3cret")
+	if _, err := parseFlags(args); err != nil {
+		t.Fatalf("TCP -local-listen with a token: %v", err)
+	}
+
+	ts := httptest.NewServer(server.WithToken(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), "s3cret"))
+	defer ts.Close()
+	addr := strings.TrimPrefix(ts.URL, "http://")
+	if err := checkLocal(addr, ""); err != nil {
+		t.Fatalf("check with the token: %v", err)
+	}
+	for _, tok := range []string{"", "wrong", "s3cret2"} {
+		t.Setenv(localTokenEnv, tok)
+		if err := checkLocal(addr, ""); err == nil || !strings.Contains(err.Error(), "401") {
+			t.Fatalf("check with token %q: %v, want 401", tok, err)
+		}
 	}
 }

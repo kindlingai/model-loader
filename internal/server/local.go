@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -137,4 +138,21 @@ func NewLocal(reqs Requests) http.Handler {
 		}
 	})
 	return mux
+}
+
+// WithToken returns h, answering 401 to any request that does not carry
+// "Authorization: Bearer token". An empty token returns h as it is.
+func WithToken(h http.Handler, token string) http.Handler {
+	if token == "" {
+		return h
+	}
+	want := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }

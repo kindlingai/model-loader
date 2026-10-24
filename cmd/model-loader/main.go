@@ -90,7 +90,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.IntVar(&cfg.pullWorkers, "pull-workers", 4, "root only: maximum segments fetched from origins at once for pull-through")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
 	fs.StringVar(&cfg.diskBudget, "disk-budget", "", "most the store may hold, as bytes (500G, 2T) or a percentage of its filesystem (80%); fetches evict unwanted segments the fleet keeps copies of to stay under it. Empty: no budget, nothing evicted")
-	fs.StringVar(&cfg.localListen, "local-listen", "unix:model-loader.sock", "where to serve the local request API: unix:PATH (relative to -store) or host:port; empty to turn it off")
+	fs.StringVar(&cfg.localListen, "local-listen", "unix:model-loader.sock", "where to serve the local request API: unix:PATH (relative to -store) or host:port (needs $MODEL_LOADER_LOCAL_TOKEN); empty to turn it off")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	fs.StringVar(&cfg.check, "check", "", "check that the local request API at unix:PATH (relative to -store) or host:port answers, exit 0 if it does, and exit; for health checks and for a consumer to wait on")
 	if err := fs.Parse(args); err != nil {
@@ -116,6 +116,10 @@ func parseFlags(args []string) (*config, error) {
 		if _, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
 			errs = append(errs, fmt.Errorf("-mentat-url, -mentat-port: %w", err))
 		}
+	}
+	if cfg.localListen != "" && !strings.HasPrefix(cfg.localListen, "unix:") && localToken() == "" {
+		// Anything that reaches the port could pin and release pieces.
+		errs = append(errs, fmt.Errorf("-local-listen %s: a TCP local API needs %s set", cfg.localListen, localTokenEnv))
 	}
 	if cfg.discoveryKind == "k8s" && cfg.k8sService == "" {
 		errs = append(errs, errors.New("-k8s-service is required when -discovery=k8s"))
@@ -251,7 +255,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		localSrv := &http.Server{Handler: server.NewLocal(d)}
+		localSrv := &http.Server{Handler: server.WithToken(server.NewLocal(d), localToken())}
 		defer localSrv.Close()
 		go func() {
 			log.Printf("model-loader: local request API on %s", ln.Addr())
@@ -390,15 +394,22 @@ func staticPeers(list string) (discovery.Discoverer, error) {
 	return discovery.NewStatic(addrs), nil
 }
 
+// localTokenEnv names the environment variable holding the local API's
+// token. It is read from the environment, like HF_TOKEN, to keep it out of
+// argv. Unset: the local API has no authentication.
+const localTokenEnv = "MODEL_LOADER_LOCAL_TOKEN"
+
+func localToken() string { return strings.TrimSpace(os.Getenv(localTokenEnv)) }
+
 // checkTimeout bounds -check, so a wedged daemon fails a health check
 // rather than hanging it.
 const checkTimeout = 3 * time.Second
 
 // checkLocal asks the local request API at addr (as -local-listen takes
 // it, a relative unix path being under storeDir) for its request list,
-// and returns nil if it answers 200. It proves more than a TCP check of
-// -listen can: that the socket a consumer uses is there, is not stale,
-// and is served.
+// with the token if one is set, and returns nil if it answers 200. It
+// proves more than a TCP check of -listen can: that the socket a consumer
+// uses is there, is not stale, and is served.
 func checkLocal(addr, storeDir string) error {
 	network, target := "tcp", addr
 	if path, ok := strings.CutPrefix(addr, "unix:"); ok {
@@ -415,7 +426,14 @@ func checkLocal(addr, storeDir string) error {
 			},
 		},
 	}
-	resp, err := client.Get("http://local/requests")
+	req, err := http.NewRequest(http.MethodGet, "http://local/requests", nil)
+	if err != nil {
+		return err
+	}
+	if token := localToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("check %s: %w", addr, err)
 	}

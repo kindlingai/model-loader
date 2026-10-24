@@ -42,7 +42,10 @@ type FileManifest struct {
 // zero-length file has none: there is nothing to fetch or verify per segment,
 // only the whole-file hash of the empty content.
 func (f FileManifest) NumSegments() int {
-	return len(f.SegmentSHA256)
+	if f.SegmentSize <= 0 || f.Size <= 0 {
+		return len(f.SegmentSHA256)
+	}
+	return int(1 + (f.Size-1)/f.SegmentSize) // no overflow near MaxInt64
 }
 
 // SegmentBounds returns the byte range [start, end) of segment i.
@@ -56,9 +59,6 @@ func (f FileManifest) SegmentBounds(i int) (start, end int64) {
 		return f.Size, f.Size // past the end: no bytes, never an overflow
 	}
 	end = start + min(size, f.Size-start)
-	if len(f.SegmentSHA256) == 0 {
-		end = f.Size
-	}
 	return start, end
 }
 
@@ -100,13 +100,31 @@ func (m *Manifest) Validate() error {
 			if f.SegmentSize <= 0 {
 				return fmt.Errorf("manifest %s@%s: %s: no segment size", m.Model, m.Revision, f.Path)
 			}
-			want = int(1 + (f.Size-1)/f.SegmentSize) // no overflow near MaxInt64
+			want = f.NumSegments()
+			if want > maxSegmentsPerFile {
+				return fmt.Errorf("manifest %s@%s: %s: %d segments, more than %d", m.Model, m.Revision, f.Path, want, maxSegmentsPerFile)
+			}
 		}
-		if len(f.SegmentSHA256) != want {
+		// No segment hashes at all is a root's manifest for a file it does
+		// not hold whole yet (see Hashed).
+		if len(f.SegmentSHA256) != want && len(f.SegmentSHA256) != 0 {
 			return fmt.Errorf("manifest %s@%s: %s: %d segment hashes, want %d", m.Model, m.Revision, f.Path, len(f.SegmentSHA256), want)
 		}
 	}
 	return nil
+}
+
+// maxSegmentsPerFile bounds a file's segments, so a manifest from another
+// node cannot make this one allocate per-segment state without bound. At
+// 64 MiB segments it is 1 PiB per file.
+const maxSegmentsPerFile = 1 << 24
+
+// Hashed reports whether f lists a sha256 for every segment. A root
+// publishes a manifest before it holds a file whole only for pull-through
+// (see docs/design.md); that file has no segment hashes, and a node checks
+// each segment against the sha256 the root recorded when it fetched it.
+func (f FileManifest) Hashed() bool {
+	return len(f.SegmentSHA256) == f.NumSegments()
 }
 
 // TotalSize sums every file's size.

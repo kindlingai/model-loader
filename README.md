@@ -65,6 +65,7 @@ internal/store/     local content store, manifests, integrity
 internal/source/    download sources (http, huggingface)
 internal/transfer/  resumable range-fetch engine
 internal/want/      what a node must hold: selection to needed segments
+internal/xxh64/     XXH64 (seed 0), for consumer range checksums
 internal/discovery/ peer discovery backends (static, k8s DNS)
 internal/server/    LAN-facing HTTP server (status/manifest/blob)
 internal/daemon/    reconcile loop tying it together

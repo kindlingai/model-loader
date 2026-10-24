@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -71,6 +72,15 @@ type Config struct {
 	// this process reconciles it, and fetches again any that no longer
 	// match the manifest.
 	VerifyOnStart bool
+
+	// PullWorkers bounds how many segments a root fetches from origins at
+	// once for pull-through. Defaults to defaultPullWorkers.
+	PullWorkers int
+
+	// SegmentSize is the segment size of manifests a root publishes for
+	// pull-through. Defaults to store.DefaultSegmentSize; tests set it
+	// small.
+	SegmentSize int64
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -83,6 +93,14 @@ type Daemon struct {
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
 	verified map[string]bool
+
+	stateMu sync.Mutex
+	states  map[string]*store.RevisionState // see revState
+
+	pullMu    sync.Mutex
+	pulls     map[string]*pullCall // see once
+	pullSrcs  map[string]cachedSources
+	pullSlots chan struct{}
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -96,12 +114,19 @@ func New(cfg Config) *Daemon {
 	if cfg.StallTimeout <= 0 {
 		cfg.StallTimeout = defaultStallTimeout
 	}
+	if cfg.PullWorkers <= 0 {
+		cfg.PullWorkers = defaultPullWorkers
+	}
 	return &Daemon{
 		cfg:        cfg,
 		sem:        make(chan struct{}, cfg.MaxConcurrentTransfers),
 		availSlots: make(chan struct{}, availabilityQueries),
 		statuses:   make(map[string]server.ModelStatus),
 		verified:   make(map[string]bool),
+		states:     make(map[string]*store.RevisionState),
+		pulls:      make(map[string]*pullCall),
+		pullSrcs:   make(map[string]cachedSources),
+		pullSlots:  make(chan struct{}, cfg.PullWorkers),
 	}
 }
 
@@ -273,7 +298,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	m := w.Model
 	manifest, err := d.cfg.Store.LoadManifest(m.Name, m.Revision)
 	if err != nil {
-		manifest, err = d.acquireManifest(ctx, m)
+		manifest, err = d.acquireManifest(ctx, w)
 		if err != nil {
 			ms := server.ModelStatus{
 				Model: m.Name, Revision: m.Revision, State: server.StatePending,
@@ -296,7 +321,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		return err
 	}
 
-	rs, err := d.cfg.Store.LoadState(manifest)
+	rs, err := d.revState(manifest)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
@@ -310,6 +335,12 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			log.Printf("model-loader: %s@%s: re-verify dropped %d segments that no longer match the manifest", m.Name, m.Revision, dropped)
 		}
 	}
+	// A consumer checksum given after its range was fetched is checked
+	// against the held bytes now; one that fails drops what it covers, so
+	// the need is no longer satisfied and that is fetched again.
+	if err := d.applyPendingChecks(manifest, need, rs); err != nil {
+		log.Printf("model-loader: %s@%s: %v", m.Name, m.Revision, err)
+	}
 	if rs.Complete() || need.Satisfied(manifest, rs) {
 		d.setStatus(progress(w, manifest, need, rs, server.StateReady))
 		return nil
@@ -317,20 +348,32 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 
 	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
 
-	peers, err := d.cfg.Discoverer.Peers(ctx)
-	if err != nil {
-		peers = nil // a discovery hiccup shouldn't block falling back to WAN.
+	// A root holding a manifest it published for pull-through fetches what
+	// it needs itself the same way it does for a peer: from the origin, one
+	// fetch per segment however many ask.
+	pull := d.IsWANEligible() && lazy(manifest)
+	var srcs *sources
+	if !pull {
+		peers, err := d.cfg.Discoverer.Peers(ctx)
+		if err != nil {
+			peers = nil // a discovery hiccup shouldn't block falling back to WAN.
+		}
+		srcs = d.buildSources(ctx, m, manifest, peers)
 	}
-	srcs := d.buildSources(ctx, m, manifest, peers)
 
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
 			continue
 		}
-		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
-			Need: fn.Segments, Order: srcs.order(fm.Path), Slots: d.sem,
-		})
+		var err error
+		if pull {
+			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
+		} else {
+			err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
+				Need: fn.Segments, Order: srcs.order(fm.Path), Slots: d.sem, Checks: fn.Checks,
+			})
+		}
 		if err != nil {
 			ms := progress(w, manifest, need, rs, server.StateError)
 			ms.Error = err.Error()
@@ -355,4 +398,40 @@ func (d *Daemon) markVisited(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.verified[key] = true
+}
+
+// applyPendingChecks checks every consumer checksum in need that covers
+// only held segments and has not matched before, and saves rs.
+func (d *Daemon) applyPendingChecks(m *store.Manifest, need *want.Need, rs *store.RevisionState) error {
+	var errs []error
+	changed := false
+	for _, fm := range m.Files {
+		fn := need.Files[fm.Path]
+		if fn == nil || len(transfer.PendingChecks(fm, rs, fn.Checks)) == 0 {
+			continue
+		}
+		changed = true
+		f, err := os.Open(d.cfg.Store.FilePath(m.Model, m.Revision, fm.Path))
+		if err != nil {
+			// The file is gone: nothing the checks cover is held.
+			for _, c := range transfer.PendingChecks(fm, rs, fn.Checks) {
+				first, last := c.Segments(fm)
+				for i := first; i <= last; i++ {
+					rs.DropSegment(fm, i)
+				}
+			}
+			errs = append(errs, err)
+			continue
+		}
+		if err := transfer.ApplyChecks(f, fm, rs, fn.Checks); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", fm.Path, err))
+		}
+		f.Close()
+	}
+	if changed {
+		if err := d.cfg.Store.SaveState(rs); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }

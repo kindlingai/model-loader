@@ -307,13 +307,17 @@ func TestManifestValidate(t *testing.T) {
 	}
 }
 
-// Sizes near MaxInt64 must not overflow the segment count into a manifest
-// that passes Validate with no segments.
+// Sizes near MaxInt64 must not overflow the segment count, and a file may
+// not have so many segments that per-segment state has no bound.
 func TestManifestValidateOverflow(t *testing.T) {
 	const max = int64(^uint64(0) >> 1)
 	m := &Manifest{Files: []FileManifest{{Path: "a", Size: max, SegmentSize: max}}}
+	if err := m.Validate(); err != nil || m.Files[0].NumSegments() != 1 {
+		t.Fatalf("Validate = %v, NumSegments = %d; want one segment", err, m.Files[0].NumSegments())
+	}
+	m = &Manifest{Files: []FileManifest{{Path: "a", Size: max, SegmentSize: 1}}}
 	if err := m.Validate(); err == nil {
-		t.Fatal("Validate = nil for a huge file with no segment hashes")
+		t.Fatal("Validate = nil for a file with MaxInt64 segments")
 	}
 }
 
@@ -473,4 +477,15 @@ func TestStateSaved(t *testing.T) {
 		t.Fatal("StateSaved = false after a good save")
 	}
 	_ = m
+}
+
+// A segment of a hashless file keeps its sha256 whatever its trust, so a
+// copier or a re-verify can check it.
+func TestMarkSegmentKeepsHashForManifestTrust(t *testing.T) {
+	fm := FileManifest{Path: "a", Size: 20, SegmentSize: 10}
+	rs := NewRevisionState(&Manifest{Files: []FileManifest{fm}})
+	rs.MarkSegment(fm, 1, "abc", TrustManifest)
+	if got := rs.FileState(fm).SegmentHash(fm, 1); got != "abc" {
+		t.Fatalf("SegmentHash = %q, want abc", got)
+	}
 }

@@ -70,6 +70,8 @@ type FileNeed struct {
 	// Segments[i] is true when segment i is needed. Every segment is
 	// needed when Whole.
 	Segments []bool
+	// Checks are the consumer's checksums for ranges of the file.
+	Checks []store.RangeCheck
 }
 
 // Resolve works out which segments of which files w needs, from manifest
@@ -110,6 +112,13 @@ func Resolve(m *store.Manifest, w Want) (*Need, error) {
 				}
 				for i := first; i <= last; i++ {
 					fn.Segments[i] = true
+				}
+				if r.XXH64 != "" {
+					sum, err := r.Checksum()
+					if err != nil {
+						return nil, fmt.Errorf("%s: %s: %w", Key(m.Model, m.Revision), fm.Path, err)
+					}
+					fn.Checks = append(fn.Checks, store.RangeCheck{Offset: r.Offset, Length: r.Length, XXH64: sum})
 				}
 			}
 		}

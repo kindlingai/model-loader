@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"github.com/kindlingai/model-loader/internal/xxh64"
 	"io"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -554,4 +556,61 @@ func openFDs(t *testing.T) int {
 		}
 	}
 	return n
+}
+
+// A file whose segments match the manifest's segment hashes but whose
+// whole sha256 does not is not served, and is not hashed again each pass.
+func TestFinishFileWholeFailedNotServed(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("f"), 20)
+	fm := buildManifestFile("w.bin", content, 10)
+	fm.SHA256 = strings.Repeat("0", 64)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	src := &fakeFetcher{content: content, ready: 20}
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{src}, Options{}); err == nil {
+		t.Fatal("FetchFile = nil with a contradictory whole-file sha256")
+	}
+	fs := rs.FileState(fm)
+	if !fs.WholeFailed || len(fs.ReadyRanges(fm)) != 0 {
+		t.Fatalf("state %+v: ready ranges %v, want none", fs, fs.ReadyRanges(fm))
+	}
+	src.calls = 0
+	if err := FetchFile(context.Background(), st, "m", "r1", fm, rs, []Fetcher{src}, Options{}); err == nil || src.calls != 0 {
+		t.Fatalf("second FetchFile = %v after %d calls, want the same failure and no fetch", err, src.calls)
+	}
+}
+
+// A check that drops a segment is seen by the next check of the same
+// segment: the second cannot pass on the bytes the first threw away.
+func TestApplyChecksSeesEarlierDrop(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := []byte("xxbb")
+	fm := store.FileManifest{Path: "w.bin", Size: 4, SegmentSize: 4}
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	rs := store.NewRevisionState(m)
+	f, err := st.EnsureFile("m", "r1", fm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.WriteAt(held, 0)
+	sum := sha256.Sum256(held)
+	rs.MarkSegment(fm, 0, hex.EncodeToString(sum[:]), store.TrustOrigin)
+	checks := []store.RangeCheck{
+		{Offset: 0, Length: 2, XXH64: xxh64.Sum64([]byte("aa"))},
+		{Offset: 2, Length: 2, XXH64: xxh64.Sum64([]byte("bb"))},
+	}
+	if err := ApplyChecks(f, fm, rs, checks); err == nil {
+		t.Fatal("ApplyChecks = nil with a bad range")
+	}
+	if fs := rs.FileState(fm); fs.HasChecked(checks[1]) {
+		t.Fatal("the second check was recorded against dropped bytes")
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
+	"github.com/kindlingai/model-loader/internal/xxh64"
 )
 
 // Fetcher opens a byte range of one file. length <= 0 means to EOF.
@@ -28,9 +29,23 @@ type WANFetcher struct {
 	Model  catalog.Model
 }
 
+// Open reads from the model's origin. What it returns claims
+// store.TrustOrigin (see Claimer).
 func (w WANFetcher) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
-	return w.Source.Open(ctx, w.Model, path, offset, length)
+	rc, err := w.Source.Open(ctx, w.Model, path, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	return claimed{rc, "", store.TrustOrigin}, nil
 }
+
+// claimed is a reader with a source's claim about the segment it reads.
+type claimed struct {
+	io.ReadCloser
+	sum, trust string
+}
+
+func (c claimed) Claim() (string, string) { return c.sum, c.trust }
 
 // PeerFetcher adapts a PeerClient bound to one peer address and
 // model/revision to the Fetcher interface.
@@ -41,7 +56,13 @@ type PeerFetcher struct {
 }
 
 func (p PeerFetcher) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
-	return p.Client.OpenBlob(ctx, p.Addr, p.Model, p.Revision, path, offset, length)
+	return p.Client.OpenBlob(ctx, p.Addr, p.Model, p.Revision, path, offset, length, nil)
+}
+
+// OpenChecked asks the peer for the range, passing checks for it to verify
+// first (a root fetching the range from its origin does).
+func (p PeerFetcher) OpenChecked(ctx context.Context, path string, offset, length int64, checks []store.RangeCheck) (io.ReadCloser, error) {
+	return p.Client.OpenBlob(ctx, p.Addr, p.Model, p.Revision, path, offset, length, checks)
 }
 
 // Options tunes FetchFile. The zero value fetches every segment, trying
@@ -58,41 +79,56 @@ type Options struct {
 	// capacity is also how many segments of this file are fetched at once,
 	// so different segments can come from different sources in parallel.
 	Slots chan struct{}
+	// Checks are a consumer's checksums for ranges of the file. Each is
+	// checked once every segment it covers is held, unless all of them
+	// were verified against the manifest; one that fails drops the
+	// segments it covers. A source that takes checks (see CheckedFetcher)
+	// is given those inside the segment it is asked for.
+	Checks []store.RangeCheck
+}
+
+// Claimer is implemented by a reader whose source vouches for a segment:
+// the sha256 it holds for it and how it verified it (a store.Trust
+// constant). A source that fetched it from the model's origin itself
+// claims "" and store.TrustOrigin.
+type Claimer interface {
+	Claim() (sha256, trust string)
+}
+
+// CheckedFetcher is a Fetcher that can pass a consumer's checksums for
+// ranges inside the requested one on to its source, so the source checks
+// them before it answers.
+type CheckedFetcher interface {
+	OpenChecked(ctx context.Context, path string, offset, length int64, checks []store.RangeCheck) (io.ReadCloser, error)
 }
 
 // FetchFile downloads the not-yet-done segments of fm that opts.Need marks
 // into the store. For each segment it tries the fetchers opts.Order names,
 // falling back to the next one when a fetcher doesn't have it yet or
-// fails. Each segment is verified against the manifest as soon as it
-// lands. Once every segment of the file is done, needed or not, the whole
-// file is verified once more and marked complete; until then the file is
-// partial, a sparse file with every held segment at its own offset. rs is
-// mutated and persisted to st as progress is made, so a restart resumes
-// from the last saved segment rather than from scratch.
+// fails. Each segment is verified as soon as it lands: against the
+// manifest when fm has segment hashes, else against the sha256 its source
+// claims for it (see Claimer). Once every segment of the file is done,
+// needed or not, the whole file is verified once more and marked complete;
+// until then the file is partial, a sparse file with every held segment at
+// its own offset. rs is updated and persisted to st as progress is made,
+// so a restart resumes from the last saved segment rather than from
+// scratch. rs may be shared with other fetches into the same revision.
 func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm store.FileManifest, rs *store.RevisionState, fetchers []Fetcher, opts Options) error {
 	need := opts.Need
 	fileState := rs.FileState(fm)
 	if fileState.Complete {
 		return nil
 	}
-	if len(fileState.SegmentsDone) != fm.NumSegments() {
-		// State that does not match the manifest's segments: keep what
-		// lines up, and fetch the rest.
-		done := make([]bool, fm.NumSegments())
-		copy(done, fileState.SegmentsDone)
-		fileState.SegmentsDone = done
-	}
+	done := make([]bool, fm.NumSegments())
+	copy(done, fileState.SegmentsDone) // state from other segments: keep what lines up.
 	if need != nil && len(need) != fm.NumSegments() {
 		return fmt.Errorf("fetch %s: need has %d segments, manifest %d", fm.Path, len(need), fm.NumSegments())
 	}
 	var todo []int
-	for i, done := range fileState.SegmentsDone {
-		if !done && (need == nil || need[i]) {
+	for i, d := range done {
+		if !d && (need == nil || need[i]) {
 			todo = append(todo, i)
 		}
-	}
-	if len(todo) == 0 && !allDone(fileState.SegmentsDone) {
-		return nil // every needed segment is already held.
 	}
 	if len(todo) > 0 && len(fetchers) == 0 {
 		return fmt.Errorf("fetch %s: no sources available", fm.Path)
@@ -127,7 +163,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	workers = min(workers, max(1, len(todo)))
 
 	var (
-		mu       sync.Mutex // guards fileState, rs, dead and firstErr
+		mu       sync.Mutex // guards dead and firstErr
 		dead     = make([]bool, len(fetchers))
 		firstErr error
 		wg       sync.WaitGroup
@@ -154,8 +190,10 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 					}
 				}
 				f, err := openFile()
+				var sum, trust string
 				if err == nil {
-					err = fetchSegment(ctx, f, fm, i, fetchers, order(i), dead, &mu)
+					start, end := fm.SegmentBounds(i)
+					sum, trust, err = fetchSegment(ctx, f, fm, i, fetchers, order(i), checksOverlapping(opts.Checks, start, end), dead, &mu)
 					f.Close()
 				}
 				if opts.Slots != nil {
@@ -165,12 +203,8 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 					fail(fmt.Errorf("fetch %s segment %d: %w", fm.Path, i, err))
 					continue
 				}
-				mu.Lock()
-				fileState.SegmentsDone[i] = true
-				rs.SetFileState(fileState)
-				err = st.SaveState(rs)
-				mu.Unlock()
-				if err != nil {
+				rs.MarkSegment(fm, i, sum, trust)
+				if err := st.SaveState(rs); err != nil {
 					fail(fmt.Errorf("fetch %s: save state: %w", fm.Path, err))
 				}
 			}
@@ -193,20 +227,141 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if err := syncAndUncache(f); err != nil {
 		return fmt.Errorf("fetch %s: %w", fm.Path, err)
 	}
-	if !allDone(fileState.SegmentsDone) {
-		return nil // partial: the rest of the file is not needed.
+	err = ApplyChecks(f, fm, rs, opts.Checks)
+	if serr := st.SaveState(rs); err == nil && serr != nil {
+		err = serr
 	}
+	if err != nil {
+		return fmt.Errorf("fetch %s: %w", fm.Path, err)
+	}
+	return FinishFile(st, f, fm, rs)
+}
 
+// FinishFile verifies fm whole and marks it complete once every segment is
+// held. A file with segments still missing is left partial. If the whole
+// file fails its check, every segment not verified against manifest
+// segment hashes is dropped, so it is fetched again rather than served. If
+// segments the manifest verified are left, fetching them again cannot
+// change them; the file is marked WholeFailed and nothing of it is served.
+func FinishFile(st *store.Store, f *os.File, fm store.FileManifest, rs *store.RevisionState) error {
+	unlock := rs.LockFile(fm.Path)
+	defer unlock()
+	fs := rs.FileState(fm)
+	if fs.Complete || len(fs.SegmentsDone) != fm.NumSegments() || !allDone(fs.SegmentsDone) {
+		return nil
+	}
+	failed := fmt.Errorf("fetch %s: whole-file verification failed after every segment passed", fm.Path)
+	if fs.WholeFailed {
+		return failed // checked before; the bytes have not changed since.
+	}
 	ok, err := store.VerifyWholeFile(f, fm)
 	if err != nil {
 		return fmt.Errorf("fetch %s: verify whole file: %w", fm.Path, err)
 	}
 	if !ok {
-		return fmt.Errorf("fetch %s: whole-file verification failed after every segment passed", fm.Path)
+		for i := range fs.SegmentsDone {
+			if fs.TrustOf(i) != store.TrustManifest || !fm.Hashed() {
+				rs.DropSegment(fm, i)
+			}
+		}
+		rs.SetWholeFailed(fm)
+		_ = st.SaveState(rs)
+		return failed
 	}
-	fileState.Complete = true
-	rs.SetFileState(fileState)
+	if !rs.SetComplete(fm) {
+		return nil // a segment was dropped meanwhile; it is fetched again.
+	}
 	return st.SaveState(rs)
+}
+
+// pending reports whether ApplyChecks would check c now, given fs: every
+// segment it covers is held, not every one of those was verified against
+// the manifest, and it has not matched these bytes before.
+func pending(fm store.FileManifest, fs store.FileState, c store.RangeCheck) bool {
+	if fs.HasChecked(c) {
+		return false
+	}
+	first, last := c.Segments(fm)
+	manifest := true
+	for i := first; i <= last; i++ {
+		t := fs.TrustOf(i)
+		if t == "" {
+			return false
+		}
+		manifest = manifest && t == store.TrustManifest
+	}
+	return !manifest
+}
+
+// PendingChecks returns those of checks that ApplyChecks would check now.
+func PendingChecks(fm store.FileManifest, rs *store.RevisionState, checks []store.RangeCheck) []store.RangeCheck {
+	fs := rs.FileState(fm)
+	var out []store.RangeCheck
+	for _, c := range checks {
+		if pending(fm, fs, c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ApplyChecks checks each of checks that is pending against the held
+// bytes. When every segment a check covers was verified against the
+// manifest, the bytes are the origin's and a mismatch is the consumer's
+// mistake, so it is not checked. A range that matches is recorded, and its
+// segments' trust goes up to store.TrustRequester. One that does not (or
+// cannot be read, as in a file cut short) drops its segments that were not
+// verified against the manifest, so they are fetched again, and
+// ApplyChecks returns an error naming it. Each check is judged against the
+// state as it is then, so one check's drop is seen by the next. rs is not
+// saved.
+func ApplyChecks(f *os.File, fm store.FileManifest, rs *store.RevisionState, checks []store.RangeCheck) error {
+	unlock := rs.LockFile(fm.Path)
+	defer unlock()
+	var errs []error
+	for _, c := range checks {
+		if !pending(fm, rs.FileState(fm), c) {
+			continue
+		}
+		ok, err := store.CheckRange(f, c)
+		if err != nil {
+			ok = false
+		}
+		fs := rs.FileState(fm)
+		first, last := c.Segments(fm)
+		for i := first; i <= last; i++ {
+			switch {
+			case fs.TrustOf(i) == store.TrustManifest:
+			case ok:
+				rs.SetTrust(fm, i, store.TrustRequester)
+			default:
+				rs.DropSegment(fm, i)
+			}
+		}
+		switch {
+		case ok:
+			rs.AddChecked(fm, c)
+		case err != nil:
+			errs = append(errs, fmt.Errorf("range offset %d length %d: %w", c.Offset, c.Length, err))
+		default:
+			errs = append(errs, fmt.Errorf("range offset %d length %d does not match its xxh64 %s", c.Offset, c.Length, xxh64.Format(c.XXH64)))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// checksOverlapping returns the checks that share a byte with
+// [start, end). A source that takes checks fetches every segment they span
+// and checks them before it answers, so a check spanning segments is
+// verified at the root too.
+func checksOverlapping(checks []store.RangeCheck, start, end int64) []store.RangeCheck {
+	var out []store.RangeCheck
+	for _, c := range checks {
+		if c.Overlaps(start, end) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func allDone(segments []bool) bool {
@@ -236,18 +391,19 @@ func syncAndUncache(f *os.File) error {
 }
 
 // fetchSegment tries the fetchers order names, in turn, for segment i,
-// returning at the first success. A fetcher reporting ErrRangeUnavailable
-// is skipped for this segment only. One that fails outright (a peer that
-// went away mid-copy, a dropped connection, data that fails verification)
-// is marked in dead and skipped for the rest of the file, so the copy fails
-// over to the next peer or the root instead of failing, and doesn't wait on
-// a dead address again for every segment. mu guards dead.
+// returning at the first success the segment's sha256 and how it was
+// verified. A fetcher reporting ErrRangeUnavailable is skipped for this
+// segment only. One that fails outright (a peer that went away mid-copy, a
+// dropped connection, data that fails verification) is marked in dead and
+// skipped for the rest of the file, so the copy fails over to the next peer
+// or the root instead of failing, and doesn't wait on a dead address again
+// for every segment. mu guards dead.
 //
 // At most the segment's own bytes are written, so a source that sends too
 // much cannot overwrite a neighbouring segment another worker holds. The
 // segment is synced before it is verified, so verifying drops its pages
 // from page cache.
-func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, fetchers []Fetcher, order []int, dead []bool, mu *sync.Mutex) error {
+func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex) (string, string, error) {
 	start, end := fm.SegmentBounds(i)
 	length := end - start
 	isDead := func(k int) bool {
@@ -265,7 +421,13 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 		if k < 0 || k >= len(fetchers) || isDead(k) {
 			continue
 		}
-		rc, err := fetchers[k].Open(ctx, fm.Path, start, length)
+		var rc io.ReadCloser
+		var err error
+		if cf, ok := fetchers[k].(CheckedFetcher); ok && len(checks) > 0 {
+			rc, err = cf.OpenChecked(ctx, fm.Path, start, length, checks)
+		} else {
+			rc, err = fetchers[k].Open(ctx, fm.Path, start, length)
+		}
 		if errors.Is(err, ErrRangeUnavailable) {
 			lastErr = err
 			continue
@@ -274,6 +436,12 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 			kill(k)
 			lastErr = err
 			continue
+		}
+		var claimSum, claimTrust string
+		claimed := false
+		if c, ok := rc.(Claimer); ok {
+			claimSum, claimTrust = c.Claim()
+			claimed = true
 		}
 
 		// Write at most the segment's own bytes, so a source that sends
@@ -304,21 +472,43 @@ func fetchSegment(ctx context.Context, f *os.File, fm store.FileManifest, i int,
 		}
 
 		if err := f.Sync(); err != nil {
-			return fmt.Errorf("sync: %w", err)
+			return "", "", fmt.Errorf("sync: %w", err)
 		}
-		verified, err := store.VerifySegment(f, fm, i)
+		sum, err := store.HashSegment(f, fm, i)
 		if err != nil {
-			return err
+			return "", "", err
 		}
-		if !verified {
+		var trust string
+		switch {
+		case fm.Hashed():
+			if sum == fm.SegmentSHA256[i] {
+				trust = store.TrustManifest
+			} else {
+				bad = errors.New("segment failed hash verification")
+			}
+		case claimed && claimSum != "":
+			if sum == claimSum {
+				trust = claimTrust
+			} else {
+				bad = errors.New("segment does not match the sha256 its source claims")
+			}
+		case claimed && claimTrust == store.TrustOrigin:
+			trust = store.TrustOrigin // fetched from the origin by this node.
+		default:
+			bad = errors.New("no segment hash in the manifest, and the source claims none")
+		}
+		if bad != nil {
 			kill(k)
-			lastErr = errors.New("segment failed hash verification")
+			lastErr = bad
 			continue
 		}
-		return nil
+		if trust == "" {
+			trust = store.TrustOrigin
+		}
+		return sum, trust, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no source left to try")
 	}
-	return lastErr
+	return "", "", lastErr
 }

@@ -93,6 +93,14 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	return &m, nil
 }
 
+type noPullKey struct{}
+
+// WithNoPull marks ctx so that blob requests made with it ask the node to
+// serve only what it holds (see server.HeaderNoPull).
+func WithNoPull(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noPullKey{}, true)
+}
+
 // maxSegmentsBody bounds a peer's /segments (and /status) answer. A revision with ten
 // thousand files of a hundred segment runs each fits well inside it.
 const maxSegmentsBody = 16 << 20
@@ -131,7 +139,12 @@ func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string)
 // within model/revision on the peer at addr. length <= 0 means to EOF. It
 // returns ErrRangeUnavailable if the peer reports 404 or 416 -- not yet
 // having this file, or not yet having this range of it.
-func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path string, offset, length int64) (io.ReadCloser, error) {
+//
+// checks, if any, go to the peer in the X-Range-XXH64 header. When the
+// peer sends X-Segment-SHA256 (it does for a file with no segment hashes
+// in the manifest) the reader returned is a Claimer with it and the
+// peer's X-Segment-Trust.
+func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path string, offset, length int64, checks []store.RangeCheck) (io.ReadCloser, error) {
 	url := fmt.Sprintf("http://%s/blob/%s/%s/%s", addr, model, revision, escapePath(path))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -144,18 +157,33 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		}
 	}
+	if len(checks) > 0 {
+		req.Header.Set(server.HeaderRangeXXH64, store.FormatChecks(checks))
+	}
+	if ctx.Value(noPullKey{}) != nil {
+		req.Header.Set(server.HeaderNoPull, "1")
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("peer %s: blob %s: %w", addr, path, err)
 	}
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
+		if sum := resp.Header.Get(server.HeaderSegmentSHA256); sum != "" {
+			return claimed{resp.Body, sum, resp.Header.Get(server.HeaderSegmentTrust)}, nil
+		}
 		return resp.Body, nil
 	case http.StatusNotFound, http.StatusRequestedRangeNotSatisfiable:
 		resp.Body.Close()
 		return nil, ErrRangeUnavailable
 	default:
+		// Say why: a root that fetched the range from its origin says
+		// what went wrong there (a checksum mismatch, an origin error).
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
+		if m := strings.TrimSpace(string(msg)); m != "" {
+			return nil, fmt.Errorf("peer %s: blob %s: %s: %s", addr, path, resp.Status, m)
+		}
 		return nil, fmt.Errorf("peer %s: blob %s: %s", addr, path, resp.Status)
 	}
 }

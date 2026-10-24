@@ -31,8 +31,9 @@ The example env makes the box a peer: it finds the other boxes through
 mentatd, adds the NAS root (`MODEL_LOADER_PEERS`), holds only what gr8 asks
 for (`MODEL_LOADER_SELECTION` names a file that is not there), and keeps the
 store under `MODEL_LOADER_DISK_BUDGET`. The NAS runs `deploy/compose` with
-`nas.env.example`. Every box runs model-loader on the same port (7762):
-mentatd does not say which port each box uses yet (kindlingai/mentat#4).
+`nas.env.example`. Each box publishes the port it runs model-loader on
+through mentatd (kindlingai/mentat#4); a box whose mentatd predates
+records is taken to be on 7762.
 
 ## gr8
 

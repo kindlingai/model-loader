@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -43,13 +44,14 @@ const mentatTimeout = 5 * time.Second
 // mentatd finds dead drops out once a fetch begun after that has ended:
 // within mentatTTL plus a fetch's time, at most mentatTimeout.
 //
-// mentatd knows each box's addresses, not the port model-loader listens
-// on there, so every box is taken to listen on the same port; a box with
-// several addresses is reached at the first that takes a connection on
-// it (see choose). (Reading the
-// port from a record each box publishes waits on kindlingai/mentat#4.)
+// Each box's model-loader publishes its port in a record through its own
+// mentatd (see Publish), and a box with no record, such as one whose
+// mentatd predates records, is taken to listen on the default port. A box
+// with several addresses is reached at the first that takes a connection
+// on it (see choose).
 type Mentat struct {
 	statusURL string
+	recordURL string
 	port      int
 	client    *http.Client
 
@@ -80,13 +82,17 @@ func NewMentat(baseURL string, port int) (*Mentat, error) {
 			return nil, fmt.Errorf("mentat discovery: %q has no valid port", baseURL)
 		}
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + "/status"
+	base := strings.TrimSuffix(u.Path, "/")
 	u.RawPath = ""
+	u.Path = base + "/status"
+	statusURL := u.String()
+	u.Path = base + "/records/" + MentatRecordName
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("mentat discovery: %d is not a port", port)
 	}
 	return &Mentat{
-		statusURL: u.String(),
+		statusURL: statusURL,
+		recordURL: u.String(),
 		port:      port,
 		client:    &http.Client{Timeout: mentatTimeout},
 		dial:      net.DialTimeout,
@@ -110,6 +116,22 @@ type mentatPeer struct {
 	// Addrs is every address the box listens on.
 	Addrs []string `json:"addrs"`
 	Alive bool     `json:"alive"`
+	// Records is what the box's processes publish through its mentatd,
+	// by name. Each is parsed on its own, so one that is malformed costs
+	// only that box its port.
+	Records map[string]json.RawMessage `json:"records"`
+}
+
+// portOr returns the port the box's model-loader record gives, or def
+// when it has no valid one.
+func (p mentatPeer) portOr(def int) int {
+	var rec struct {
+		Port int `json:"port"`
+	}
+	if json.Unmarshal(p.Records[MentatRecordName], &rec) != nil || rec.Port <= 0 || rec.Port > 65535 {
+		return def
+	}
+	return rec.Port
 }
 
 // candidates returns the hosts the box may be reached at, best first:
@@ -232,12 +254,13 @@ func (m *Mentat) fetch() ([]Peer, error) {
 	type row struct {
 		id    string
 		hosts []string
+		port  int
 	}
 	var rows []row
 	for _, id := range ids {
 		p := table[id]
 		if hosts := p.candidates(); p.Alive && id != st.NodeID && len(hosts) > 0 {
-			rows = append(rows, row{id, hosts})
+			rows = append(rows, row{id, hosts, p.portOr(m.port)})
 		}
 	}
 	chosen := make([]string, len(rows))
@@ -246,14 +269,13 @@ func (m *Mentat) fetch() ([]Peer, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			chosen[k] = m.choose(r.id, r.hosts)
+			chosen[k] = net.JoinHostPort(m.choose(r.id, r.hosts, r.port), strconv.Itoa(r.port))
 		}()
 	}
 	wg.Wait()
 	seen := make(map[string]bool)
 	var out []Peer
-	for _, host := range chosen {
-		addr := net.JoinHostPort(host, strconv.Itoa(m.port))
+	for _, addr := range chosen {
 		if !seen[addr] {
 			seen[addr] = true
 			out = append(out, Peer{Addr: addr})
@@ -278,14 +300,14 @@ type probed struct {
 
 // choose returns the host to reach box id at. With one candidate that is
 // it. With more, each is tried in order, a TCP connection to model-loader's
-// port, and the first that connects is taken; if none does (model-loader
-// is not up there yet, say) the first is. The answer is kept for probeTTL,
-// or until mentatd lists other candidates.
-func (m *Mentat) choose(id string, hosts []string) string {
+// port there, and the first that connects is taken; if none does
+// (model-loader is not up there yet, say) the first is. The answer is kept
+// for probeTTL, or until mentatd lists other candidates or another port.
+func (m *Mentat) choose(id string, hosts []string, port int) string {
 	if len(hosts) == 1 {
 		return hosts[0]
 	}
-	key := strings.Join(hosts, ",")
+	key := strings.Join(hosts, ",") + "/" + strconv.Itoa(port)
 	m.mu.Lock()
 	c, ok := m.probes[id]
 	m.mu.Unlock()
@@ -294,7 +316,7 @@ func (m *Mentat) choose(id string, hosts []string) string {
 	}
 	host := hosts[0]
 	for _, h := range hosts {
-		conn, err := m.dial("tcp", net.JoinHostPort(h, strconv.Itoa(m.port)), probeTimeout)
+		conn, err := m.dial("tcp", net.JoinHostPort(h, strconv.Itoa(port)), probeTimeout)
 		if err == nil {
 			conn.Close()
 			host = h
@@ -308,4 +330,80 @@ func (m *Mentat) choose(id string, hosts []string) string {
 	m.probes[id] = probed{hosts: key, host: host, at: time.Now()}
 	m.mu.Unlock()
 	return host
+}
+
+// MentatRecordName is the name model-loader publishes its record under in
+// mentatd, PUT /records/model-loader.
+const MentatRecordName = "model-loader"
+
+// MentatRecord is what model-loader publishes about its box through
+// mentatd, for every other box's model-loader, and gr8, to read from
+// their own mentatd.
+type MentatRecord struct {
+	// Port is the port model-loader serves its HTTP API on.
+	Port  int      `json:"port"`
+	Roles []string `json:"roles"`
+	// Holdings are the revisions the box holds, whole ("ready") or the
+	// part it selects ("partial"). /segments says which segments.
+	Holdings []MentatHolding `json:"holdings"`
+	// Truncated means mentatd had no room for every holding, and some
+	// are left out.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// MentatHolding is one revision a box holds.
+type MentatHolding struct {
+	Model    string `json:"model"`
+	Revision string `json:"revision"`
+	State    string `json:"state"`
+}
+
+// Publish stores rec as this box's record in mentatd, or deletes it when
+// rec is nil. Holdings are sorted, so an unchanged record is the same
+// JSON, which mentatd takes at no cost however often it is sent. A record
+// mentatd has no room for (413) is sent again with half its holdings,
+// until it fits or has none, so this need not know mentatd's limit.
+func (m *Mentat) Publish(ctx context.Context, rec *MentatRecord) error {
+	if rec == nil {
+		_, err := m.send(ctx, http.MethodDelete, nil)
+		return err
+	}
+	r := *rec
+	r.Holdings = append(make([]MentatHolding, 0, len(r.Holdings)), r.Holdings...)
+	sort.Slice(r.Holdings, func(i, j int) bool {
+		a, b := r.Holdings[i], r.Holdings[j]
+		return a.Model < b.Model || a.Model == b.Model && a.Revision < b.Revision
+	})
+	for {
+		body, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("mentat record: %w", err)
+		}
+		code, err := m.send(ctx, http.MethodPut, body)
+		if code != http.StatusRequestEntityTooLarge || len(r.Holdings) == 0 {
+			return err
+		}
+		r.Holdings, r.Truncated = r.Holdings[:len(r.Holdings)/2], true
+	}
+}
+
+// send makes one request to the record's URL, and returns its status code
+// and, for any but 204, an error.
+func (m *Mentat) send(ctx context.Context, method string, body []byte) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, mentatTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, m.recordURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, fmt.Errorf("mentat record: %w", err)
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("mentat record: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		why, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return resp.StatusCode, fmt.Errorf("mentat record: %s %s: %s: %s", method, m.recordURL, resp.Status, strings.TrimSpace(string(why)))
+	}
+	return resp.StatusCode, nil
 }

@@ -31,7 +31,9 @@ func (d *Daemon) acquireManifest(ctx context.Context, w want.Want) (*store.Manif
 	peers, err := d.cfg.Discoverer.Peers(ctx)
 	if err == nil {
 		for _, p := range peers {
-			mf, err := d.cfg.Peers.Manifest(ctx, p.Addr, m.Name, m.Revision)
+			mctx, cancel := context.WithTimeout(ctx, manifestTimeout)
+			mf, err := d.cfg.Peers.Manifest(mctx, p.Addr, m.Name, m.Revision)
+			cancel()
 			if err != nil {
 				continue
 			}
@@ -61,6 +63,11 @@ func (d *Daemon) acquireManifest(ctx context.Context, w want.Want) (*store.Manif
 	defer d.limit.Release()
 	return d.downloadFromWAN(ctx, m)
 }
+
+// manifestTimeout bounds how long one peer's /manifest may take, so a
+// peer that takes the connection and never answers is passed over. A root
+// asked for one it does not hold fetches it from its origin first.
+const manifestTimeout = 30 * time.Second
 
 // availabilityTimeout bounds how long one peer's /segments may take.
 const availabilityTimeout = 10 * time.Second

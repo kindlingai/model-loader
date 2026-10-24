@@ -127,13 +127,23 @@ func (d *Daemon) Manifest(ctx context.Context, name, revision string) (*store.Ma
 		if mf, err := d.cfg.Store.LoadManifest(name, revision); err == nil {
 			return mf, nil
 		}
-		return d.publishLazyManifest(ctx, m)
+		// The asking peer gives up at its manifestTimeout, and a slow
+		// origin may take longer. Bound to the asker, the build would start
+		// over at each asking and never finish, so it runs on its own clock
+		// and is saved for the next.
+		bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lazyManifestTimeout)
+		defer cancel()
+		return d.publishLazyManifest(bctx, m)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return v.(*store.Manifest), nil
 }
+
+// lazyManifestTimeout bounds building a manifest from the origin's file
+// list, which no asking peer's going away ends.
+const lazyManifestTimeout = 5 * time.Minute
 
 func (d *Daemon) publishLazyManifest(ctx context.Context, m catalog.Model) (*store.Manifest, error) {
 	src, err := d.cfg.Sources.For(m)

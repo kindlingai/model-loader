@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/discovery"
+	"github.com/kindlingai/model-loader/internal/server"
 )
 
 func TestParseRoles(t *testing.T) {
@@ -87,7 +88,7 @@ func TestParseFlagsValid(t *testing.T) {
 
 func TestBuildDiscovererStatic(t *testing.T) {
 	cfg := &config{discoveryKind: "static", staticPeers: "10.0.0.1:7762, 10.0.0.2:7762"}
-	d, err := buildDiscoverer(cfg)
+	d, _, err := buildDiscoverer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,14 +99,14 @@ func TestBuildDiscovererStatic(t *testing.T) {
 
 func TestBuildDiscovererStaticRejectsBadAddr(t *testing.T) {
 	cfg := &config{discoveryKind: "static", staticPeers: "not-a-host-port"}
-	if _, err := buildDiscoverer(cfg); err == nil {
+	if _, _, err := buildDiscoverer(cfg); err == nil {
 		t.Fatal("expected an error for a malformed peer address")
 	}
 }
 
 func TestBuildDiscovererK8s(t *testing.T) {
 	cfg := &config{discoveryKind: "k8s", k8sService: "model-loader-headless", k8sPort: 7762}
-	d, err := buildDiscoverer(cfg)
+	d, _, err := buildDiscoverer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +132,7 @@ func TestBuildDiscovererMentat(t *testing.T) {
 		"10.0.0.2:7762": {"10.0.0.2:7762"},
 	} {
 		cfg.staticPeers = peers
-		d, err := buildDiscoverer(cfg)
+		d, _, err := buildDiscoverer(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +164,7 @@ func TestBuildDiscovererK8sPeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := buildDiscoverer(cfg)
+	d, _, err := buildDiscoverer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +173,25 @@ func TestBuildDiscovererK8sPeers(t *testing.T) {
 		t.Fatalf("Peers = %v, %v; want nas.lan:7762", got, err)
 	}
 	cfg.staticPeers = "nas.lan"
-	if _, err := buildDiscoverer(cfg); err == nil {
+	if _, _, err := buildDiscoverer(cfg); err == nil {
 		t.Fatal("-peers with no port accepted")
+	}
+}
+
+// The record holds what the box serves: revisions ready or partial, not
+// ones still pending, downloading or failed.
+func TestMentatRecord(t *testing.T) {
+	st := server.StatusResponse{Roles: []string{"peer"}, Models: []server.ModelStatus{
+		{Model: "a", Revision: "1", State: server.StateReady},
+		{Model: "b", Revision: "1", State: server.StatePartial},
+		{Model: "c", Revision: "1", State: server.StateDownloading},
+		{Model: "d", Revision: "1", State: server.StateError},
+	}}
+	got := mentatRecord(st, 7762)
+	want := &discovery.MentatRecord{Port: 7762, Roles: []string{"peer"}, Holdings: []discovery.MentatHolding{
+		{Model: "a", Revision: "1", State: "ready"}, {Model: "b", Revision: "1", State: "partial"},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mentatRecord = %+v, want %+v", got, want)
 	}
 }

@@ -130,6 +130,30 @@ check it against.
 A consumer checksum given after its range was fetched is checked against
 the held bytes on the next pass, once; one that fails drops what it covers.
 
+### Requests
+
+The selection file is static. A local consumer says what it needs at run
+time with a named request (`PUT /requests/{name}`, see `docs/protocol.md`):
+gr8 works out a rank's pieces with `g6load fetch-plan`, puts them as a
+request at boot, puts a new one when the rank or the TP width changes, and
+waits until it is ready. Requests and the selection file both apply on one
+node: every reconcile adds the pieces of every request to the selection's.
+
+- A replaced request fetches only what the node does not hold yet. A
+  change from TP=4 to TP=3 keeps the pieces both widths need.
+- A request pins its pieces: while it exists they are wanted, and eviction
+  removes only pieces nothing wants.
+- Requests are saved under the store, so they hold across restarts.
+- A request whose ranges do not fit the manifest is `invalid`; it does not
+  stop the node fetching the rest of the model. (The same holds for a bad
+  partial entry in the selection file.)
+- Putting or releasing a request starts a reconcile at once, not at the
+  next tick.
+- A file that fails (a consumer checksum that does not match, say) does not
+  stop the other files of the model; the model reports the error.
+- A request's checksums apply even when the selection file wants the whole
+  model.
+
 ## Store
 
 The materialized file tree is the canonical store — there is no separate

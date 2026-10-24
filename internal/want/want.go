@@ -17,8 +17,12 @@ type Want struct {
 	Model catalog.Model
 	// Whole means every file of the revision.
 	Whole bool
-	// Pieces, when not Whole, are the parts of the revision wanted.
+	// Pieces are the parts of the revision wanted. When Whole they add
+	// nothing to fetch, but their consumer checksums still apply.
 	Pieces []catalog.Pieces
+	// Priority is the highest priority of the requests that want it;
+	// its transfers ask for slots at it.
+	Priority int
 }
 
 // Key identifies a model revision, as name@revision.
@@ -36,9 +40,7 @@ func FromSelection(c *catalog.Catalog, s *catalog.Selection) ([]Want, error) {
 		for i, p := range s.Partial {
 			if p.Names(m) {
 				named[i] = true
-				if !w.Whole {
-					w.Pieces = append(w.Pieces, p)
-				}
+				w.Pieces = append(w.Pieces, p)
 			}
 		}
 		if w.Whole || len(w.Pieces) > 0 {
@@ -87,9 +89,6 @@ func Resolve(m *store.Manifest, w Want) (*Need, error) {
 			n.Files[fm.Path] = wholeNeed(fm)
 		}
 	}
-	if w.Whole {
-		return n, nil
-	}
 	for _, p := range w.Pieces {
 		for _, fr := range p.Ranges {
 			fm, ok := m.Find(fr.Path)
@@ -101,6 +100,8 @@ func Resolve(m *store.Manifest, w Want) (*Need, error) {
 				fn = &FileNeed{Segments: make([]bool, fm.NumSegments())}
 				n.Files[fm.Path] = fn
 			}
+			// A whole file needs every segment already; a range in it adds
+			// only its checksum.
 			for _, r := range fr.Ranges {
 				if r.Offset+r.Length > fm.Size {
 					return nil, fmt.Errorf("%s: %s: range offset %d length %d runs past the file's %d bytes",

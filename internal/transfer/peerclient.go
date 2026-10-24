@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/kindlingai/model-loader/internal/server"
@@ -163,6 +164,9 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 	if ctx.Value(noPullKey{}) != nil {
 		req.Header.Set(server.HeaderNoPull, "1")
 	}
+	if p := server.Priority(ctx); p != 0 {
+		req.Header.Set(server.HeaderPriority, strconv.Itoa(p))
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("peer %s: blob %s: %w", addr, path, err)
@@ -176,6 +180,10 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 	case http.StatusNotFound, http.StatusRequestedRangeNotSatisfiable:
 		resp.Body.Close()
 		return nil, ErrRangeUnavailable
+	case http.StatusUnprocessableEntity:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		return nil, checkFailed(fmt.Sprintf("peer %s: blob %s: %s", addr, path, strings.TrimSpace(string(msg))))
 	default:
 		// Say why: a root that fetched the range from its origin says
 		// what went wrong there (a checksum mismatch, an origin error).
@@ -187,3 +195,10 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 		return nil, fmt.Errorf("peer %s: blob %s: %s", addr, path, resp.Status)
 	}
 }
+
+// checkFailed is a peer's answer that a consumer checksum did not match;
+// its text is the peer's own, which names the check.
+type checkFailed string
+
+func (e checkFailed) Error() string { return string(e) }
+func (e checkFailed) Unwrap() error { return store.ErrCheckFailed }

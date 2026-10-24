@@ -13,10 +13,12 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/discovery"
+	"github.com/kindlingai/model-loader/internal/request"
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
@@ -81,17 +83,25 @@ type Config struct {
 	// pull-through. Defaults to store.DefaultSegmentSize; tests set it
 	// small.
 	SegmentSize int64
+
+	// Requests, if set, holds the named requests of local consumers. Their
+	// pieces are wanted along with the selection's.
+	Requests *request.Registry
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
 // interface server.Server depends on.
 type Daemon struct {
 	cfg        Config
-	sem        chan struct{}
-	availSlots chan struct{} // see availabilityQueries
+	limit      *transfer.Limiter // segment transfers, by priority
+	availSlots chan struct{}     // see availabilityQueries
+	kick       chan struct{}     // see Kick
+	wantsGen   atomic.Uint64     // see Kick
+	onPass     func()            // tests: called as each Run pass starts
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
+	change   chan struct{} // closed and replaced on every status change
 	verified map[string]bool
 
 	stateMu sync.Mutex
@@ -100,7 +110,7 @@ type Daemon struct {
 	pullMu    sync.Mutex
 	pulls     map[string]*pullCall // see once
 	pullSrcs  map[string]cachedSources
-	pullSlots chan struct{}
+	pullLimit *transfer.Limiter // pull-through segment fetches, by priority
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -119,14 +129,16 @@ func New(cfg Config) *Daemon {
 	}
 	return &Daemon{
 		cfg:        cfg,
-		sem:        make(chan struct{}, cfg.MaxConcurrentTransfers),
+		limit:      transfer.NewLimiter(cfg.MaxConcurrentTransfers),
 		availSlots: make(chan struct{}, availabilityQueries),
+		kick:       make(chan struct{}, 1),
+		change:     make(chan struct{}),
 		statuses:   make(map[string]server.ModelStatus),
 		verified:   make(map[string]bool),
 		states:     make(map[string]*store.RevisionState),
 		pulls:      make(map[string]*pullCall),
 		pullSrcs:   make(map[string]cachedSources),
-		pullSlots:  make(chan struct{}, cfg.PullWorkers),
+		pullLimit:  transfer.NewLimiter(cfg.PullWorkers),
 	}
 }
 
@@ -156,6 +168,7 @@ func (d *Daemon) setStatus(ms server.ModelStatus) {
 	ms.UpdatedAt = time.Now().UTC()
 	d.mu.Lock()
 	d.statuses[want.Key(ms.Model, ms.Revision)] = ms
+	d.notifyLocked()
 	d.mu.Unlock()
 }
 
@@ -177,6 +190,10 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		gen := d.wantsGen.Load() // before the wants it goes with
+		if d.onPass != nil {
+			d.onPass()
+		}
 		wants, err := d.refreshWants()
 		if err != nil {
 			onErr(err)
@@ -189,9 +206,13 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer busy.Delete(key)
-				if err := d.reconcileModel(ctx, w); err != nil {
+				err := d.reconcileModel(ctx, w)
+				busy.Delete(key)
+				if err != nil {
 					onErr(fmt.Errorf("model %s: %w", key, err))
+				}
+				if d.wantsGen.Load() != gen {
+					d.wake() // wants changed since they were read: look again.
 				}
 			}()
 		}
@@ -199,6 +220,7 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-d.kick:
 		}
 	}
 }
@@ -236,7 +258,9 @@ func (d *Daemon) refreshWants() ([]want.Want, error) {
 	d.mu.Lock()
 	sel := d.cfg.Selection
 	d.mu.Unlock()
+	sel, prio := d.withRequests(sel)
 	wants, err := want.FromSelection(d.cfg.Catalog, sel)
+	sortByPriority(wants, prio)
 	d.pruneStatuses(wants)
 	return wants, errors.Join(selErr, err)
 }
@@ -312,7 +336,10 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		}
 	}
 
-	need, err := want.Resolve(manifest, w)
+	need, err := resolveEach(manifest, w)
+	if errors.Is(err, errSomePieces) {
+		err = nil // the rest are fetched; requestStatus reports the bad one.
+	}
 	if err != nil {
 		d.setStatus(server.ModelStatus{
 			Model: m.Name, Revision: m.Revision, State: server.StateError,
@@ -361,6 +388,10 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 		srcs = d.buildSources(ctx, m, manifest, peers)
 	}
 
+	// Transfers this pass makes ask for slots at the want's priority, here
+	// and, through the priority header, at a root pulling through.
+	ctx = server.WithPriority(ctx, w.Priority)
+	var errs []error
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
@@ -371,16 +402,23 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
 		} else {
 			err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
-				Need: fn.Segments, Order: srcs.order(fm.Path), Slots: d.sem, Checks: fn.Checks,
+				Need: fn.Segments, Order: srcs.order(fm.Path), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
 			})
 		}
 		if err != nil {
-			ms := progress(w, manifest, need, rs, server.StateError)
-			ms.Error = err.Error()
-			d.setStatus(ms)
-			return fmt.Errorf("fetch %s: %w", fm.Path, err)
+			// Go on with the other files: one bad piece (a consumer
+			// checksum that does not match, say) must not hold back
+			// every other request for the model.
+			errs = append(errs, fmt.Errorf("fetch %s: %w", fm.Path, err))
+			continue
 		}
 		d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
+	}
+	if err := errors.Join(errs...); err != nil {
+		ms := progress(w, manifest, need, rs, server.StateError)
+		ms.Error = err.Error()
+		d.setStatus(ms)
+		return err
 	}
 
 	d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))

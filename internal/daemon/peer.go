@@ -55,8 +55,10 @@ func (d *Daemon) acquireManifest(ctx context.Context, w want.Want) (*store.Manif
 		return d.Manifest(ctx, m.Name, m.Revision)
 	}
 
-	d.sem <- struct{}{}
-	defer func() { <-d.sem }()
+	if err := d.limit.Acquire(ctx, w.Priority); err != nil {
+		return nil, err
+	}
+	defer d.limit.Release()
 	return d.downloadFromWAN(ctx, m)
 }
 

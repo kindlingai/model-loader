@@ -98,23 +98,16 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		return fmt.Errorf("fetch %s: no sources available", fm.Path)
 	}
 
-	// The destination is opened only once a segment transfer has a slot
-	// (or there is only the whole-file check left), so files queued
-	// behind the transfer limit hold no descriptors.
-	var opened *os.File
-	openFile := sync.OnceValues(func() (*os.File, error) {
+	// Each segment transfer opens the destination once it has a slot and
+	// closes it when the segment is done, so files waiting for the
+	// transfer limit hold no descriptors, between segments or before.
+	openFile := func() (*os.File, error) {
 		f, err := st.EnsureFile(model, revision, fm)
 		if err != nil {
 			return nil, fmt.Errorf("fetch %s: %w", fm.Path, err)
 		}
-		opened = f
 		return f, nil
-	})
-	defer func() {
-		if opened != nil {
-			opened.Close()
-		}
-	}()
+	}
 
 	if opts.Slots != nil && cap(opts.Slots) == 0 {
 		opts.Slots = nil // an unbuffered channel would block every send.
@@ -163,6 +156,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 				f, err := openFile()
 				if err == nil {
 					err = fetchSegment(ctx, f, fm, i, fetchers, order(i), dead, &mu)
+					f.Close()
 				}
 				if opts.Slots != nil {
 					<-opts.Slots
@@ -195,6 +189,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 	if err := syncAndUncache(f); err != nil {
 		return fmt.Errorf("fetch %s: %w", fm.Path, err)
 	}

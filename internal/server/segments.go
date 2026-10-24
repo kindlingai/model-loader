@@ -2,6 +2,8 @@ package server
 
 import (
 	"net/http"
+
+	"github.com/kindlingai/model-loader/internal/store"
 )
 
 // SegmentsResponse is the body of GET /segments/{model}/{revision}: which
@@ -42,6 +44,30 @@ func (f FileSegments) Has(i int) bool {
 		}
 	}
 	return false
+}
+
+// Valid reports whether r is an answer about model@revision whose files
+// are all in m, with held ranges inside each file's segments. A node
+// choosing sources ignores an answer that is not.
+func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
+	if r.Model != m.Model || r.Revision != m.Revision {
+		return false
+	}
+	segs := make(map[string]int, len(m.Files))
+	for _, fm := range m.Files {
+		segs[fm.Path] = fm.NumSegments()
+	}
+	for path, fs := range r.Files {
+		if n, ok := segs[path]; !ok || fs.Segments != n {
+			return false
+		}
+		for _, h := range fs.Held {
+			if h[0] < 0 || h[0] >= h[1] || h[1] > fs.Segments {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // HeldRanges packs done into half-open index ranges.

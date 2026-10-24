@@ -9,7 +9,9 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -496,4 +498,60 @@ func TestFetchFileOpensOnlyWithASlot(t *testing.T) {
 	if _, err := os.Stat(st.FilePath("m", "r1", "w.bin")); !os.IsNotExist(err) {
 		t.Fatalf("destination exists (%v) while waiting for a slot", err)
 	}
+}
+
+// Between segments, while waiting for a slot again, a file holds no open
+// descriptor: segment transfers close it as they finish.
+func TestFetchFileClosesBetweenSegments(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := bytes.Repeat([]byte("c"), 20)
+	fm := buildManifestFile("w.bin", content, 10)
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{fm}}
+	before := openFDs(t)
+	slots := make(chan struct{}, 1)
+	stolen := make(chan struct{})
+	var once sync.Once
+	steal := fetcherFunc(func(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+		// After the first segment, take the slot as soon as the worker
+		// gives it back, so the worker waits for it.
+		once.Do(func() {
+			go func() { slots <- struct{}{}; close(stolen) }()
+		})
+		return io.NopCloser(bytes.NewReader(content[offset : offset+length])), nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- FetchFile(context.Background(), st, "m", "r1", fm, store.NewRevisionState(m), []Fetcher{steal}, Options{Slots: slots})
+	}()
+	<-stolen
+	time.Sleep(50 * time.Millisecond) // let the worker reach the slot wait
+	got := openFDs(t)
+	<-slots
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got > before {
+		t.Fatalf("%d descriptors open while waiting for a slot, want at most %d", got, before)
+	}
+}
+
+type fetcherFunc func(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error)
+
+func (f fetcherFunc) Open(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	return f(ctx, path, offset, length)
+}
+
+func openFDs(t *testing.T) int {
+	t.Helper()
+	n := 0
+	for fd := 0; fd < 4096; fd++ {
+		var st syscall.Stat_t
+		if syscall.Fstat(fd, &st) == nil {
+			n++
+		}
+	}
+	return n
 }

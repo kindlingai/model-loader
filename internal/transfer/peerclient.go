@@ -61,7 +61,7 @@ func (c *PeerClient) Status(ctx context.Context, addr string) (*server.StatusRes
 		return nil, fmt.Errorf("peer %s: status: %s", addr, resp.Status)
 	}
 	var s server.StatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSegmentsBody)).Decode(&s); err != nil {
 		return nil, fmt.Errorf("peer %s: decode status: %w", addr, err)
 	}
 	return &s, nil
@@ -93,7 +93,7 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	return &m, nil
 }
 
-// maxSegmentsBody bounds a peer's /segments answer. A revision with ten
+// maxSegmentsBody bounds a peer's /segments (and /status) answer. A revision with ten
 // thousand files of a hundred segment runs each fits well inside it.
 const maxSegmentsBody = 16 << 20
 

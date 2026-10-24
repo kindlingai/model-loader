@@ -122,12 +122,14 @@ Every node, root or peer, runs the same small HTTP server (see
 ## Source selection
 
 Before it fetches a model's files, a node asks every known peer which
-segments it holds (`GET /segments/{model}/{revision}`). For each segment it
+segments it holds (`GET /segments/{model}/{revision}`), at most 8 at once
+across all models. For each segment it
 needs, it then tries, in order:
 
-1. the plain peers that hold the segment;
+1. the plain peers that hold the segment (and plain peers too old for
+   `/segments` whose `/status` reports the revision ready);
 2. the roots that hold it;
-3. peers that did not answer the question (an older version, or a timeout);
+3. peers that did not answer the question (an older root, or a timeout);
 4. the other peers, in case they gained the segment since they were asked;
 5. (root mode only) the file's WAN source.
 

@@ -76,8 +76,9 @@ type Config struct {
 // Daemon runs the reconcile loop and reports status via the StatusProvider
 // interface server.Server depends on.
 type Daemon struct {
-	cfg Config
-	sem chan struct{}
+	cfg        Config
+	sem        chan struct{}
+	availSlots chan struct{} // see availabilityQueries
 
 	mu       sync.Mutex
 	statuses map[string]server.ModelStatus
@@ -96,10 +97,11 @@ func New(cfg Config) *Daemon {
 		cfg.StallTimeout = defaultStallTimeout
 	}
 	return &Daemon{
-		cfg:      cfg,
-		sem:      make(chan struct{}, cfg.MaxConcurrentTransfers),
-		statuses: make(map[string]server.ModelStatus),
-		verified: make(map[string]bool),
+		cfg:        cfg,
+		sem:        make(chan struct{}, cfg.MaxConcurrentTransfers),
+		availSlots: make(chan struct{}, availabilityQueries),
+		statuses:   make(map[string]server.ModelStatus),
+		verified:   make(map[string]bool),
 	}
 }
 
@@ -319,7 +321,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	if err != nil {
 		peers = nil // a discovery hiccup shouldn't block falling back to WAN.
 	}
-	srcs := d.buildSources(ctx, m, peers)
+	srcs := d.buildSources(ctx, m, manifest, peers)
 
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]

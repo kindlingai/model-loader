@@ -67,15 +67,15 @@ type sources struct {
 	peers int
 }
 
-// availabilityQueries bounds how many peers are asked at once.
+// availabilityQueries bounds how many peers the node asks at once, across
+// every model it reconciles.
 const availabilityQueries = 8
 
 // buildSources lists m's sources and asks every peer, in parallel, which
 // segments it holds.
-func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, peers []discovery.Peer) *sources {
+func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, manifest *store.Manifest, peers []discovery.Peer) *sources {
 	s := &sources{avail: make([]*server.SegmentsResponse, len(peers)), whole: make([]bool, len(peers)), peers: len(peers)}
 	var wg sync.WaitGroup
-	slots := make(chan struct{}, availabilityQueries)
 	for k, p := range peers {
 		s.fetchers = append(s.fetchers, transfer.PeerFetcher{
 			Client: d.cfg.Peers, Addr: p.Addr, Model: m.Name, Revision: m.Revision,
@@ -83,15 +83,22 @@ func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, peers []disc
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
+			// One bound across the node, however many models reconcile.
+			select {
+			case d.availSlots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-d.availSlots }()
 			qctx, cancel := context.WithTimeout(ctx, availabilityTimeout)
 			defer cancel()
 			// On any error (a timeout, a bad answer) avail[k] stays nil:
 			// unknown, which ranks it behind every holder.
 			resp, err := d.cfg.Peers.Segments(qctx, p.Addr, m.Name, m.Revision)
 			if err == nil {
-				s.avail[k] = resp
+				if resp.Valid(manifest) {
+					s.avail[k] = resp
+				}
 				return
 			}
 			if errors.Is(err, transfer.ErrNoSegments) {

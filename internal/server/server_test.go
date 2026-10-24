@@ -323,3 +323,23 @@ func TestHandleSegments(t *testing.T) {
 		t.Fatalf("unknown revision: status = %d, %+v, %v; want 200 with no files (404 means an older node)", rec.Code, resp, err)
 	}
 }
+
+func TestSegmentsResponseValid(t *testing.T) {
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{{Path: "a", Size: 30, SegmentSize: 10, SegmentSHA256: []string{"x", "y", "z"}}}}
+	good := SegmentsResponse{Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Held: [][2]int{{0, 3}}}}}
+	if !good.Valid(m) {
+		t.Fatal("a good answer is not Valid")
+	}
+	for name, r := range map[string]SegmentsResponse{
+		"model":    {Model: "x", Revision: "r1"},
+		"revision": {Model: "m", Revision: "r2"},
+		"file":     {Model: "m", Revision: "r1", Files: map[string]FileSegments{"b": {Segments: 3}}},
+		"count":    {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: -1}}},
+		"range":    {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Held: [][2]int{{-100, 999999999}}}}},
+		"empty":    {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Held: [][2]int{{2, 2}}}}},
+	} {
+		if r.Valid(m) {
+			t.Errorf("%s: a bad answer is Valid", name)
+		}
+	}
+}

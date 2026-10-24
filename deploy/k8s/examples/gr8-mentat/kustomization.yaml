@@ -1,0 +1,9 @@
+# examples/gr8 on nodes that run mentatd, whose peers find each other
+# through it:
+#
+#   kubectl apply -k deploy/k8s/examples/gr8-mentat
+resources:
+  - ../gr8
+
+components:
+  - ../../components/mentat

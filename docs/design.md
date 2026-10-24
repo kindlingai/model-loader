@@ -411,7 +411,9 @@ One repo, one binary, three deploy trees under `deploy/`:
 - `deploy/k8s/` — Kustomize: a root Deployment and a peer DaemonSet, a
   headless Service for discovery, a ConfigMap for the catalog.
   `examples/gr8` adds gr8 on one node, with a NAS outside the cluster as
-  the root.
+  the root. `components/mentat` switches the peers to mentat discovery on
+  the host network, for nodes that run mentatd; `examples/gr8-mentat` is
+  gr8 with it.
 - `deploy/compose/` — a `docker-compose.yml` with role and peer list set by
   environment variables, `gr8.yml` to add gr8 on the same box, and env
   files for a NAS root and for a Spark peer.

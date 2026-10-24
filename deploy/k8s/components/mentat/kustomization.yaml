@@ -1,0 +1,37 @@
+# Peers find each other through the node's mentatd, not the headless
+# Service, on nodes that run mentatd on the host (kindling-spark-os). Add it
+# to an overlay:
+#
+#   components:
+#     - ../../components/mentat
+#
+# mentatd's peer table lists node addresses, so each peer runs in its node's
+# network namespace: other nodes reach it at <node address>:7762, and it
+# reaches mentatd at -mentat-url's default, http://127.0.0.1:6380, as a
+# process on the box, the only kind mentatd takes records from. A node
+# running this cannot also run deploy/spark-os's unit, which takes the same
+# port.
+#
+# Only the DaemonSet changes. A root Deployment in the cluster is not in
+# mentatd's table, so name it in -peers, or keep the root outside the
+# cluster as examples/gr8 does.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - target: {kind: DaemonSet, name: model-loader-peer}
+    patch: |
+      - op: add
+        path: /spec/template/spec/hostNetwork
+        value: true
+      # Cluster DNS names, such as a -peers entry, keep resolving.
+      - op: add
+        path: /spec/template/spec/dnsPolicy
+        value: ClusterFirstWithHostNet
+      # The build fails if base moves the flag, rather than replace another.
+      - op: test
+        path: /spec/template/spec/containers/0/args/4
+        value: -discovery=k8s
+      # -k8s-service and -k8s-port stay, unread without -discovery=k8s.
+      - op: replace
+        path: /spec/template/spec/containers/0/args/4
+        value: -discovery=mentat

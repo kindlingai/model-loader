@@ -44,6 +44,9 @@ jobs:
       - name: validate kustomize gr8 example
         run: kubectl kustomize deploy/k8s/examples/gr8 >/dev/null
 
+      - name: validate kustomize gr8 example with mentat discovery
+        run: kubectl kustomize deploy/k8s/examples/gr8-mentat >/dev/null
+
       - name: validate docker compose
         run: |
           docker compose -f deploy/compose/docker-compose.yml config >/dev/null

@@ -93,6 +93,32 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	return &m, nil
 }
 
+// Segments fetches which segments of model/revision a peer holds. It
+// returns ErrRangeUnavailable if the peer has no manifest for it (404).
+func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string) (*server.SegmentsResponse, error) {
+	u := fmt.Sprintf("http://%s/segments/%s/%s", addr, url.PathEscape(model), url.PathEscape(revision))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("peer %s: segments: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrRangeUnavailable
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("peer %s: segments: %s", addr, resp.Status)
+	}
+	var s server.SegmentsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return nil, fmt.Errorf("peer %s: decode segments: %w", addr, err)
+	}
+	return &s, nil
+}
+
 // OpenBlob returns a reader for byte range [offset, offset+length) of path
 // within model/revision on the peer at addr. length <= 0 means to EOF. It
 // returns ErrRangeUnavailable if the peer reports 404 or 416 -- not yet

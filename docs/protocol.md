@@ -59,6 +59,31 @@ partially). 404 if this node has never started it — ask a different peer.
 }
 ```
 
+## `GET /segments/{model}/{revision}`
+
+Which segments of each file this node holds, verified, as half-open ranges
+of segment indices. A file it holds nothing of is left out. 404 if this
+node has no manifest for the revision.
+
+```json
+{
+  "model": "glm-5.3",
+  "revision": "abc1234",
+  "roles": ["peer"],
+  "files": {
+    "experts/exlr8-layer-003.k4.safetensors": {
+      "segments": 12,
+      "held": [[0, 4], [9, 10]]
+    }
+  }
+}
+```
+
+Here the node holds segments 0-3 and 9 of a 12-segment file. `roles` are
+the node's roles, as in `/status`. A fetching node asks every peer once per
+reconcile pass and prefers plain peers that hold a segment to roots that
+hold it.
+
 ## `GET /blob/{model}/{revision}/{path}`
 
 Serves the file at `path`, honoring `Range` requests (`Accept-Ranges: bytes`).

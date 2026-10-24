@@ -318,16 +318,16 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	if err != nil {
 		peers = nil // a discovery hiccup shouldn't block falling back to WAN.
 	}
-	fetchers := d.buildFetchers(m, peers)
+	srcs := d.buildSources(ctx, m, peers)
 
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
 			continue
 		}
-		d.sem <- struct{}{}
-		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, fetchers, fn.Segments)
-		<-d.sem
+		err := transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
+			Need: fn.Segments, Order: srcs.order(fm.Path), Slots: d.sem,
+		})
 		if err != nil {
 			ms := progress(w, manifest, need, rs, server.StateError)
 			ms.Error = err.Error()

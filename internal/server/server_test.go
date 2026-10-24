@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -252,5 +253,72 @@ func TestFilePathParentDirsExist(t *testing.T) {
 	f.Close()
 	if _, err := os.Stat(filepath.Join(st.FilePath("m", "r1", "nested/dir/file.bin"))); err != nil {
 		t.Fatalf("expected file to exist: %v", err)
+	}
+}
+
+func TestHeldRanges(t *testing.T) {
+	got := HeldRanges([]bool{true, true, false, false, true, false, true})
+	want := [][2]int{{0, 2}, {4, 5}, {6, 7}}
+	if len(got) != len(want) {
+		t.Fatalf("HeldRanges = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("HeldRanges = %v, want %v", got, want)
+		}
+	}
+	fs := FileSegments{Segments: 7, Held: got}
+	for i, want := range []bool{true, true, false, false, true, false, true} {
+		if fs.Has(i) != want {
+			t.Fatalf("Has(%d) = %v, want %v", i, fs.Has(i), want)
+		}
+	}
+	if HeldRanges(nil) != nil || HeldRanges([]bool{false}) != nil {
+		t.Fatal("HeldRanges of nothing held should be empty")
+	}
+}
+
+func TestHandleSegments(t *testing.T) {
+	st, m := setupStore(t)
+	srv := New(st, fakeStatus{})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/segments/m/r1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var resp SegmentsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	fs, ok := resp.Files["a.txt"]
+	if !ok || fs.Segments != 1 || !fs.Has(0) {
+		t.Fatalf("segments = %+v, want a.txt with its one segment held", resp)
+	}
+
+	rs, err := st.LoadState(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := rs.FileState(m.Files[0])
+	f.SegmentsDone[0], f.Complete = false, false
+	rs.SetFileState(f)
+	if err := st.SaveState(rs); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/segments/m/r1", nil))
+	resp = SegmentsResponse{}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resp.Files["a.txt"]; ok {
+		t.Fatalf("segments = %+v, want a file with nothing held left out", resp)
+	}
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/segments/m/nope", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown revision: status = %d, want 404", rec.Code)
 	}
 }

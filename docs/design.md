@@ -13,9 +13,11 @@
 ## Non-goals (for now)
 
 - Cross-revision block-level dedup.
-- Full BitTorrent-style multi-source parallel chunk swarming. One source per
-  file at a time is enough at home/small-fleet scale; revisit only if a real
-  deployment shows root or peer bandwidth is actually the bottleneck.
+- Full BitTorrent-style swarming (piece trading, tit-for-tat, a tracker).
+  Segments of one file do come from several nodes at once (see "Source
+  selection"), because with partial selections no single peer may hold a
+  whole file; but sources are chosen from each node's reported segments,
+  not negotiated.
 - A consensus protocol for which root fetches a new catalog entry. Two roots
   racing to WAN-fetch the same new entry is handled with a soft check-LAN
   before pulling, not solved.
@@ -119,11 +121,28 @@ Every node, root or peer, runs the same small HTTP server (see
 
 ## Source selection
 
-For each file a node needs, it asks its known peers' `/status` and picks, in
-order: a LAN peer that reports the file ready, then a configured root, then
-(root mode only) the file's WAN source. This makes every node that finishes a
-download an additional source for everyone else — root bandwidth stays flat
-as the fleet grows, without needing a tracker or piece-level swarm.
+Before it fetches a model's files, a node asks every known peer which
+segments it holds (`GET /segments/{model}/{revision}`). For each segment it
+needs, it then tries, in order:
+
+1. the plain peers that hold the segment;
+2. the roots that hold it;
+3. peers that did not answer the question (an older version, or a timeout);
+4. the other peers, in case they gained the segment since they were asked;
+5. (root mode only) the file's WAN source.
+
+Within the first two groups each segment starts at a different node, so the
+segments of one file come from several nodes at once. Every segment
+transfer holds one of the node's `-max-concurrent-transfers` slots, so the
+limit applies to segments across all files and models. A source that fails
+outright (a peer that went away mid-copy, a bad hash) is dropped for the
+rest of the file and the segment moves on to its next source; a source that
+does not hold a range answers 416 and is skipped for that segment only.
+
+This makes every node that holds a segment an additional source for
+everyone else. Root bandwidth stays flat as the fleet grows, and a model
+spread across the peers with no single copy of any file can still be built
+on a new node without the root.
 
 ## Discovery
 
@@ -162,7 +181,7 @@ answer:
   later.
 - Discovery: static list and k8s DNS. mentat and LAN broadcast are
   fast-follows once the core loop is proven.
-- No cross-revision dedup, no multi-source parallel fetch of one file.
+- No cross-revision dedup.
 
 ## Deployment targets
 

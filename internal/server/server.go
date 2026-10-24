@@ -1,6 +1,6 @@
 // Package server implements the LAN-facing HTTP API every node exposes,
-// root or peer alike: /status, /manifest/{model}/{revision}, and
-// /blob/{model}/{revision}/{path}. See docs/protocol.md for the wire
+// root or peer alike: /status, /manifest/{model}/{revision},
+// /segments/{model}/{revision} and /blob/{model}/{revision}/{path}. See docs/protocol.md for the wire
 // format.
 package server
 
@@ -68,6 +68,7 @@ func New(st *store.Store, status StatusProvider) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /manifest/{model}/{revision}", s.handleManifest)
+	mux.HandleFunc("GET /segments/{model}/{revision}", s.handleSegments)
 	mux.HandleFunc("GET /blob/{model}/{revision}/{path...}", s.handleBlob)
 	mux.HandleFunc("HEAD /blob/{model}/{revision}/{path...}", s.handleBlob)
 	s.mux = mux

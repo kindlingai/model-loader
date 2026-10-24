@@ -72,17 +72,26 @@ func (f FileManifest) SegmentIndex(off int64) int {
 
 // Manifest describes every file in a model revision.
 type Manifest struct {
-	Model    string         `json:"model"`
-	Revision string         `json:"revision"`
-	Files    []FileManifest `json:"files"`
+	Model    string `json:"model"`
+	Revision string `json:"revision"`
+	// Commit is the commit the origin resolved Revision to when the
+	// manifest was made; every file is of it. Empty for an origin with no
+	// commits (a plain HTTP source).
+	Commit string         `json:"commit,omitempty"`
+	Files  []FileManifest `json:"files"`
 }
 
 // Validate checks that m is self-consistent: every path is a clean,
-// relative, slash-separated path inside the revision and appears once, and
-// every file has one segment hash per SegmentSize bytes. A manifest comes
-// from another node, so a bad one must fail here rather than index out of
-// range or write outside the store later.
+// relative, slash-separated path inside the revision and appears once,
+// every file has one segment hash per SegmentSize bytes, and the commit,
+// if any, is a hex git commit id. A manifest comes from another node, so a
+// bad one must fail here rather than index out of range or write outside
+// the store later.
 func (m *Manifest) Validate() error {
+	// The commit goes into origin URLs.
+	if _, err := hex.DecodeString(m.Commit); err != nil || (m.Commit != "" && len(m.Commit) != 40 && len(m.Commit) != 64) {
+		return fmt.Errorf("manifest %s@%s: invalid commit %q", m.Model, m.Revision, m.Commit)
+	}
 	seen := make(map[string]bool, len(m.Files))
 	for _, f := range m.Files {
 		if f.Path == "" || path.IsAbs(f.Path) || path.Clean(f.Path) != f.Path || f.Path == ".." || strings.HasPrefix(f.Path, "../") || strings.Contains(f.Path, "\\") {

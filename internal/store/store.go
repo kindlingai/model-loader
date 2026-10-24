@@ -19,7 +19,8 @@ import (
 //	<root>/state/<model>/<revision>.json
 //
 // The models tree holds the materialized files consumers read directly;
-// manifests and state are small JSON side files, not meant for consumers.
+// manifests and state are small JSON side files. What a consumer may rely
+// on in all three is the store contract in docs/design.md.
 type Store struct {
 	root string
 

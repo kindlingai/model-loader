@@ -65,7 +65,8 @@ partially). 404 if this node has never started it — ask a different peer.
 ```json
 {
   "model": "nvidia/nemotron-3-nano-30b-a3b",
-  "revision": "abc1234",
+  "revision": "main",
+  "commit": "8f0c1d2e3b4a59687766554433221100ffeeddcc",
   "files": [
     {
       "path": "model-00001-of-00004.safetensors",
@@ -77,6 +78,10 @@ partially). 404 if this node has never started it — ask a different peer.
   ]
 }
 ```
+
+`commit` is the commit the origin resolved `revision` to, when it has
+commits (Hugging Face); every file is of it, and a node that fetches from
+the origin fetches that commit. It is a hex git commit id or empty.
 
 A root publishes a manifest for pull-through the first time one is asked
 for, for a catalog model it does not want whole. Its files have

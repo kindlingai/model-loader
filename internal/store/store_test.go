@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -304,6 +305,16 @@ func TestManifestValidate(t *testing.T) {
 	}
 	if err := (&Manifest{Files: []FileManifest{ok, ok}}).Validate(); err == nil {
 		t.Error("duplicate path: Validate = nil, want an error")
+	}
+	for _, c := range []string{"0123456789abcdef0123456789abcdef01234567", strings.Repeat("ab", 32)} {
+		if err := (&Manifest{Commit: c, Files: []FileManifest{ok}}).Validate(); err != nil {
+			t.Errorf("commit %q: Validate = %v", c, err)
+		}
+	}
+	for _, c := range []string{"main", "../../other/resolve/main", "0123456789abcdef0123456789abcdef0123456", strings.Repeat("zz", 20)} {
+		if err := (&Manifest{Commit: c, Files: []FileManifest{ok}}).Validate(); err == nil {
+			t.Errorf("commit %q: Validate = nil, want an error", c)
+		}
 	}
 }
 

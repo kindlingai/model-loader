@@ -45,28 +45,46 @@ func (s *huggingfaceSource) get(ctx context.Context, u string) (*http.Request, e
 	return req, nil
 }
 
-func (s *huggingfaceSource) Resolve(ctx context.Context, m catalog.Model) (*Resolved, error) {
-	u := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/%s?recursive=true",
-		m.Source.Repo, url.PathEscape(m.Revision))
+// getJSON decodes the JSON answer to a GET of u into v.
+func (s *huggingfaceSource) getJSON(ctx context.Context, u string, v any) error {
 	req, err := s.get(ctx, u)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("huggingface source: GET %s: %w", u, err)
+		return fmt.Errorf("huggingface source: GET %s: %w", u, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("huggingface source: GET %s: %s", u, resp.Status)
+		return fmt.Errorf("huggingface source: GET %s: %s", u, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("huggingface source: decode %s: %w", u, err)
+	}
+	return nil
+}
+
+// Resolve resolves m's revision (a branch, tag or commit) to its commit
+// first, and lists the files of that commit, so a branch that moves
+// meanwhile cannot mix two commits' files.
+func (s *huggingfaceSource) Resolve(ctx context.Context, m catalog.Model) (*Resolved, error) {
+	var info struct {
+		SHA string `json:"sha"`
+	}
+	if err := s.getJSON(ctx, fmt.Sprintf("https://huggingface.co/api/models/%s/revision/%s", m.Source.Repo, url.PathEscape(m.Revision)), &info); err != nil {
+		return nil, err
+	}
+	if !isCommit(info.SHA) {
+		return nil, fmt.Errorf("huggingface source: %s@%s: no commit id in the revision's info (got %q)", m.Source.Repo, m.Revision, info.SHA)
 	}
 
 	var entries []hfTreeEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("huggingface source: decode tree for %s@%s: %w", m.Source.Repo, m.Revision, err)
+	if err := s.getJSON(ctx, fmt.Sprintf("https://huggingface.co/api/models/%s/tree/%s?recursive=true", m.Source.Repo, info.SHA), &entries); err != nil {
+		return nil, err
 	}
 
-	resolved := &Resolved{}
+	resolved := &Resolved{Commit: info.SHA}
 	for _, e := range entries {
 		if e.Type != "file" {
 			continue
@@ -118,8 +136,13 @@ func (s *huggingfaceSource) Open(ctx context.Context, m catalog.Model, path stri
 	}
 }
 
-func isSHA256(s string) bool {
-	if len(s) != 64 {
+func isSHA256(s string) bool { return isHex(s, 64) }
+
+// isCommit reports whether s is a git commit id, as the Hub gives them.
+func isCommit(s string) bool { return isHex(s, 40) }
+
+func isHex(s string, n int) bool {
+	if len(s) != n {
 		return false
 	}
 	_, err := hex.DecodeString(s)

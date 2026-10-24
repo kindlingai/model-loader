@@ -125,7 +125,7 @@ func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, manifest *st
 	wg.Wait()
 	if d.IsWANEligible() {
 		if src, err := d.cfg.Sources.For(m); err == nil {
-			s.fetchers = append(s.fetchers, transfer.WANFetcher{Source: src, Model: m})
+			s.fetchers = append(s.fetchers, transfer.WANFetcher{Source: src, Model: atCommit(m, manifest)})
 		}
 	}
 	return s

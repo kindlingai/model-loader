@@ -51,7 +51,7 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 		return nil, fmt.Errorf("source for %s resolved no files", m.Name)
 	}
 
-	manifest := &store.Manifest{Model: m.Name, Revision: m.Revision}
+	manifest := &store.Manifest{Model: m.Name, Revision: m.Revision, Commit: resolved.Commit}
 	for _, rf := range resolved.Files {
 		manifest.Files = append(manifest.Files, store.FileManifest{Path: rf.Path, Size: rf.Size, SHA256: rf.SHA256})
 	}
@@ -127,7 +127,7 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 		}
 		if !of.Complete {
 			report(of.BytesDone)
-			err := d.downloadFile(ctx, src, m, rs, of, func(inFile int64) {
+			err := d.downloadFile(ctx, src, m, manifest, rs, of, func(inFile int64) {
 				written[i].Store(inFile)
 				report(inFile)
 			})
@@ -214,17 +214,18 @@ func freshOrigin(fm store.FileManifest) store.OriginFile {
 // saved segment, saving rs at every segment boundary and reporting the
 // file's bytes on disk to progress. An origin that can't serve a range gets
 // the file from the start. It gives up with errStalled if no bytes arrive
-// for Config.StallTimeout, including while waiting for the response.
-func (d *Daemon) downloadFile(ctx context.Context, src source.Source, m catalog.Model, rs *store.RevisionState, of *store.OriginFile, progress func(int64)) error {
+// for Config.StallTimeout, including while waiting for the response. It
+// fetches the commit mf resolved m's revision to.
+func (d *Daemon) downloadFile(ctx context.Context, src source.Source, m catalog.Model, mf *store.Manifest, rs *store.RevisionState, of *store.OriginFile, progress func(int64)) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	stall := time.AfterFunc(d.cfg.StallTimeout, func() { cancel(errStalled) })
 	defer stall.Stop()
 
-	rc, err := src.Open(ctx, m, of.Path, of.BytesDone, 0)
+	rc, err := src.Open(ctx, atCommit(m, mf), of.Path, of.BytesDone, 0)
 	if errors.Is(err, source.ErrRangeIgnored) {
 		*of = freshOrigin(of.FileManifest)
-		rc, err = src.Open(ctx, m, of.Path, 0, 0)
+		rc, err = src.Open(ctx, atCommit(m, mf), of.Path, 0, 0)
 	}
 	if err != nil {
 		return stallCause(ctx, err)

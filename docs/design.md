@@ -231,7 +231,9 @@ Complete:
 
 Bytes a segment the state marks held covers are on disk: a segment is
 marked held only once written and verified, and an evicted one is marked
-not held before its bytes are freed. Eviction removes only pieces nothing
+not held before its bytes are freed. If saving the state fails, the old
+state file is removed, as it may mark held a segment since found bad;
+until a save succeeds the revision reads as holding nothing. Eviction removes only pieces nothing
 on the node wants, so a consumer keeps what it reads pinned with a request
 or a selection entry while model-loader runs.
 

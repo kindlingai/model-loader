@@ -459,7 +459,8 @@ func TestSegmentBoundsNoOverflow(t *testing.T) {
 	}
 }
 
-// A failed state save is remembered until a save succeeds.
+// A failed state save is remembered until a save succeeds, and leaves no
+// state file behind.
 func TestStateSaved(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
@@ -487,7 +488,28 @@ func TestStateSaved(t *testing.T) {
 	if !s.StateSaved("m", "r1") {
 		t.Fatal("StateSaved = false after a good save")
 	}
-	_ = m
+
+	// A save that fails removes the old file, which may mark held a
+	// segment since found bad: a consumer reading the store then sees
+	// nothing held. The next good save writes it again.
+	path := s.statePath("m", "r1")
+	if err := os.Mkdir(path+".tmp", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rs.DropSegment(m.Files[0], 0)
+	if err := s.SaveState(rs); err == nil {
+		t.Fatal("SaveState = nil with its temp file blocked")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale state file still there after a failed save: %v", err)
+	}
+	os.Remove(path + ".tmp")
+	if err := s.SaveState(rs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("state file not written again: %v", err)
+	}
 }
 
 // A segment of a hashless file keeps its sha256 whatever its trust, so a

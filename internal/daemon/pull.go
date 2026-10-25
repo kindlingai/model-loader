@@ -282,7 +282,11 @@ func (d *Daemon) pullFile(ctx context.Context, m catalog.Model, mf *store.Manife
 			return err
 		}
 		err = transfer.ApplyChecks(f, fm, rs, checks)
-		if serr := d.cfg.Store.SaveState(rs); err == nil {
+		save := d.cfg.Store.SaveState
+		if fm.Small() && err == nil {
+			save = d.cfg.Store.SaveStateSoon // see transfer.Options.SaveSoon
+		}
+		if serr := save(rs); err == nil {
 			err = serr
 		}
 		if err == nil {
@@ -349,39 +353,132 @@ func (d *Daemon) originSources(m catalog.Model) *sources {
 	return s
 }
 
-// pullSegments fetches the segments segs marks that rs does not hold, with
-// at most Config.PullWorkers of this call's chunks in flight, and at most
-// that many across the node fetching at once; one fetch per chunk however
-// many callers want it. A chunk (see store.ChunkSize) is one segment for a
-// file of 64 MiB segments; for a file of smaller ones, each fetch takes
-// the chunk's missing segments that segs marks in as few ranges as the
-// sources allow (see transfer.FetchFile).
+// pullSegments fetches the segments segs marks that rs does not hold:
+// one fetch per segment however many callers want it, at most
+// Config.PullWorkers of this call's chunks in flight, and at most that
+// many across the node (pullLimit). Each segment a call fetches is
+// claimed first (see claimSegments); segments another call is fetching
+// are waited for, not fetched again. A call's claimed segments of one
+// chunk go as one fetch, in as few ranges as the sources allow (see
+// transfer.FetchFile), so callers wanting disjoint segments of one chunk
+// fetch them in parallel.
 func (d *Daemon) pullSegments(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, segs []bool, srcs *sources) error {
-	fs := rs.FileState(fm)
-	queue := make(chan int)
+	file := want.Key(m.Name, m.Revision) + "\x00" + fm.Path
+	// Each round fetches what this call claimed and waits for the rest.
+	// What another call failed to fetch is claimed by this one next
+	// round; a fetch of this call's own that fails ends it.
+	for {
+		mine, theirs := d.claimSegments(file, fm, rs, segs)
+		if mine == nil && theirs == nil {
+			return nil
+		}
+		if mine != nil {
+			err := d.fetchClaimed(ctx, m, fm, rs, mine, srcs)
+			d.releaseSegments(file, mine)
+			if err != nil {
+				return err
+			}
+		}
+		for _, ch := range theirs {
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+// pullClaim is one segment a call is fetching: done is closed when it
+// is over, held or not.
+type pullClaim struct{ done chan struct{} }
+
+// claimSegments claims for the caller the segments segs marks that rs
+// does not hold and no other call is fetching (mine, one bool per
+// segment, nil if none), and returns the done channels of those another
+// call is fetching (theirs).
+func (d *Daemon) claimSegments(file string, fm store.FileManifest, rs *store.RevisionState, segs []bool) (mine []bool, theirs []chan struct{}) {
+	d.pullMu.Lock()
+	defer d.pullMu.Unlock()
+	if d.claims == nil {
+		d.claims = make(map[string]map[int]*pullClaim)
+	}
+	held := rs.FileState(fm).SegmentsDone
+	claims := d.claims[file]
+	for i, w := range segs {
+		if !w || (i < len(held) && held[i]) {
+			continue
+		}
+		if c := claims[i]; c != nil {
+			theirs = append(theirs, c.done)
+			continue
+		}
+		if claims == nil {
+			claims = make(map[int]*pullClaim)
+			d.claims[file] = claims
+		}
+		claims[i] = &pullClaim{done: make(chan struct{})}
+		if mine == nil {
+			mine = make([]bool, len(segs))
+		}
+		mine[i] = true
+	}
+	return mine, theirs
+}
+
+// releaseSegments ends the caller's claims on mine.
+func (d *Daemon) releaseSegments(file string, mine []bool) {
+	d.pullMu.Lock()
+	defer d.pullMu.Unlock()
+	claims := d.claims[file]
+	for i, m := range mine {
+		if c := claims[i]; m && c != nil {
+			close(c.done)
+			delete(claims, i)
+		}
+	}
+	if len(claims) == 0 {
+		delete(d.claims, file)
+	}
+}
+
+// fetchClaimed fetches the segments mine marks, a chunk at a time, at
+// most Config.PullWorkers chunks at once.
+func (d *Daemon) fetchClaimed(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, mine []bool, srcs *sources) error {
+	queue := make(chan []bool)
 	var wg sync.WaitGroup
-	errs := make([]error, fm.NumChunks())
+	var mu sync.Mutex
+	var errs []error
 	for range d.cfg.PullWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for c := range queue {
-				errs[c] = d.pullChunk(ctx, m, fm, rs, c, segs, srcs)
+			for need := range queue {
+				if err := d.pullFetch(ctx, m, fm, rs, need, srcs); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+				}
 			}
 		}()
 	}
 loop:
 	for c := range fm.NumChunks() {
 		first, end := fm.ChunkBounds(c)
-		missing := false
-		for i := first; i < end && !missing; i++ {
-			missing = segs[i] && fs.TrustOf(i) == ""
+		var need []bool
+		for i := first; i < end; i++ {
+			if mine[i] {
+				if need == nil {
+					need = make([]bool, fm.NumSegments())
+				}
+				need[i] = true
+			}
 		}
-		if !missing {
+		if need == nil {
 			continue
 		}
 		select {
-		case queue <- c:
+		case queue <- need:
 		case <-ctx.Done():
 			break loop
 		}
@@ -394,47 +491,8 @@ loop:
 	return errors.Join(errs...)
 }
 
-// pullChunk fetches the segments of chunk c of fm that segs marks and rs
-// does not hold. Callers that want the same chunk at once share one fetch;
-// one that wants segments the fetch did not take fetches again for them.
-func (d *Daemon) pullChunk(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, c int, segs []bool, srcs *sources) error {
-	first, end := fm.ChunkBounds(c)
-	missing := func() []bool {
-		var need []bool
-		for i := first; i < end; i++ {
-			if segs[i] && rs.SegmentTrust(fm, i) == "" {
-				if need == nil {
-					need = make([]bool, fm.NumSegments())
-				}
-				need[i] = true
-			}
-		}
-		return need
-	}
-	for attempt := 0; ; attempt++ {
-		need := missing()
-		if need == nil {
-			return nil
-		}
-		if attempt == 2 {
-			// Another caller's fetch of the chunk took other segments,
-			// twice: fetch these without it.
-			return d.pullFetch(ctx, m, fm, rs, need, srcs)
-		}
-		key := fmt.Sprintf("segment %s %s %d", want.Key(m.Name, m.Revision), fm.Path, c)
-		if _, err := d.once(ctx, key, func() (any, error) {
-			return nil, d.pullFetch(ctx, m, fm, rs, missing(), srcs)
-		}); err != nil {
-			return err
-		}
-	}
-}
-
 // pullFetch fetches the segments need marks, at the caller's priority.
 func (d *Daemon) pullFetch(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, need []bool, srcs *sources) error {
-	if need == nil {
-		return nil // another call fetched them just now.
-	}
 	// Wait for a slot, at the caller's priority (the first caller's, for
 	// a chunk many want), as long as the caller does; once the fetch has
 	// started it finishes even if the caller goes away, as others may be
@@ -447,7 +505,7 @@ func (d *Daemon) pullFetch(ctx context.Context, m catalog.Model, fm store.FileMa
 	defer cancel()
 	defer d.writing(m.Name, m.Revision, fm)()
 	return transfer.FetchFile(pctx, d.cfg.Store, m.Name, m.Revision, fm, rs,
-		srcs.fetchers, transfer.Options{Need: need, Order: srcs.order(fm.Path)})
+		srcs.fetchers, transfer.Options{Need: need, Order: srcs.order(fm), SaveSoon: true})
 }
 
 // lazy reports whether mf has a file with no segment hashes: a manifest a

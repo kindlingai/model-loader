@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -82,20 +83,31 @@ type spaceNeed struct {
 // held or not. Fetches of the same chunk share one, the union of what
 // each needs. d.diskMu guards segs.
 type chunkNeed struct {
-	rs   *store.RevisionState
-	fm   store.FileManifest
-	bs   int64
-	segs map[int]bool
+	rs    *store.RevisionState
+	fm    store.FileManifest
+	bs    int64
+	first int    // the chunk's first segment
+	segs  []bool // segs[k]: segment first+k is needed
+
+	// The last count, at rs generation gen; see remaining. d.diskMu.
+	counted   bool
+	gen, left uint64
 }
 
 // remaining is the room the segments not held yet need, in the
 // filesystem blocks each touches, bs bytes a block, as the store's use is
 // counted.
 func (c *chunkNeed) remaining() int64 {
+	gen := c.rs.Gen()
+	if c.counted && c.gen == gen {
+		return int64(c.left)
+	}
 	var n int64
+	defer func() { c.counted, c.gen, c.left = true, gen, uint64(n) }()
 	c.rs.View(c.fm, func(fs *store.FileState) {
-		for i := range c.segs {
-			if i < len(fs.SegmentsDone) && fs.SegmentsDone[i] {
+		for k, want := range c.segs {
+			i := c.first + k
+			if !want || (i < len(fs.SegmentsDone) && fs.SegmentsDone[i]) {
 				continue
 			}
 			start, end := c.fm.SegmentBounds(i)
@@ -118,10 +130,11 @@ func segmentNeeds(mf *store.Manifest, rs *store.RevisionState, fm store.FileMani
 			}
 			if c := fm.ChunkOf(i); c != curChunk {
 				curChunk = c
-				cur = &chunkNeed{rs: rs, fm: fm, bs: bs, segs: make(map[int]bool)}
+				first, end := fm.ChunkBounds(c)
+				cur = &chunkNeed{rs: rs, fm: fm, bs: bs, first: first, segs: make([]bool, end-first)}
 				out = append(out, spaceNeed{key: useKey(mf.Model, mf.Revision, fm.Path, c), remaining: cur.remaining, chunk: cur})
 			}
-			cur.segs[i] = true
+			cur.segs[i-cur.first] = true
 		}
 	})
 	return out
@@ -184,9 +197,10 @@ func (d *Daemon) makeRoom(ctx context.Context, needs []spaceNeed) (func(), error
 			joined = false
 		} else if r.chunk != nil && n.chunk != nil {
 			// The reservation covers what every fetch of the chunk needs.
-			for i := range n.chunk.segs {
-				if !r.chunk.segs[i] {
-					r.chunk.segs[i] = true
+			for k, want := range n.chunk.segs {
+				if want && k < len(r.chunk.segs) && !r.chunk.segs[k] {
+					r.chunk.segs[k] = true
+					r.chunk.counted = false
 					joined = false
 				}
 			}
@@ -271,16 +285,33 @@ func (d *Daemon) freeLocked(ctx context.Context) {
 		log.Printf("model-loader: not evicting: %v", err)
 		return
 	}
-	for _, v := range vs {
-		if d.fitsLocked() {
+	used, need, err := d.measureLocked()
+	if err != nil {
+		return
+	}
+	over := used + need - d.cfg.DiskBudget
+	// Pick victims, oldest first, until their bytes cover what is over,
+	// then evict them together: one state save per revision, not one per
+	// chunk. Freed space is measured again after, and another batch goes
+	// if holes did not free what was counted (a partial block, say).
+	for len(vs) > 0 && over > 0 {
+		var batch []victim
+		var bytes int64
+		for len(vs) > 0 && bytes < over {
+			v := vs[0]
+			vs = vs[1:]
+			if v = v.filter(func(i int) bool { return !pinned(pins, v.mf, v.fm, i) }); len(v.segs) > 0 {
+				batch = append(batch, v)
+				bytes += v.bytes
+			}
+		}
+		for _, err := range d.evictBatch(batch) {
+			log.Printf("model-loader: evict: %v", err)
+		}
+		if used, need, err = d.measureLocked(); err != nil {
 			return
 		}
-		if v = v.filter(func(i int) bool { return !pinned(pins, v.mf, v.fm, i) }); len(v.segs) == 0 {
-			continue
-		}
-		if _, err := d.evict(v); err != nil {
-			log.Printf("model-loader: evict %s@%s %s chunk %d: %v", v.mf.Model, v.mf.Revision, v.fm.Path, v.chunk, err)
-		}
+		over = used + need - d.cfg.DiskBudget
 	}
 }
 
@@ -313,15 +344,25 @@ func (d *Daemon) reclaimLocked() {
 			if d.cfg.Store.FileAllocated(mf.Model, mf.Revision, fm.Path) == 0 {
 				continue
 			}
+			// Only a file with more on disk than its held segments take
+			// has anything to free. (Allocated includes the blocks a held
+			// run's ends share with unheld bytes: none of those can be
+			// freed anyway.)
+			var heldBytes int64
+			rs.View(fm, func(fs *store.FileState) { heldBytes = fs.BytesDone(fm) })
+			if d.cfg.Store.FileAllocated(mf.Model, mf.Revision, fm.Path) <= heldBytes {
+				continue
+			}
+			savedHeld := saved.FileState(fm).SegmentsDone
 			d.useMu.Lock()
 			if d.serving[useKey(mf.Model, mf.Revision, fm.Path, fileUse)] == 0 {
-				held := rs.FileState(fm).SegmentsDone
-				savedHeld := saved.FileState(fm).SegmentsDone
+				busy := d.chunksInUseLocked(mf, fm)
 				free := make([]bool, fm.NumSegments())
-				for i := range free {
-					free[i] = !(i < len(held) && held[i]) && !(i < len(savedHeld) && savedHeld[i]) &&
-						d.serving[useKey(mf.Model, mf.Revision, fm.Path, fm.ChunkOf(i))] == 0
-				}
+				rs.View(fm, func(fs *store.FileState) {
+					for i := range free {
+						free[i] = !(i < len(fs.SegmentsDone) && fs.SegmentsDone[i]) && !(i < len(savedHeld) && savedHeld[i]) && !busy[fm.ChunkOf(i)]
+					}
+				})
 				_ = d.cfg.Store.FreeSegments(mf.Model, mf.Revision, fm, store.Runs(free), false)
 			}
 			d.useMu.Unlock()
@@ -597,38 +638,110 @@ func (d *Daemon) lowerHolds(answers []*server.SegmentsResponse) func(path string
 	}
 }
 
-// evict removes the segments of v from the store, unless the chunk is in
-// use; those no longer held are left alone. It reports whether it dropped
-// any from the state; the space it frees is measured, not assumed.
+// evict removes the segments of v from the store (see evictBatch). It
+// reports whether it dropped any from the state.
 func (d *Daemon) evict(v victim) (bool, error) {
+	dropped, errs := d.evictBatchN([]victim{v})
+	return dropped > 0, errors.Join(errs...)
+}
+
+// evictBatch removes the segments of every victim of vs whose chunk is
+// not in use, and returns what went wrong.
+func (d *Daemon) evictBatch(vs []victim) []error {
+	_, errs := d.evictBatchN(vs)
+	return errs
+}
+
+// evictBatchN removes the held segments of every victim of vs whose chunk
+// is not in use; those no longer held are left alone. They are dropped
+// from the state in memory, with the chunk marked in use so nothing
+// serves or fetches into it meanwhile; each revision's state is saved
+// once; then their blocks are freed. A revision whose save fails keeps
+// its bytes (the state file was removed, see Store.SaveState). It
+// returns how many victims it dropped segments of; the space it frees is
+// measured, not assumed.
+func (d *Daemon) evictBatchN(vs []victim) (int, []error) {
+	type done struct {
+		v    victim
+		last bool
+	}
+	var taken []done
+	var keys []string
 	d.useMu.Lock()
-	defer d.useMu.Unlock()
-	if d.inUseLocked(v) {
-		return false, nil
-	}
-	unlock := v.rs.LockFile(v.fm.Path)
-	defer unlock()
-	if v = v.filter(func(i int) bool { return v.rs.SegmentTrust(v.fm, i) != "" }); len(v.segs) == 0 {
-		return false, nil
-	}
-	v.rs.EvictSegments(v.fm, v.segs)
-	if err := d.cfg.Store.SaveState(v.rs); err != nil {
-		return true, err
-	}
-	last := true
-	v.rs.View(v.fm, func(fs *store.FileState) {
-		for _, held := range fs.SegmentsDone {
-			last = last && !held
+	for _, v := range vs {
+		if d.inUseLocked(v) {
+			continue
 		}
-	})
-	gone := make([]bool, v.fm.NumSegments())
-	for _, i := range v.segs {
-		gone[i] = true
+		unlock := v.rs.LockFile(v.fm.Path)
+		v = v.filter(func(i int) bool { return v.rs.SegmentTrust(v.fm, i) != "" })
+		if len(v.segs) > 0 {
+			v.rs.EvictSegments(v.fm, v.segs)
+			last := true
+			v.rs.View(v.fm, func(fs *store.FileState) {
+				for _, held := range fs.SegmentsDone {
+					last = last && !held
+				}
+			})
+			taken = append(taken, done{v, last})
+			k := useKey(v.mf.Model, v.mf.Revision, v.fm.Path, v.chunk)
+			d.serving[k]++
+			keys = append(keys, k)
+		}
+		unlock()
 	}
-	// Nothing writes the file (inUseLocked), so removing it with nothing
-	// held cannot strand a transfer's writes in an unlinked file. If this
-	// fails the space stays charged, and reclaimLocked tries again.
-	return true, d.cfg.Store.FreeSegments(v.mf.Model, v.mf.Revision, v.fm, store.Runs(gone), last)
+	d.useMu.Unlock()
+	defer func() {
+		d.useMu.Lock()
+		for _, k := range keys {
+			if d.serving[k]--; d.serving[k] <= 0 {
+				delete(d.serving, k)
+			}
+		}
+		d.useMu.Unlock()
+	}()
+
+	var errs []error
+	saved := map[*store.RevisionState]error{}
+	for _, t := range taken {
+		if _, ok := saved[t.v.rs]; !ok {
+			saved[t.v.rs] = d.cfg.Store.SaveState(t.v.rs)
+			if err := saved[t.v.rs]; err != nil {
+				errs = append(errs, fmt.Errorf("%s@%s: save state: %w", t.v.mf.Model, t.v.mf.Revision, err))
+			}
+		}
+	}
+	for _, t := range taken {
+		if saved[t.v.rs] != nil {
+			continue
+		}
+		v := t.v
+		gone := make([]bool, v.fm.NumSegments())
+		for _, i := range v.segs {
+			gone[i] = true
+		}
+		// The chunk is marked in use, so nothing writes into it now. A
+		// file with nothing held is removed only if nothing writes any
+		// of it (useMu, fileUse); else just the hole is punched. If this
+		// fails the space stays charged, and reclaimLocked tries again.
+		last := t.last
+		if last {
+			d.useMu.Lock()
+			last = d.serving[useKey(v.mf.Model, v.mf.Revision, v.fm.Path, fileUse)] == 0
+			if last {
+				err := d.cfg.Store.FreeSegments(v.mf.Model, v.mf.Revision, v.fm, store.Runs(gone), true)
+				d.useMu.Unlock()
+				if err != nil {
+					errs = append(errs, fmt.Errorf("%s@%s %s chunk %d: %w", v.mf.Model, v.mf.Revision, v.fm.Path, v.chunk, err))
+				}
+				continue
+			}
+			d.useMu.Unlock()
+		}
+		if err := d.cfg.Store.FreeSegments(v.mf.Model, v.mf.Revision, v.fm, store.Runs(gone), false); err != nil {
+			errs = append(errs, fmt.Errorf("%s@%s %s chunk %d: %w", v.mf.Model, v.mf.Revision, v.fm.Path, v.chunk, err))
+		}
+	}
+	return len(taken), errs
 }
 
 // retireLocked evicts what it may of every retired revision (see the
@@ -659,22 +772,23 @@ func (d *Daemon) retireLocked(ctx context.Context) {
 			continue
 		}
 		held := false
+		var batch []victim
 		for _, fm := range mf.Files {
 			for _, v := range heldChunks(mf, rs, fm) {
 				all := len(v.segs)
 				if v = v.filter(func(i int) bool { return lower(fm.Path, i) }); len(v.segs) < all {
 					held = true // a segment only this node holds stays.
 				}
-				if len(v.segs) == 0 {
-					continue
+				if len(v.segs) > 0 {
+					batch = append(batch, v)
 				}
-				dropped, err := d.evict(v)
-				if err != nil {
-					log.Printf("model-loader: evict retired %s@%s %s chunk %d: %v", ref.Model, ref.Revision, fm.Path, v.chunk, err)
-				}
-				held = held || !dropped
 			}
 		}
+		dropped, errs := d.evictBatchN(batch)
+		for _, err := range errs {
+			log.Printf("model-loader: evict retired %s@%s: %v", ref.Model, ref.Revision, err)
+		}
+		held = held || dropped < len(batch) || len(errs) > 0
 		if !held {
 			d.useMu.Lock()
 			if !d.revisionInUseLocked(ref) {
@@ -682,13 +796,16 @@ func (d *Daemon) retireLocked(ctx context.Context) {
 				for _, fm := range mf.Files {
 					paths = append(paths, fm.Path)
 				}
-				if err := d.cfg.Store.RemoveRevision(ref.Model, ref.Revision, paths); err != nil {
+				rs.Close() // no save put off for later may write it back.
+				err := d.cfg.Store.RemoveRevision(ref.Model, ref.Revision, paths)
+				// Closed, rs saves nothing more: load it again if needed.
+				d.stateMu.Lock()
+				delete(d.states, want.Key(ref.Model, ref.Revision))
+				d.stateMu.Unlock()
+				if err != nil {
 					log.Printf("model-loader: remove retired %s@%s: %v", ref.Model, ref.Revision, err)
 				} else {
 					log.Printf("model-loader: removed retired %s@%s: nothing of it is held here", ref.Model, ref.Revision)
-					d.stateMu.Lock()
-					delete(d.states, want.Key(ref.Model, ref.Revision))
-					d.stateMu.Unlock()
 				}
 			}
 			d.useMu.Unlock()
@@ -740,6 +857,21 @@ func (d *Daemon) fleetRetired(answers []*server.SegmentsResponse) bool {
 func (d *Daemon) Cataloged(model, revision string) bool {
 	_, ok := d.catalogModel(model, revision)
 	return ok
+}
+
+// chunksInUseLocked returns the chunks of fm being served or fetched.
+// d.useMu is held.
+func (d *Daemon) chunksInUseLocked(mf *store.Manifest, fm store.FileManifest) map[int]bool {
+	prefix := fmt.Sprintf("%s\x00%s\x00", want.Key(mf.Model, mf.Revision), fm.Path)
+	busy := map[int]bool{}
+	for k, n := range d.serving {
+		if rest, ok := strings.CutPrefix(k, prefix); ok && n > 0 {
+			if c, err := strconv.Atoi(rest); err == nil {
+				busy[c] = true
+			}
+		}
+	}
+	return busy
 }
 
 // fileUse is the chunk index useKey takes for a whole file: something

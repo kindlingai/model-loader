@@ -144,6 +144,12 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 			// against the sha256 this node vouches for (see
 			// server.HeaderSegmentSHA256), as for pull-through.
 			manifest.Files[i].SegmentSize, manifest.Files[i].SegmentSHA256 = size, nil
+			// Their sha256, of the bytes just checked whole, go in the
+			// side file now: what this node vouches for, and what a
+			// re-verify checks, once part of the file is evicted.
+			if err := d.hashSmallFile(m, manifest.Files[i]); err != nil {
+				return nil, fmt.Errorf("hash %s: %w", fm.Path, err)
+			}
 		}
 		done += fm.Size
 		report(0)
@@ -165,6 +171,27 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 	}
 
 	return manifest, nil
+}
+
+// hashSmallFile writes the sha256 of every segment of fm, a file of small
+// segments held whole, to its side file, a chunk at a time.
+func (d *Daemon) hashSmallFile(m catalog.Model, fm store.FileManifest) error {
+	f, err := os.Open(d.cfg.Store.FilePath(m.Name, m.Revision, fm.Path))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for c := range fm.NumChunks() {
+		first, end := fm.ChunkBounds(c)
+		sums, err := store.HashSegments(f, fm, first, end-first)
+		if err != nil {
+			return err
+		}
+		if err := d.cfg.Store.WriteSegmentHashes(m.Name, m.Revision, fm, first, sums); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // originProgress returns fm's entry in rs.Origin, starting it over unless the

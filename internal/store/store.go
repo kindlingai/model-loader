@@ -125,14 +125,42 @@ const stateSaveEvery = time.Second
 func (s *Store) SaveStateSoon(rs *RevisionState) error {
 	rs.saveMu.Lock()
 	defer rs.saveMu.Unlock()
-	if time.Since(rs.lastSave) < stateSaveEvery && s.StateSaved(rs.Model, rs.Revision) {
+	if wait := stateSaveEvery - time.Since(rs.lastSave); wait > 0 && s.StateSaved(rs.Model, rs.Revision) {
+		// Saved just now: save again once the second is up, so what was
+		// marked held since reaches the disk without another caller.
+		if rs.flush == nil && !rs.closed {
+			rs.flush = time.AfterFunc(wait, func() {
+				rs.saveMu.Lock()
+				defer rs.saveMu.Unlock()
+				rs.flush = nil
+				if !rs.closed {
+					_ = s.saveLocked(rs)
+				}
+			})
+		}
 		return nil
 	}
 	return s.saveLocked(rs)
 }
 
+// Close stops rs being saved again: a save SaveStateSoon has put off is
+// dropped, and later saves do nothing. Its revision is about to be
+// removed from the store.
+func (rs *RevisionState) Close() {
+	rs.saveMu.Lock()
+	defer rs.saveMu.Unlock()
+	rs.closed = true
+	if rs.flush != nil {
+		rs.flush.Stop()
+		rs.flush = nil
+	}
+}
+
 // saveLocked is SaveState. rs.saveMu is held.
 func (s *Store) saveLocked(rs *RevisionState) error {
+	if rs.closed {
+		return nil
+	}
 	snap, small := rs.snapshot()
 	path := s.statePath(snap.Model, snap.Revision)
 	err := os.MkdirAll(filepath.Dir(path), 0o755)

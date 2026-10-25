@@ -102,9 +102,11 @@ func WithNoPull(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noPullKey{}, true)
 }
 
-// maxSegmentsBody bounds a peer's /segments (and /status) answer. A revision with ten
-// thousand files of a hundred segment runs each fits well inside it.
-const maxSegmentsBody = 16 << 20
+// maxSegmentsBody bounds a peer's /segments (and /status) answer. A peer
+// holding one rank's expert halves of a release in 64 KiB segments
+// reports about a million runs (tens of MB) for it; a revision with ten
+// thousand files of a hundred runs each fits too.
+const maxSegmentsBody = 256 << 20
 
 // ErrNoSegments means a peer predates GET /segments, so what it holds is
 // unknown.

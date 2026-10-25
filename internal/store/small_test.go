@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func withChunk(t *testing.T, n int64) {
@@ -233,5 +234,39 @@ func TestSaveStateSoon(t *testing.T) {
 	got, _ = s.LoadState(m)
 	if fs := got.FileState(fm); !fs.SegmentsDone[1] {
 		t.Fatal("SaveState did not write")
+	}
+}
+
+// A save SaveStateSoon put off is written once the second is up, unless
+// the state is closed (its revision removed) first.
+func TestSaveStateSoonFlushAndClose(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm := FileManifest{Path: "a", Size: 30, SegmentSize: 10}
+	m := &Manifest{Model: "m", Revision: "r1", Files: []FileManifest{fm}}
+	rs := NewRevisionState(m)
+	rs.MarkSegment(fm, 0, "", TrustManifest)
+	s.SaveStateSoon(rs)
+	rs.MarkSegment(fm, 1, "", TrustManifest)
+	s.SaveStateSoon(rs) // put off
+	time.Sleep(stateSaveEvery + 300*time.Millisecond)
+	got, _ := s.LoadState(m)
+	if !got.FileState(fm).SegmentsDone[1] {
+		t.Fatal("the save put off was not written")
+	}
+
+	rs.MarkSegment(fm, 2, "", TrustManifest)
+	s.SaveStateSoon(rs) // saved now: the last was over a second ago
+	rs.MarkSegment(fm, 0, "", TrustManifest)
+	s.SaveStateSoon(rs) // put off
+	rs.Close()
+	if err := s.RemoveRevision("m", "r1", []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(stateSaveEvery + 300*time.Millisecond)
+	if _, err := os.Stat(filepath.Join(s.Dir(), "state", "m", "r1.json")); !os.IsNotExist(err) {
+		t.Fatalf("state of a removed revision written back: %v", err)
 	}
 }

@@ -120,8 +120,12 @@ type Daemon struct {
 	stateMu sync.Mutex
 	states  map[string]*store.RevisionState // see revState
 
-	pullMu    sync.Mutex
-	pulls     map[string]*pullCall // see once
+	pullMu sync.Mutex
+	pulls  map[string]*pullCall          // see once
+	claims map[string]map[int]*pullClaim // see claimSegments
+
+	needMu    sync.Mutex
+	needs     map[string]*resolvedNeed // see resolveRequest
 	pullSrcs  map[string]cachedSources
 	pullLimit *transfer.Limiter // pull-through segment fetches, by priority
 }
@@ -440,6 +444,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	// and, through the priority header, at a root pulling through.
 	ctx = server.WithPriority(ctx, w.Priority)
 	var errs []error
+	lastProgress := time.Now()
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
@@ -451,7 +456,7 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
 		} else {
 			err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
-				Need: fn.Segments, Order: srcs.order(fm.Path), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
+				Need: fn.Segments, Order: srcs.order(fm), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
 			})
 		}
 		done()
@@ -462,7 +467,12 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 			errs = append(errs, fmt.Errorf("fetch %s: %w", fm.Path, err))
 			continue
 		}
-		d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
+		// Progress is worked out over every needed segment: at most once
+		// a second, not after each of hundreds of files.
+		if time.Since(lastProgress) >= time.Second {
+			d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
+			lastProgress = time.Now()
+		}
 	}
 	if err := errors.Join(errs...); err != nil {
 		ms := progress(w, manifest, need, rs, server.StateError)

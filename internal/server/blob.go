@@ -140,9 +140,7 @@ func (s *Server) claims(m *store.Manifest, fm store.FileManifest, rs *store.Revi
 		return nil, nil
 	}
 	sums, trusts := make([]string, n), make([]string, n)
-	complete := false
 	rs.View(fm, func(fs *store.FileState) {
-		complete = fs.Complete
 		for k := range n {
 			sums[k], trusts[k] = fs.SegmentHash(fm, first+k), fs.TrustOf(first+k)
 		}
@@ -155,33 +153,12 @@ func (s *Server) claims(m *store.Manifest, fm store.FileManifest, rs *store.Revi
 			}
 		}
 	}
-	f := (*os.File)(nil)
-	defer func() {
-		if f != nil {
-			f.Close()
-		}
-	}()
 	for k := range n {
-		if sums[k] != "" {
-			continue
-		}
-		if !complete {
+		if sums[k] == "" {
+			// Vouch only with a sha256 recorded when the bytes were
+			// verified, never one of the bytes as they are now.
 			return nil, nil
 		}
-		// A file verified whole that recorded no segment hash (a root's
-		// whole download of a file of small segments): its bytes are the
-		// origin's, so hash them now.
-		if f == nil {
-			var err error
-			if f, err = os.Open(s.store.FilePath(m.Model, m.Revision, fm.Path)); err != nil {
-				return nil, nil
-			}
-		}
-		h, err := store.HashSegment(f, fm, first+k)
-		if err != nil {
-			return nil, nil
-		}
-		sums[k] = h
 	}
 	return sums, trusts
 }

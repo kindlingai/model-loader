@@ -114,7 +114,9 @@ models:
   peer checks each it copies against the sha256 its source sends with it.
   The whole file is checked against the origin's sha256 once every
   segment is held, as before. A root that downloads such a file whole
-  checks it whole, and vouches for a segment by hashing it when asked.
+  checks it whole, then records the sha256 of each of its segments. A
+  node vouches for a segment only with a sha256 recorded when its bytes
+  were verified, never by hashing them as they are when asked.
 - With 64 KiB segments a request for one rank's halves holds about 1.3x
   their bytes (a half is not aligned to segments, so each holds part of
   a segment at each end).
@@ -135,15 +137,28 @@ scale:
   held. It is model-loader's own, not part of the store contract.
 - Use times, eviction, disk reservations and in-use marks are per chunk
   of 64 MiB, not per segment. Eviction removes the held segments of a
-  chunk that nothing pins together; a pinned segment in it stays.
+  chunk that nothing pins together; a pinned segment in it stays. The
+  victims of one pass are dropped together, with one state save per
+  revision.
 - Consecutive segments of one chunk, from the same sources, are fetched
-  as one range of at most 256 segments. A source vouches for each with
+  as one range of at most 256 segments. The holders a fetch tries first
+  rotate per chunk, not per segment, so a chunk's segments go to one
+  holder in one range, and different chunks to different holders. A source vouches for each with
   one sha256 per segment (see `X-Segment-SHA256` in
   `docs/protocol.md`). A source that vouches for none (an older node)
   is asked for the run again segment by segment.
 - A file of small segments saves its state at most once a second while
-  its segments land, and once at the end. The state on disk holds fewer
-  segments than the node does in between, never more.
+  its segments land, and once at the end. A root filling a pull-through
+  saves it at most once a second (a timer writes what is left), as the
+  peer it fills is served from memory. The state on disk holds fewer
+  segments than the node does in between, never more; a drop or an
+  eviction is saved at once.
+- A root pulling through claims each segment it fetches: a request for
+  segments another request is fetching waits for them, and fetches the
+  rest itself, so requests for disjoint segments of one chunk run in
+  parallel and no segment is fetched twice.
+- `/segments` from a node holding one rank's halves of the release is
+  about a million runs (tens of MB); an answer may be up to 256 MiB.
 - A blob request reads what is held from the state the node keeps in
   memory, not the state file.
 

@@ -98,7 +98,7 @@ it has no manifest for answers with no files. A 404 means a node too old to
 have this endpoint. A fetching node then reads its `/status`: a plain peer
 that reports the revision `ready` holds every segment; otherwise what it
 holds is unknown. An answer for another model or revision, or with a file
-or range outside the manifest, is ignored, as is any answer over 16 MiB.
+or range outside the manifest, is ignored, as is any answer over 256 MiB.
 
 ```json
 {
@@ -157,7 +157,7 @@ have no `segment_sha256` for them, as one from a pull-through root has
 none, and a file of small segments never has):
 
 - `X-Segment-SHA256`: the sha256 this node holds for each segment,
-  comma-separated, in order. The requester checks the bytes of each
+  comma-separated, in order, as recorded when it verified the segment. The requester checks the bytes of each
   against it. A node older than small segments sends this only for a
   request of one segment.
 - `X-Segment-Trust`: how this node verified each, in the same order:

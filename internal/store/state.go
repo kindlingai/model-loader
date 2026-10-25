@@ -406,6 +406,9 @@ type RevisionState struct {
 	locks      map[string]*sync.Mutex // see LockFile
 	index      map[string]int         // Files by path; see find
 	lastSave   time.Time              // see Store.SaveStateSoon; guarded by saveMu
+	flush      *time.Timer            // a SaveStateSoon save to come; guarded by saveMu
+	closed     bool                   // see Close; guarded by saveMu
+	gen        uint64                 // bumped at every change; see Gen
 	Model      string                 `json:"model"`
 	Revision   string                 `json:"revision"`
 	Files      []FileState            `json:"files"`
@@ -509,6 +512,7 @@ func (rs *RevisionState) RangeReady(fm FileManifest, start, end int64) bool {
 func (rs *RevisionState) SetFileState(fs FileState) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	rs.gen++
 	rs.setLocked(fs.clone())
 }
 
@@ -541,11 +545,20 @@ func (rs *RevisionState) setLocked(fs FileState) {
 	rs.index = nil
 }
 
+// Gen returns a number that changes whenever what rs holds may have: a
+// caller can keep what it worked out from rs until it does.
+func (rs *RevisionState) Gen() uint64 {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.gen
+}
+
 // update applies fn to fm's state, created and fitted to fm's segments,
 // atomically.
 func (rs *RevisionState) update(fm FileManifest, fn func(*FileState)) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	rs.gen++
 	fs := rs.find(fm.Path)
 	if fs == nil {
 		rs.Files = append(rs.Files, FileState{Path: fm.Path})

@@ -337,8 +337,8 @@ func TestSmallSegmentsEvictByChunk(t *testing.T) {
 // State for the release's scale stays small: tens of MB at most for 821
 // GB of width files in 64 KiB segments, and it loads quickly.
 func TestSmallSegmentsStateScale(t *testing.T) {
-	if testing.Short() {
-		t.Skip("large")
+	if testing.Short() || raceOn {
+		t.Skip("large, and timed")
 	}
 	withChunk(t, store.DefaultSegmentSize)
 	const segSize = 64 << 10

@@ -48,7 +48,7 @@ func TestWholeDownloadSmallSegmentsVouched(t *testing.T) {
 	}
 
 	rs, _ := f.root.revState(mf)
-	if ok, err := f.root.evict(heldChunks(mf, rs, fm)[0]); !ok || err != nil {
+	if ok, err := f.root.evict(heldChunks(mf, rs, fm, nil)[0]); !ok || err != nil {
 		t.Fatalf("evict: %v %v", ok, err)
 	}
 	if dropped, err := f.rootSt.Reverify(mf, rs); err != nil || dropped != 0 {

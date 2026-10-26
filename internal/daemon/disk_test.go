@@ -319,15 +319,18 @@ func TestBudgetRetiredRootCopyDoesNotCount(t *testing.T) {
 }
 
 // gatedPeers is a Discoverer that, once armed, holds the first Peers call
-// until released.
+// until released. It counts the calls: one for each time the fleet is
+// asked.
 type gatedPeers struct {
 	discovery.Discoverer
 	armed   atomic.Bool
+	calls   atomic.Int32
 	entered chan struct{}
 	release chan struct{}
 }
 
 func (g *gatedPeers) Peers(ctx context.Context) ([]discovery.Peer, error) {
+	g.calls.Add(1)
 	if g.armed.CompareAndSwap(true, false) {
 		close(g.entered)
 		<-g.release
@@ -358,6 +361,38 @@ func TestBudgetPinDuringEviction(t *testing.T) {
 	}
 	if got := f.held("old", "a1.bin"); got != all10 {
 		t.Fatalf("a1.bin, pinned during eviction: held %s, want all", got)
+	}
+}
+
+// A disk pass over the budget asks the fleet once, and counts as
+// evictable what may go after eviction, with the pins of a request made
+// while the fleet was asked.
+func TestBudgetEvictableAfterPinDuringPass(t *testing.T) {
+	f := newDiskFleet(t, "spark-a") // the peer keeps a1.bin: all of it may go.
+	d := f.node(19*seg, &catalog.Selection{})
+	g := &gatedPeers{Discoverer: d.cfg.Discoverer, entered: make(chan struct{}), release: make(chan struct{})}
+	d.cfg.Discoverer = g
+	g.armed.Store(true)
+	done := make(chan struct{})
+	go func() {
+		d.diskPass(context.Background())
+		close(done)
+	}()
+	<-g.entered
+	if _, err := d.PutRequest(request.Request{Name: "pin", Pieces: catalog.Pieces{Model: "old",
+		Ranges: []catalog.FileRanges{{Path: "a1.bin", Ranges: []catalog.ByteRange{{Offset: 5 * seg, Length: 5 * seg}}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	close(g.release)
+	<-done
+	if got := f.held("old", "a1.bin"); got != "0111111111" {
+		t.Fatalf("a1.bin: held %s, want segment 0 evicted to fit", got)
+	}
+	if ds := d.Status().Disk; ds == nil || ds.EvictableBytes != 4*seg {
+		t.Fatalf("status disk = %+v, want segments 1-4 of a1.bin evictable (5-9 are pinned)", ds)
+	}
+	if n := g.calls.Load(); n != 1 {
+		t.Fatalf("the pass asked the fleet %d times, want once", n)
 	}
 }
 

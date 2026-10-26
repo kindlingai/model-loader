@@ -675,30 +675,31 @@ func (rs *RevisionState) DropSegment(fm FileManifest, i int) {
 // forgotten, so a request whose checked range is elsewhere in the file
 // stays ready.
 func (rs *RevisionState) EvictSegment(fm FileManifest, i int) {
-	rs.EvictSegments(fm, []int{i})
+	rs.EvictSegments(fm, [][2]int{{i, i + 1}})
 }
 
-// EvictSegments is EvictSegment for each of segs, at once.
-func (rs *RevisionState) EvictSegments(fm FileManifest, segs []int) {
+// EvictSegments is EvictSegment for each segment of runs, half-open
+// index ranges, at once.
+func (rs *RevisionState) EvictSegments(fm FileManifest, runs [][2]int) {
 	rs.update(fm, func(fs *FileState) {
 		var gone []Range
-		for _, i := range segs {
-			if i < 0 || i >= len(fs.SegmentsDone) {
+		for _, r := range runs {
+			first, end := max(r[0], 0), min(r[1], len(fs.SegmentsDone))
+			if first >= end {
 				continue
 			}
-			fs.SegmentsDone[i], fs.Complete = false, false
-			if i < len(fs.SegmentSHA256) {
-				fs.SegmentSHA256[i] = ""
+			for i := first; i < end; i++ {
+				fs.SegmentsDone[i], fs.Complete = false, false
+				if i < len(fs.SegmentSHA256) {
+					fs.SegmentSHA256[i] = ""
+				}
+				if i < len(fs.trust) {
+					fs.trust[i] = trustManifest
+				}
 			}
-			if i < len(fs.trust) {
-				fs.trust[i] = trustManifest
-			}
-			start, end := fm.SegmentBounds(i)
-			if n := len(gone); n > 0 && gone[n-1].End == start {
-				gone[n-1].End = end
-			} else {
-				gone = append(gone, Range{start, end})
-			}
+			start, _ := fm.SegmentBounds(first)
+			_, stop := fm.SegmentBounds(end - 1)
+			gone = append(gone, Range{start, stop})
 		}
 		kept := fs.Checked[:0]
 		for _, k := range fs.Checked {

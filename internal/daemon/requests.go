@@ -173,6 +173,20 @@ func (d *Daemon) DeleteRequest(name string) (bool, error) {
 }
 
 // ListRequests implements server.Requests.
+// CatalogModels implements server.Requests: every catalog entry, in
+// catalog order.
+func (d *Daemon) CatalogModels() []server.CatalogModel {
+	out := []server.CatalogModel{}
+	if d.cfg.Catalog == nil {
+		return out
+	}
+	for _, m := range d.cfg.Catalog.Models {
+		out = append(out, server.CatalogModel{Name: m.Name, Revision: m.Revision, Source: server.CatalogSource{
+			Type: string(m.Source.Type), Repo: m.Source.Repo, URL: m.Source.URL}})
+	}
+	return out
+}
+
 func (d *Daemon) ListRequests() []server.RequestStatus {
 	out := []server.RequestStatus{}
 	if d.cfg.Requests == nil {

@@ -46,6 +46,27 @@ type Requests interface {
 	WaitRequest(ctx context.Context, name string) (RequestStatus, bool)
 	DeleteRequest(name string) (bool, error)
 	ListRequests() []RequestStatus
+	// CatalogModels lists the catalog's models, so a consumer can find
+	// the catalog name of a source it knows (a Hugging Face repo) instead
+	// of being told it.
+	CatalogModels() []CatalogModel
+}
+
+// CatalogModel is one catalog entry as GET /catalog lists it: its name,
+// revision and source. Nothing else in the catalog (segment sizes,
+// notes) is part of the local API.
+type CatalogModel struct {
+	Name     string        `json:"name"`
+	Revision string        `json:"revision"`
+	Source   CatalogSource `json:"source"`
+}
+
+// CatalogSource is a catalog entry's origin: type huggingface with repo,
+// or type http with url.
+type CatalogSource struct {
+	Type string `json:"type"`
+	Repo string `json:"repo,omitempty"`
+	URL  string `json:"url,omitempty"`
 }
 
 // maxRequestBody bounds a request's JSON. A fetch plan for one rank of a
@@ -60,6 +81,9 @@ const maxWait = 30 * time.Minute
 // (a unix socket by default), apart from the LAN API.
 func NewLocal(reqs Requests) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /catalog", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"models": reqs.CatalogModels()})
+	})
 	mux.HandleFunc("GET /requests", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, reqs.ListRequests())
 	})

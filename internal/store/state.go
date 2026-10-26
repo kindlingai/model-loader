@@ -15,7 +15,8 @@ const (
 	// TrustOrigin: a root fetched it from the model's origin (over TLS)
 	// for a file it had no segment hashes for, and recorded its sha256.
 	// A node that copies it from that root checks it against that sha256
-	// and keeps the root's trust mode.
+	// and keeps the root's trust mode, but for TrustManifest, which it
+	// holds as TrustOrigin until it checks the whole file itself.
 	TrustOrigin = "origin"
 	// TrustRequester: as TrustOrigin, and every range a consumer supplied
 	// a checksum for in the segment matched it.

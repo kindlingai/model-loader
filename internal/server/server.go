@@ -20,12 +20,16 @@ type ModelStatus struct {
 	State    string `json:"state"` // pending|downloading|partial|ready|error
 	// Selection is "partial" when this node wants only part of the
 	// revision. BytesTotal and BytesDone then count the wanted part.
-	Selection  string    `json:"selection,omitempty"`
-	BytesTotal int64     `json:"bytes_total"`
-	BytesDone  int64     `json:"bytes_done"`
-	Source     string    `json:"source,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Selection  string `json:"selection,omitempty"`
+	BytesTotal int64  `json:"bytes_total"`
+	BytesDone  int64  `json:"bytes_done"`
+	// BytesReused is how much of the revision this process copied from a
+	// file of the same sha256 the store held already, instead of fetching
+	// it (-dedup).
+	BytesReused int64     `json:"bytes_reused,omitempty"`
+	Source      string    `json:"source,omitempty"`
+	Error       string    `json:"error,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 const (

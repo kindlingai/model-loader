@@ -91,6 +91,10 @@ type Config struct {
 	// DiskBudget is the most the store may hold, in bytes. Fetches evict
 	// what they may to stay under it (see disk.go). 0 means no budget.
 	DiskBudget int64
+
+	// Dedup copies a file another revision in the store holds whole with
+	// the same sha256 instead of fetching it (see dedup.go).
+	Dedup bool
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -116,6 +120,7 @@ type Daemon struct {
 	disk     *server.DiskStatus // see diskPass
 	change   chan struct{}      // closed and replaced on every status change
 	verified map[string]bool
+	reused   map[string]int64 // bytes copied by dedup, by want.Key
 
 	stateMu sync.Mutex
 	states  map[string]*store.RevisionState // see revState
@@ -154,6 +159,7 @@ func New(cfg Config) *Daemon {
 		change:     make(chan struct{}),
 		statuses:   make(map[string]server.ModelStatus),
 		verified:   make(map[string]bool),
+		reused:     make(map[string]int64),
 		states:     make(map[string]*store.RevisionState),
 		pulls:      make(map[string]*pullCall),
 		pullSrcs:   make(map[string]cachedSources),
@@ -189,8 +195,10 @@ func (d *Daemon) Status() server.StatusResponse {
 
 func (d *Daemon) setStatus(ms server.ModelStatus) {
 	ms.UpdatedAt = time.Now().UTC()
+	key := want.Key(ms.Model, ms.Revision)
 	d.mu.Lock()
-	d.statuses[want.Key(ms.Model, ms.Revision)] = ms
+	ms.BytesReused = d.reused[key]
+	d.statuses[key] = ms
 	d.notifyLocked()
 	d.mu.Unlock()
 }
@@ -445,16 +453,28 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	ctx = server.WithPriority(ctx, w.Priority)
 	var errs []error
 	lastProgress := time.Now()
+	var twins map[string][]twin // see dedup.go; read when first needed
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
 			continue
 		}
 		var err error
+		reused := false
 		done := d.writing(m.Name, m.Revision, fm)
-		if pull {
+		// Not on a root: a peer's pull may be writing into the file
+		// meanwhile, and the copy could mark held a segment it wrote bad.
+		if d.cfg.Dedup && fn.Whole && !d.IsWANEligible() {
+			if twins == nil {
+				twins = d.twins()
+			}
+			reused, err = d.reuseHeld(ctx, m, fm, rs, twins)
+		}
+		switch {
+		case reused || err != nil:
+		case pull:
 			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
-		} else {
+		default:
 			err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
 				Need: fn.Segments, Order: srcs.order(fm), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
 			})

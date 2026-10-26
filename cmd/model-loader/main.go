@@ -68,6 +68,7 @@ type config struct {
 	verifyOnStart     bool
 	localListen       string
 	diskBudget        string
+	dedup             string
 }
 
 func parseFlags(args []string) (*config, error) {
@@ -90,6 +91,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.IntVar(&cfg.pullWorkers, "pull-workers", 4, "root only: maximum segments fetched from origins at once for pull-through")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
 	fs.StringVar(&cfg.diskBudget, "disk-budget", "", "most the store may hold, as bytes (500G, 2T) or a percentage of its filesystem (80%); fetches evict unwanted segments the fleet keeps copies of to stay under it. Empty: no budget, nothing evicted")
+	fs.StringVar(&cfg.dedup, "dedup", "off", "copy: before fetching a file, copy one the store already holds whole with the same sha256 (cloned where the filesystem can, on the server on NFS 4.2); off: fetch every file")
 	fs.StringVar(&cfg.localListen, "local-listen", "unix:model-loader.sock", "where to serve the local request API: unix:PATH (relative to -store) or host:port (needs $MODEL_LOADER_LOCAL_TOKEN); empty to turn it off")
 	fs.BoolVar(&cfg.showVersion, "version", false, "print the version and exit")
 	fs.StringVar(&cfg.check, "check", "", "check that the local request API at unix:PATH (relative to -store) or host:port answers, exit 0 if it does, and exit; for health checks and for a consumer to wait on")
@@ -120,6 +122,9 @@ func parseFlags(args []string) (*config, error) {
 	if cfg.localListen != "" && !strings.HasPrefix(cfg.localListen, "unix:") && localToken() == "" {
 		// Anything that reaches the port could pin and release pieces.
 		errs = append(errs, fmt.Errorf("-local-listen %s: a TCP local API needs %s set", cfg.localListen, localTokenEnv))
+	}
+	if cfg.dedup != "off" && cfg.dedup != "copy" {
+		errs = append(errs, fmt.Errorf("-dedup: must be off or copy (got %q)", cfg.dedup))
 	}
 	if cfg.discoveryKind == "k8s" && cfg.k8sService == "" {
 		errs = append(errs, errors.New("-k8s-service is required when -discovery=k8s"))
@@ -221,6 +226,7 @@ func run(args []string) error {
 		VerifyOnStart:          cfg.verifyOnStart,
 		Requests:               reqs,
 		DiskBudget:             budget,
+		Dedup:                  cfg.dedup == "copy",
 	})
 
 	srv := server.New(st, d)

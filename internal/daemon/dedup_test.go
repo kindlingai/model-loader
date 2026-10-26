@@ -152,3 +152,75 @@ func TestDedupPeerCopiesOnlyWholeTwin(t *testing.T) {
 		}
 	}
 }
+
+// A peer that holds part of a file fetches the rest over the LAN rather
+// than copy a twin over the segments it has checked already.
+func TestDedupPeerFetchesRestOfPartFile(t *testing.T) {
+	w := pattern(300_000, 'w')
+	rootSt, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, rootSt, "b", 100_000, map[string][]byte{"w.bin": w}, "w.bin")
+	ts, blobs := countingPeer(t, rootSt)
+
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedFiles(t, st, "a", 0, map[string][]byte{"w.bin": w}, "w.bin")
+	mfB := seedFiles(t, st, "b", 100_000, map[string][]byte{"w.bin": w}, "w.bin")
+	rs, _ := st.LoadState(mfB)
+	rs.DropSegment(mfB.Files[0], 1)
+	rs.DropSegment(mfB.Files[0], 2)
+	if err := st.SaveState(rs); err != nil {
+		t.Fatal(err)
+	}
+	mB := catalog.Model{Name: "b", Revision: "r1", Source: catalog.Source{Type: catalog.SourceHTTP, URL: "http://unused.invalid"}}
+	d := New(Config{
+		NodeID: "spark", Roles: []string{"peer"}, Store: st,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{mB}}, Selection: allSelection(),
+		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic([]string{ts.Listener.Addr().String()}), Dedup: true,
+	})
+	if err := d.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	ms := d.Status().Models[0]
+	if ms.State != server.StateReady || ms.BytesReused != 0 || blobs.Load() == 0 {
+		t.Errorf("%s, %d bytes reused, %d blob requests (%s); want ready, 0, some", ms.State, ms.BytesReused, blobs.Load(), ms.Error)
+	}
+}
+
+// A twin that a re-verify finds bad while it is copied is not used, even
+// once it is fetched again and complete by the time the copy ends: the
+// copy read the bad bytes.
+func TestDedupTwinRepairedDuringCopy(t *testing.T) {
+	w := pattern(300_000, 'w')
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mfA := seedFiles(t, st, "a", 100_000, map[string][]byte{"w.bin": w}, "w.bin")
+	d := New(Config{
+		NodeID: "spark", Roles: []string{"peer"}, Store: st, Catalog: &catalog.Catalog{}, Selection: allSelection(),
+		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil), Dedup: true,
+	})
+	rsA, err := d.revState(mfA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fa, fb := mfA.Files[0], mfA.Files[0]
+	mB := catalog.Model{Name: "b", Revision: "r1"}
+	for _, repair := range []bool{false, true} {
+		progress := func(int64) {
+			if repair {
+				rsA.DropSegment(fa, 1)
+				rsA.MarkSegment(fa, 1, "", store.TrustManifest)
+				rsA.SetComplete(fa)
+			}
+		}
+		if _, ok := d.reuse(context.Background(), mB, fb, d.twins(), progress); ok == repair {
+			t.Errorf("twin repaired during the copy %v: reused %v", repair, ok)
+		}
+	}
+}

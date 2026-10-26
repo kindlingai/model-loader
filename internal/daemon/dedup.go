@@ -97,16 +97,17 @@ func (d *Daemon) reuseFrom(ctx context.Context, m catalog.Model, fm store.FileMa
 	// Marked as being written, so eviction and retiring leave the twin
 	// alone; checked whole only after, so one evicted just before is seen.
 	defer d.writing(t.mf.Model, t.mf.Revision, t.fm)()
+	// Retired since twins read it: revState would cache an empty state
+	// for it, which a later download of the same revision would use.
+	if !d.cfg.Store.HasManifest(t.mf.Model, t.mf.Revision) {
+		return nil, errNotHeld
+	}
 	rs, err := d.revState(t.mf)
 	if err != nil {
 		return nil, err
 	}
-	whole := func() bool {
-		ok := false
-		rs.View(t.fm, func(fs *store.FileState) { ok = fs.Complete && !fs.WholeFailed })
-		return ok
-	}
-	if !whole() {
+	whole, lost := rs.Whole(t.fm)
+	if !whole {
 		return nil, errNotHeld
 	}
 	from := store.RevisionRef{Model: t.mf.Model, Revision: t.mf.Revision}
@@ -117,8 +118,9 @@ func (d *Daemon) reuseFrom(ctx context.Context, m catalog.Model, fm store.FileMa
 	if err != nil {
 		return nil, err
 	}
-	// A re-verify may have dropped part of the twin while it was copied.
-	if !whole() {
+	// A re-verify may have found part of the twin bad while it was copied,
+	// and it may have been fetched again since: the copy read it as it was.
+	if whole, now := rs.Whole(t.fm); !whole || now != lost {
 		return nil, errNotHeld
 	}
 	return sums, nil
@@ -167,9 +169,16 @@ func (d *Daemon) reusedSums(m catalog.Model, fm store.FileManifest, t twin, rs *
 }
 
 // reuseHeld is reuse for a file of a revision this node has the manifest
-// of: once copied, every segment of fm is marked held and the file
-// complete, and rs saved.
+// of and holds none of: once copied, every segment of fm is marked held
+// and the file complete, and rs saved. A file it holds part of fetches
+// the rest: the copy writes the whole file, so one that failed would
+// leave segments marked held with the twin's bytes in them.
 func (d *Daemon) reuseHeld(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, twins map[string][]twin) (bool, error) {
+	held := false
+	rs.View(fm, func(fs *store.FileState) { held = slices.Contains(fs.SegmentsDone, true) })
+	if held {
+		return false, nil
+	}
 	sums, ok := d.reuse(ctx, m, fm, twins, func(int64) {})
 	if !ok {
 		return false, nil
@@ -189,8 +198,13 @@ func (d *Daemon) reuseHeld(ctx context.Context, m catalog.Model, fm store.FileMa
 
 // reuseOrigin is reuse for a root's download of m from its origin, of the
 // file of: once copied, of is complete, and rs saved. It reports whether
-// it wrote the side file of a file the catalog gives small segments.
+// it wrote the side file of a file the catalog gives small segments. A
+// file partly downloaded resumes instead: a copy that failed would leave
+// the twin's bytes under the hash state the download resumes from.
 func (d *Daemon) reuseOrigin(ctx context.Context, m catalog.Model, rs *store.RevisionState, of *store.OriginFile, twins map[string][]twin, progress func(int64)) (bool, error) {
+	if of.BytesDone > 0 {
+		return false, nil
+	}
 	fm := of.FileManifest
 	fm.SegmentSHA256 = nil
 	if size := m.SegmentSizeFor(fm.Path); size > 0 && size != store.DefaultSegmentSize {

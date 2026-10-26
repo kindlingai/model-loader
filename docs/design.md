@@ -362,12 +362,15 @@ with the twin's at the same segment size.
   revision leaves the other whole.
 - The copy is not hashed again. The twin was checked against the same
   sha256 when it landed, and is marked in use while it is copied so
-  eviction cannot free it meanwhile. The segment hashes a file needs are
+  eviction cannot free it meanwhile. If a re-verify finds part of it bad
+  during the copy, the copy is not used, even once that part is fetched
+  again. The segment hashes a file needs are
   carried over from the twin's manifest, state or side file where it has
   them at the same segment size; otherwise the copy is hashed once.
   `-verify-on-start` checks a copy as it checks any other file.
 - A root does not copy for a model whose manifest it holds already, nor a
-  peer for a file it wants only part of: those fetch as before.
+  peer for a file it wants only part of, nor either for a file it holds
+  part of already: those fetch as before.
 - `/status` reports per model the bytes copied this way since the process
   started (`bytes_reused`).
 - The disk budget counts each file's blocks, so a cloned file is charged

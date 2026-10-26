@@ -315,9 +315,8 @@ func (s *Store) EnsureFile(model, revision string, fm FileManifest) (*os.File, e
 // Linux the copy is copy_file_range: a filesystem that can clone blocks
 // (btrfs, XFS, ZFS block cloning) shares them copy-on-write, and NFS 4.2
 // copies on the server. The two are separate files either way, so what
-// later punches holes in or rewrites one never touches the other. Bytes
-// already in the destination are written over in place, not truncated
-// first, so a held segment never reads as zeros meanwhile.
+// later punches holes in or rewrites one never touches the other. What
+// the destination held before is written over, and it is cut to fm.Size.
 func (s *Store) CopyFile(ctx context.Context, model, revision string, fm FileManifest, from RevisionRef, path string, progress func(int64)) error {
 	src, err := os.OpenFile(s.FilePath(from.Model, from.Revision, path), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {

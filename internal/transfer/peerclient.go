@@ -104,8 +104,9 @@ func WithNoPull(ctx context.Context) context.Context {
 
 // maxSegmentsBody bounds a peer's /segments (and /status) answer. A peer
 // holding one rank's expert halves of a release in 64 KiB segments
-// reports about a million runs (tens of MB) for it; a revision with ten
-// thousand files of a hundred runs each fits too.
+// answers in about 2 MB of bitmaps, or, older than server.BitsParam,
+// about a million runs (14 MB); a revision with ten thousand files of a
+// hundred runs each fits too.
 const maxSegmentsBody = 256 << 20
 
 // ErrNoSegments means a peer predates GET /segments, so what it holds is
@@ -115,7 +116,7 @@ var ErrNoSegments = errors.New("peer does not report segments")
 // Segments fetches which segments of model/revision a peer holds. It
 // returns ErrNoSegments if the peer is too old to answer (404).
 func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string) (*server.SegmentsResponse, error) {
-	u := fmt.Sprintf("http://%s/segments/%s/%s", addr, url.PathEscape(model), url.PathEscape(revision))
+	u := fmt.Sprintf("http://%s/segments/%s/%s?%s=1", addr, url.PathEscape(model), url.PathEscape(revision), server.BitsParam)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

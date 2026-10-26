@@ -158,7 +158,10 @@ scale:
   rest itself, so requests for disjoint segments of one chunk run in
   parallel and no segment is fetched twice.
 - `/segments` from a node holding one rank's halves of the release is
-  about a million runs (tens of MB); an answer may be up to 256 MiB.
+  about a million runs (14 MB), or about 2 MB as bitmaps, which nodes
+  ask for (`?bits=1`); an answer may be up to 256 MiB. Eviction keeps
+  its victims as runs, one per chunk, and a disk pass asks each peer
+  once: what eviction left is what it reports could be evicted.
 - A blob request reads what is held from the state the node keeps in
   memory, not the state file.
 

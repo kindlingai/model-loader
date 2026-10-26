@@ -278,6 +278,41 @@ func TestHeldRanges(t *testing.T) {
 	}
 }
 
+// An asker that takes bitmaps gets one for a file of many runs, and runs
+// for a file of few; either says the same over JSON.
+func TestHeldSegmentsBits(t *testing.T) {
+	const n = 200
+	many, few := make([]bool, n), make([]bool, n)
+	for i := range n {
+		many[i] = (i/3)%4 == 0
+		few[i] = i >= 10 && i < 50
+	}
+	m := &store.Manifest{Model: "m", Revision: "r1", Files: []store.FileManifest{{Path: "a", Size: n, SegmentSize: 1}}}
+	for _, c := range []struct {
+		done     []bool
+		bits     bool
+		wantBits bool
+	}{{many, true, true}, {many, false, false}, {few, true, false}} {
+		fs, ok := heldSegments(c.done, n, c.bits)
+		if !ok || (fs.Bits != nil) != c.wantBits {
+			t.Fatalf("bits %v: %+v, want bits %v", c.bits, fs, c.wantBits)
+		}
+		b, _ := json.Marshal(SegmentsResponse{Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": fs}})
+		var r SegmentsResponse
+		if err := json.Unmarshal(b, &r); err != nil || !r.Valid(m) {
+			t.Fatalf("bits %v: %s does not read back valid: %v", c.bits, b, err)
+		}
+		for i, want := range c.done {
+			if r.Files["a"].Has(i) != want {
+				t.Fatalf("bits %v: Has(%d) = %v, want %v", c.bits, i, !want, want)
+			}
+		}
+	}
+	if _, ok := heldSegments(make([]bool, n), n, true); ok {
+		t.Fatal("a file with nothing held is answered")
+	}
+}
+
 func TestHandleSegments(t *testing.T) {
 	st, m := setupStore(t)
 	srv := New(st, fakeStatus{})
@@ -337,6 +372,8 @@ func TestSegmentsResponseValid(t *testing.T) {
 		"count":    {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: -1}}},
 		"range":    {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Held: [][2]int{{-100, 999999999}}}}},
 		"empty":    {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Held: [][2]int{{2, 2}}}}},
+		"bits":     {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Bits: []byte{7, 0}}}},
+		"both":     {Model: "m", Revision: "r1", Files: map[string]FileSegments{"a": {Segments: 3, Bits: []byte{7}, Held: [][2]int{{0, 3}}}}},
 	} {
 		if r.Valid(m) {
 			t.Errorf("%s: a bad answer is Valid", name)

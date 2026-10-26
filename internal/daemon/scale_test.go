@@ -5,9 +5,14 @@ package daemon
 // rank's halves held, timing daemon operations that run often.
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +22,7 @@ import (
 	"github.com/kindlingai/model-loader/internal/server"
 	"github.com/kindlingai/model-loader/internal/source"
 	"github.com/kindlingai/model-loader/internal/store"
+	"github.com/kindlingai/model-loader/internal/transfer"
 	"github.com/kindlingai/model-loader/internal/want"
 )
 
@@ -190,7 +196,7 @@ func TestScaleEvictBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	vs := heldChunks(m, rs, fm)
+	vs := heldChunks(m, rs, fm, nil)
 	took, blocked := useMuProbe(d, func() {
 		if n, errs := d.evictBatchN(vs); n != len(vs) || len(errs) > 0 {
 			t.Fatalf("evicted %d of %d: %v", n, len(vs), errs)
@@ -252,5 +258,143 @@ func TestScaleRequestStatus(t *testing.T) {
 		per, allocMB, per*32, allocMB*32/1e3)
 	if per > 20*time.Millisecond || allocMB > 20 {
 		t.Errorf("requestStatus costs %v / %.0f MB per call at release scale", per, allocMB)
+	}
+}
+
+// rbPeer serves rs as a plain peer with node ID id, and counts the bytes
+// and number of its /segments answers.
+func rbPeer(t *testing.T, st *store.Store, m *store.Manifest, rs *store.RevisionState, id string) (addr string, body, asks *atomic.Int64) {
+	t.Helper()
+	p := rbDaemon(t, st, m, rs)
+	p.cfg.NodeID, p.cfg.Roles = id, []string{"peer"}
+	srv := server.New(st, p)
+	body, asks = new(atomic.Int64), new(atomic.Int64)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/segments/") {
+			asks.Add(1)
+			w = countingWriter{w, body}
+		}
+		srv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return strings.TrimPrefix(ts.URL, "http://"), body, asks
+}
+
+type countingWriter struct {
+	http.ResponseWriter
+	n *atomic.Int64
+}
+
+func (c countingWriter) Write(b []byte) (int, error) {
+	c.n.Add(int64(len(b)))
+	return c.ResponseWriter.Write(b)
+}
+
+// allocs returns how long fn takes and how many MB it allocates (both
+// ends of a request, as a peer here serves in this process).
+func allocs(fn func()) (time.Duration, float64) {
+	var ms0, ms1 runtime.MemStats
+	runtime.ReadMemStats(&ms0)
+	t0 := time.Now()
+	fn()
+	took := time.Since(t0)
+	runtime.ReadMemStats(&ms1)
+	return took, float64(ms1.TotalAlloc-ms0.TotalAlloc) / 1e6
+}
+
+// A peer holding one rank's halves of the release answers /segments in a
+// few MB, and reading it is cheap.
+func TestScaleSegments(t *testing.T) {
+	if testing.Short() || raceOn {
+		t.Skip("large, and timed")
+	}
+	withChunk(t, store.DefaultSegmentSize)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := rbManifest()
+	rs := rbState(m)
+	if err := st.SaveManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	addr, body, _ := rbPeer(t, st, m, rs, "spark-01")
+	var resp *server.SegmentsResponse
+	took, allocMB := allocs(func() {
+		resp, err = transfer.NewPeerClient(nil).Segments(context.Background(), addr, m.Model, m.Revision)
+	})
+	if err != nil || !resp.Valid(m) {
+		t.Fatalf("segments: %v (valid %v)", err, err == nil && resp.Valid(m))
+	}
+	for fi, fm := range m.Files[:2] {
+		for i := range 2 * fm.ChunkSegments() {
+			if got := resp.Files[fm.Path].Has(i); got != (fi == 0 || (i/3)%4 == 0) {
+				t.Fatalf("file %d segment %d: held %v", fi, i, got)
+			}
+		}
+	}
+	mb := float64(body.Load()) / 1e6
+	t.Logf("/segments for one rank's halves: %.1f MB, %v, %.0f MB allocated", mb, took, allocMB)
+	if mb > 4 || took > time.Second || allocMB > 32 {
+		t.Errorf("/segments is %.1f MB, takes %v and allocates %.0f MB at release scale", mb, took, allocMB)
+	}
+}
+
+// A plain peer lists what it may evict of one rank's halves, nothing
+// pinned and a peer with a lower ID holding the same, without a list of
+// every segment; a disk pass asks each peer once.
+func TestScaleVictims(t *testing.T) {
+	if testing.Short() || raceOn {
+		t.Skip("large, and timed")
+	}
+	withChunk(t, store.DefaultSegmentSize)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := rbManifest()
+	rs := rbState(m)
+	if err := st.SaveManifest(m); err != nil {
+		t.Fatal(err)
+	}
+	addr, _, asks := rbPeer(t, st, m, rs, "spark-01")
+	d := rbDaemon(t, st, m, rs)
+	d.cfg.NodeID, d.cfg.Roles = "spark-02", []string{"peer"}
+	d.cfg.Discoverer = discovery.NewStatic([]string{addr})
+	ctx := context.Background()
+	var vs []victim
+	took, allocMB := allocs(func() {
+		if vs, err = d.victims(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var bytes int64
+	for _, v := range vs {
+		bytes += v.bytes
+	}
+	if bytes != rs.BytesDone(m) {
+		t.Fatalf("victims: %d bytes, want all %d held", bytes, rs.BytesDone(m))
+	}
+	t.Logf("victims: %d chunks, %v, %.0f MB allocated (with the peer's answer)", len(vs), took, allocMB)
+	if took > 2*time.Second || allocMB > 64 {
+		t.Errorf("victims takes %v and allocates %.0f MB at release scale", took, allocMB)
+	}
+	// A disk pass counts what could be evicted; one over the budget
+	// counts what eviction left. Either asks the peer once.
+	for _, over := range []bool{false, true} {
+		want := bytes
+		if over {
+			d.cfg.NodeID = "spark-00" // the peer's ID is higher: nothing may go.
+			d.reserved["fetch"] = &reservation{refs: 1, remaining: func() int64 { return 2 * d.cfg.DiskBudget }}
+			want = 0
+		}
+		asks.Store(0)
+		d.diskPass(ctx)
+		if n := asks.Load(); n != 1 {
+			t.Errorf("over budget %v: a disk pass asked the peer %d times, want once", over, n)
+		}
+		if ds := d.Status().Disk; ds == nil || ds.EvictableBytes != want {
+			t.Errorf("over budget %v: status disk %+v, want %d evictable", over, ds, want)
+		}
 	}
 }

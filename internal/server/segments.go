@@ -39,14 +39,25 @@ func (s *SegmentsResponse) IsRoot() bool {
 }
 
 // FileSegments is one file's held segments, as half-open ranges of segment
-// indices: [[0, 4], [9, 10]] holds segments 0-3 and 9.
+// indices: [[0, 4], [9, 10]] holds segments 0-3 and 9. To an asker that
+// takes them (see BitsParam) a file whose runs would take more room is
+// sent as a bitmap instead: bit i%8 of byte i/8 is set if segment i is
+// held.
 type FileSegments struct {
 	Segments int      `json:"segments"`
-	Held     [][2]int `json:"held"`
+	Held     [][2]int `json:"held,omitempty"`
+	Bits     []byte   `json:"bits,omitempty"`
 }
+
+// BitsParam is the query parameter of GET /segments by which an asker
+// says it takes FileSegments.Bits.
+const BitsParam = "bits"
 
 // Has reports whether segment i is held. Held is sorted (see Valid).
 func (f FileSegments) Has(i int) bool {
+	if f.Bits != nil {
+		return i >= 0 && i/8 < len(f.Bits) && f.Bits[i/8]&(1<<(i%8)) != 0
+	}
 	k := sort.Search(len(f.Held), func(k int) bool { return f.Held[k][1] > i })
 	return k < len(f.Held) && f.Held[k][0] <= i
 }
@@ -66,6 +77,9 @@ func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
 		if n, ok := segs[path]; !ok || fs.Segments != n {
 			return false
 		}
+		if fs.Bits != nil && (fs.Held != nil || len(fs.Bits) != (fs.Segments+7)/8) {
+			return false
+		}
 		for k, h := range fs.Held {
 			if h[0] < 0 || h[0] >= h[1] || h[1] > fs.Segments || (k > 0 && h[0] < fs.Held[k-1][1]) {
 				return false // not well formed, or not sorted (see Has).
@@ -77,6 +91,31 @@ func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
 
 // HeldRanges packs done into half-open index ranges.
 func HeldRanges(done []bool) [][2]int { return store.Runs(done) }
+
+// heldSegments is what done holds of a file of n segments, or nothing:
+// as runs, or, if bits, as a bitmap where that is smaller. A run takes
+// about 14 bytes of JSON, a bitmap about one byte for six segments.
+func heldSegments(done []bool, n int, bits bool) (FileSegments, bool) {
+	runs := 0
+	for i, h := range done {
+		if h && (i == 0 || !done[i-1]) {
+			runs++
+		}
+	}
+	switch {
+	case runs == 0:
+		return FileSegments{}, false
+	case bits && runs > n/64:
+		b := make([]byte, (n+7)/8)
+		for i, h := range done {
+			if h {
+				b[i/8] |= 1 << (i % 8)
+			}
+		}
+		return FileSegments{Segments: n, Bits: b}, true
+	}
+	return FileSegments{Segments: n, Held: HeldRanges(done)}, true
+}
 
 func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	model, revision := r.PathValue("model"), r.PathValue("revision")
@@ -98,19 +137,20 @@ func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
 		return
 	}
+	bits := r.URL.Query().Has(BitsParam)
 	for _, fm := range m.Files {
-		var held [][2]int
+		var held FileSegments
+		var ok bool
 		rs.View(fm, func(fs *store.FileState) {
 			done := fs.SegmentsDone
 			if len(done) > fm.NumSegments() {
 				done = done[:fm.NumSegments()] // stale state; see transfer.FetchFile.
 			}
-			held = HeldRanges(done)
+			held, ok = heldSegments(done, fm.NumSegments(), bits)
 		})
-		if len(held) == 0 {
-			continue
+		if ok {
+			resp.Files[fm.Path] = held
 		}
-		resp.Files[fm.Path] = FileSegments{Segments: fm.NumSegments(), Held: held}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

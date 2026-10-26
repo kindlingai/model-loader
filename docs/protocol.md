@@ -116,7 +116,13 @@ or range outside the manifest, is ignored, as is any answer over 256 MiB.
 }
 ```
 
-Here the node holds segments 0-3 and 9 of a 12-segment file. `node_id` and
+Here the node holds segments 0-3 and 9 of a 12-segment file. An asker
+that adds `?bits=1` takes, for a file whose runs would be longer, a
+bitmap instead of `held`: `"bits"`, base64, with bit `i % 8` of byte
+`i / 8` set if segment `i` is held. A node holding one rank's halves of
+the release in 64 KiB segments answers that in about 2 MB, against
+14 MB of runs. A node older than `bits` ignores it and sends runs.
+`node_id` and
 `roles` are the node's, as in `/status`; eviction uses both to decide which
 node keeps a segment. `cataloged` says whether the node's catalog names the
 revision: a root's copy lets a peer evict its own only while it is `true`

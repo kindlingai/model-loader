@@ -305,9 +305,9 @@ func TestSmallSegmentsEvictByChunk(t *testing.T) {
 	mf, _ := f.rootSt.LoadManifest("glm", "r1")
 	fm, _ := mf.Find("w.k4.safetensors")
 	rs, _ := f.root.revState(mf)
-	vs := heldChunks(mf, rs, fm)
-	if len(vs) != 16 || len(vs[0].segs) != 16 || vs[0].bytes != 64<<10 {
-		t.Fatalf("victims: %d of %d segments, %d bytes; want 16 chunks of 16 segments, 64 KiB", len(vs), len(vs[0].segs), vs[0].bytes)
+	vs := heldChunks(mf, rs, fm, nil)
+	if len(vs) != 16 || len(vs[0].runs) != 1 || vs[0].runs[0] != [2]int{0, 16} || vs[3].runs[0] != [2]int{48, 64} || vs[0].bytes != 64<<10 {
+		t.Fatalf("victims: %d of %v, %d bytes; want 16 chunks of 16 segments, 64 KiB", len(vs), vs[0].runs, vs[0].bytes)
 	}
 	before := f.rootSt.FileAllocated("glm", "r1", fm.Path)
 	if ok, err := f.root.evict(vs[3]); !ok || err != nil {

@@ -409,6 +409,7 @@ type RevisionState struct {
 	flush      *time.Timer            // a SaveStateSoon save to come; guarded by saveMu
 	closed     bool                   // see Close; guarded by saveMu
 	gen        uint64                 // bumped at every change; see Gen
+	lost       map[string]uint64      // times each file stopped being complete; see Whole
 	Model      string                 `json:"model"`
 	Revision   string                 `json:"revision"`
 	Files      []FileState            `json:"files"`
@@ -566,7 +567,24 @@ func (rs *RevisionState) update(fm FileManifest, fn func(*FileState)) {
 		fs = &rs.Files[len(rs.Files)-1]
 	}
 	fs.fit(fm)
+	was := fs.Complete
 	fn(fs)
+	if was && !fs.Complete {
+		if rs.lost == nil {
+			rs.lost = make(map[string]uint64)
+		}
+		rs.lost[fm.Path]++
+	}
+}
+
+// Whole reports whether fm is complete and not WholeFailed, and how many
+// times it has stopped being complete: the same count before and after a
+// read of its bytes means none was found bad, and fetched again, meanwhile.
+func (rs *RevisionState) Whole(fm FileManifest) (bool, uint64) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	fs := rs.find(fm.Path)
+	return fs != nil && fs.Complete && !fs.WholeFailed, rs.lost[fm.Path]
 }
 
 // MarkSegment records segment i of fm as held, verified by trust. sum is

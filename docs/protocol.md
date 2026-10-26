@@ -38,6 +38,10 @@ needs, the same contract home-ops's `wait-model` init containers use today
 against `catalog-status.json` — just reachable over HTTP instead of a shared
 mount.
 
+`bytes_reused`, when present, is how much of the revision this process
+copied from a file with the same sha256 that its store already held,
+instead of fetching it (`-dedup`; see "Content dedup" in `docs/design.md`).
+
 A model the node's selection names only in part has `"selection":
 "partial"`. Its `bytes_total` and `bytes_done` count the wanted segments,
 not the whole revision. Once every wanted piece is held and verified its

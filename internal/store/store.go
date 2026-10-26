@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -306,6 +307,84 @@ func (s *Store) EnsureFile(model, revision string, fm FileManifest) (*os.File, e
 		}
 	}
 	return f, nil
+}
+
+// CopyFile writes the file at path of from, fm.Size bytes, into fm's place
+// in model@revision, a segment at a time, syncing each and dropping it
+// from page cache, and reports the bytes copied so far to progress. On
+// Linux the copy is copy_file_range: a filesystem that can clone blocks
+// (btrfs, XFS, ZFS block cloning) shares them copy-on-write, and NFS 4.2
+// copies on the server. The two are separate files either way, so what
+// later punches holes in or rewrites one never touches the other. What
+// the destination held before is written over, and it is cut to fm.Size.
+func (s *Store) CopyFile(ctx context.Context, model, revision string, fm FileManifest, from RevisionRef, path string, progress func(int64)) error {
+	src, err := os.OpenFile(s.FilePath(from.Model, from.Revision, path), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if info, err := src.Stat(); err != nil || !info.Mode().IsRegular() || info.Size() != fm.Size {
+		return fmt.Errorf("%s@%s %s: not a regular file of %d bytes", from.Model, from.Revision, path, fm.Size)
+	}
+	dstPath := s.FilePath(model, revision, fm.Path)
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	// Write-only, as a download from the origin writes (see daemon's
+	// downloadFile).
+	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	for off := int64(0); off < fm.Size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := io.CopyN(dst, src, min(DefaultSegmentSize, fm.Size-off))
+		if err != nil {
+			return err
+		}
+		if err := dst.Sync(); err != nil {
+			return fmt.Errorf("sync: %w", err)
+		}
+		if err := errors.Join(Uncache(dst, off, n), Uncache(src, off, n)); err != nil {
+			return fmt.Errorf("uncache: %w", err)
+		}
+		off += n
+		progress(off)
+	}
+	if err := dst.Truncate(fm.Size); err != nil { // it may have been longer
+		return err
+	}
+	return dst.Close()
+}
+
+// CopySegmentHashes writes the side file of the file at path of from (see
+// WriteSegmentHashes) as fm's in model@revision: the two files hold the
+// same bytes in segments of the same size. It is synced before it returns.
+func (s *Store) CopySegmentHashes(model, revision string, fm FileManifest, from RevisionRef, path string) error {
+	src, err := os.Open(s.hashesPath(from.Model, from.Revision, path))
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dstPath := s.hashesPath(model, revision, fm.Path)
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return err
+	}
+	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+	if err := dst.Sync(); err != nil {
+		return err
+	}
+	return dst.Close()
 }
 
 // hashUncached writes bytes [start, start+length) of f to w in chunks of

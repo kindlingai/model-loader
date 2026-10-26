@@ -57,6 +57,9 @@ func TestParseFlagsRequiresModeAndCatalog(t *testing.T) {
 	if _, err := parseFlags([]string{"-mode=bogus", "-catalog=/tmp/catalog.yaml"}); err == nil {
 		t.Fatal("expected an error for an invalid -mode")
 	}
+	if _, err := parseFlags([]string{"-mode=root", "-catalog=/tmp/catalog.yaml", "-dedup=link"}); err == nil {
+		t.Fatal("expected an error for an unknown -dedup")
+	}
 }
 
 func TestParseFlagsK8sRequiresService(t *testing.T) {

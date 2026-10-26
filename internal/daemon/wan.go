@@ -120,19 +120,29 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 	}
 	defer release()
 
+	var twins map[string][]twin // see dedup.go
+	if d.cfg.Dedup {
+		twins = d.twins()
+	}
 	for i, fm := range manifest.Files {
 		of, err := d.originProgress(m, rs, fm, report)
 		if err != nil {
 			return nil, fmt.Errorf("check %s: %w", fm.Path, err)
 		}
+		sideFile := false // of a file of small segments, written already
 		if !of.Complete {
 			report(of.BytesDone)
-			err := d.downloadFile(ctx, src, m, manifest, rs, of, func(inFile int64) {
+			progress := func(inFile int64) {
 				written[i].Store(inFile)
 				report(inFile)
-			})
-			if err != nil {
-				return nil, fmt.Errorf("download %s: %w", fm.Path, err)
+			}
+			if sideFile, err = d.reuseOrigin(ctx, m, rs, of, twins, progress); err != nil {
+				return nil, fmt.Errorf("copy %s: %w", fm.Path, err)
+			}
+			if !of.Complete {
+				if err := d.downloadFile(ctx, src, m, manifest, rs, of, progress); err != nil {
+					return nil, fmt.Errorf("download %s: %w", fm.Path, err)
+				}
 			}
 		}
 		written[i].Store(fm.Size)
@@ -147,8 +157,10 @@ func (d *Daemon) downloadFromWAN(ctx context.Context, m catalog.Model) (*store.M
 			// Their sha256, of the bytes just checked whole, go in the
 			// side file now: what this node vouches for, and what a
 			// re-verify checks, once part of the file is evicted.
-			if err := d.hashSmallFile(m, manifest.Files[i]); err != nil {
-				return nil, fmt.Errorf("hash %s: %w", fm.Path, err)
+			if !sideFile {
+				if err := d.hashSmallFile(m, manifest.Files[i]); err != nil {
+					return nil, fmt.Errorf("hash %s: %w", fm.Path, err)
+				}
 			}
 		}
 		done += fm.Size

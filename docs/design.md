@@ -338,6 +338,50 @@ consumer reads them as any user, from a read-only mount. The local API
 socket, `model-loader.sock`, is 0660 in model-loader's group (see
 "Deployment targets").
 
+### Content dedup
+
+Two catalog entries often publish the same weights: a re-release that adds
+an adapter, a steering vector or a config to a base model. Hugging Face's
+cache shares blobs only within one repo, and by default model-loader keeps
+each revision as its own tree, so it downloads and stores such a file once
+per revision. `-dedup=copy` makes a node copy it instead, from the store.
+
+Before a root downloads a file from the origin, and before a plain peer
+fetches a file it wants whole over the LAN, the node looks through its
+store's manifests for a file with the same size and whole-file sha256
+(the origin's, known before a byte is fetched) whose state marks it
+complete. If there is one, it copies that file into place, and the file is
+complete. A file with no sha256 from its origin is fetched as before; so is
+one whose twin is no longer held whole, or whose segment hashes disagree
+with the twin's at the same segment size.
+
+- The copy is `copy_file_range` on Linux, a segment at a time: on a
+  filesystem that can clone blocks (btrfs, XFS, ZFS with block cloning) the
+  two files share their blocks copy-on-write, and on NFS 4.2 the server
+  makes the copy. Elsewhere the bytes are copied on the node, which saves
+  the transfer but not the space.
+- It is a file of its own, never a hard link: eviction punches holes in a
+  file and a repair writes into it in place, and through a hard link both
+  would change the other revision too. For the same reason removing either
+  revision leaves the other whole.
+- The copy is not hashed again. The twin was checked against the same
+  sha256 when it landed, and is marked in use while it is copied so
+  eviction cannot free it meanwhile. If a re-verify finds part of it bad
+  during the copy, the copy is not used, even once that part is fetched
+  again. The segment hashes a file needs are
+  carried over from the twin's manifest, state or side file where it has
+  them at the same segment size; otherwise the copy is hashed once.
+  `-verify-on-start` checks a copy as it checks any other file.
+- A root does not copy for a model whose manifest it holds already, nor a
+  peer for a file it wants only part of, nor either for a file it holds
+  part of already: those fetch as before.
+- `/status` reports per model the bytes copied this way since the process
+  started (`bytes_reused`).
+- The disk budget counts each file's blocks, so a cloned file is charged
+  in full to both revisions, though the filesystem holds its blocks once.
+
+The default, `-dedup=off`, fetches every file.
+
 ### Disk budget and eviction
 
 GLM-5.3 and GLM-5.3-Flash together are close to the SSD size of a box.

@@ -278,6 +278,15 @@ func (d *Daemon) downloadFile(ctx context.Context, src source.Source, m catalog.
 	if err != nil {
 		return err
 	}
+	// Reopened write-only: an NFS client reads back from the server each
+	// page that a write to a file also open for reading covers only part
+	// of, and those reads wait behind the segment being flushed, stalling
+	// the download.
+	f.Close()
+	f, err = os.OpenFile(f.Name(), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
 	defer f.Close()
 	if of.BytesDone == 0 {
 		// A file the origin has since replaced may have been longer.

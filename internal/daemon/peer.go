@@ -165,8 +165,16 @@ func (d *Daemon) olderPeerHasAll(ctx context.Context, addr string, m catalog.Mod
 // what they hold; then roots that do not hold it (a root can pull it from
 // the origin); then the other peers, in case they gained it since they
 // were asked; and last this node's own WAN source.
-func (s *sources) order(path string) func(i int) []int {
+//
+// The rotation is by chunk (see store.ChunkSize), the same for every
+// segment of one: a segment of a file of 64 MiB segments, so each one
+// starts at a different node, as before; the segments of one chunk of a
+// file of small ones go to one node, as one range (see
+// transfer.FetchFile).
+func (s *sources) order(fm store.FileManifest) func(i int) []int {
+	path := fm.Path
 	return func(i int) []int {
+		rot := fm.ChunkOf(i)
 		var peerHolders, rootHolders, unknown, roots, others []int
 		for k := 0; k < s.peers; k++ {
 			a := s.avail[k]
@@ -187,8 +195,8 @@ func (s *sources) order(path string) func(i int) []int {
 			}
 		}
 		out := make([]int, 0, len(s.fetchers))
-		out = appendRotated(out, peerHolders, i)
-		out = appendRotated(out, rootHolders, i)
+		out = appendRotated(out, peerHolders, rot)
+		out = appendRotated(out, rootHolders, rot)
 		out = append(out, unknown...)
 		if !s.holdersOnly {
 			out = append(out, roots...)

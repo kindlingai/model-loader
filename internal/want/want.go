@@ -181,13 +181,14 @@ func (n *Need) BytesDone(m *store.Manifest, rs *store.RevisionState) int64 {
 		if fn == nil {
 			continue
 		}
-		fs := rs.FileState(fm)
-		for i, need := range fn.Segments {
-			if need && i < len(fs.SegmentsDone) && fs.SegmentsDone[i] {
-				start, end := fm.SegmentBounds(i)
-				total += end - start
+		rs.View(fm, func(fs *store.FileState) {
+			for i, need := range fn.Segments {
+				if need && i < len(fs.SegmentsDone) && fs.SegmentsDone[i] {
+					start, end := fm.SegmentBounds(i)
+					total += end - start
+				}
 			}
-		}
+		})
 	}
 	return total
 }
@@ -200,25 +201,30 @@ func (n *Need) Satisfied(m *store.Manifest, rs *store.RevisionState) bool {
 		if fn == nil {
 			continue
 		}
-		fs := rs.FileState(fm)
-		if fs.Complete {
-			continue
-		}
-		if fn.Whole {
-			return false
-		}
-		all := len(fs.SegmentsDone) == fm.NumSegments()
-		for i := range fn.Segments {
-			held := i < len(fs.SegmentsDone) && fs.SegmentsDone[i]
-			if fn.Segments[i] && !held {
-				return false
+		ok := true
+		rs.View(fm, func(fs *store.FileState) {
+			if fs.Complete {
+				return
 			}
-			all = all && held
-		}
-		if all {
+			if fn.Whole {
+				ok = false
+				return
+			}
+			all := len(fs.SegmentsDone) == fm.NumSegments()
+			for i := range fn.Segments {
+				held := i < len(fs.SegmentsDone) && fs.SegmentsDone[i]
+				if fn.Segments[i] && !held {
+					ok = false
+					return
+				}
+				all = all && held
+			}
 			// Every segment is held, so the file must pass its whole-file
 			// check before it counts; a failed or unfinished check is not
 			// hidden behind the segments that are held.
+			ok = !all
+		})
+		if !ok {
 			return false
 		}
 	}

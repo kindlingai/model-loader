@@ -94,6 +94,13 @@ type Options struct {
 	// segments it covers. A source that takes checks (see CheckedFetcher)
 	// is given those inside the segment it is asked for.
 	Checks []store.RangeCheck
+	// SaveSoon saves the state of a file of small segments at most once a
+	// second (store.SaveStateSoon), also at the end, unless a check
+	// dropped a segment. A root's pull-through sets it: the peer it fills
+	// is served from memory, and a whole save of a release-sized state
+	// per pull would cap the root at a few pulls a second. A local fetch
+	// does not: its consumer reads the state file once it is ready.
+	SaveSoon bool
 }
 
 // Claimer is implemented by a reader whose source vouches for the
@@ -273,7 +280,12 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	wg.Wait()
 	if firstErr != nil && (ctx.Err() != nil || len(PendingChecks(fm, rs, opts.Checks)) == 0) {
 		if marked.Load() && fm.Small() {
-			_ = st.SaveState(rs) // what landed, before giving up.
+			// What landed, before giving up.
+			if opts.SaveSoon {
+				_ = st.SaveStateSoon(rs)
+			} else {
+				_ = st.SaveState(rs)
+			}
 		}
 		return firstErr // nothing that landed is left to judge.
 	}
@@ -290,7 +302,11 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	// did land (another request's range, say) is judged now, not held
 	// back by the one that failed.
 	err = ApplyChecks(f, fm, rs, opts.Checks)
-	if serr := st.SaveState(rs); err == nil && serr != nil {
+	finalSave := st.SaveState
+	if opts.SaveSoon && fm.Small() && err == nil {
+		finalSave = st.SaveStateSoon // nothing dropped: disk may lag.
+	}
+	if serr := finalSave(rs); err == nil && serr != nil {
 		err = serr
 	}
 	if err != nil {
@@ -360,13 +376,17 @@ func pending(fm store.FileManifest, fs store.FileState, c store.RangeCheck) bool
 
 // PendingChecks returns those of checks that ApplyChecks would check now.
 func PendingChecks(fm store.FileManifest, rs *store.RevisionState, checks []store.RangeCheck) []store.RangeCheck {
-	fs := rs.FileState(fm)
-	var out []store.RangeCheck
-	for _, c := range checks {
-		if pending(fm, fs, c) {
-			out = append(out, c)
-		}
+	if len(checks) == 0 {
+		return nil
 	}
+	var out []store.RangeCheck
+	rs.View(fm, func(fs *store.FileState) {
+		for _, c := range checks {
+			if pending(fm, *fs, c) {
+				out = append(out, c)
+			}
+		}
+	})
 	return out
 }
 
@@ -465,8 +485,12 @@ func groupRuns(fm store.FileManifest, todo []int, order func(int) []int) [][2]in
 	for _, i := range todo {
 		if n := len(runs); n > 0 {
 			r := &runs[n-1]
-			if r[1] == i && fm.ChunkOf(i) == fm.ChunkOf(r[0]) && i-r[0] < maxRunSegments && slices.Equal(cur, order(i)) {
+			if o := order(i); r[1] == i && fm.ChunkOf(i) == fm.ChunkOf(r[0]) && i-r[0] < maxRunSegments && slices.Equal(cur, o) {
 				r[1] = i + 1
+				continue
+			} else {
+				runs = append(runs, [2]int{i, i + 1})
+				cur = o
 				continue
 			}
 		}

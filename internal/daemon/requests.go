@@ -207,7 +207,7 @@ func (d *Daemon) requestStatus(r request.Request) server.RequestStatus {
 			m = cm
 		}
 	}
-	need, err := want.Resolve(mf, want.Want{Model: m, Pieces: []catalog.Pieces{r.Pieces}})
+	need, err := d.resolveRequest(r, m, mf)
 	if err != nil {
 		st.State, st.Error = server.StateInvalid, err.Error()
 		return st
@@ -217,12 +217,90 @@ func (d *Daemon) requestStatus(r request.Request) server.RequestStatus {
 		st.Error = err.Error()
 		return st
 	}
-	st.BytesTotal, st.BytesDone = need.Bytes(mf), need.BytesDone(mf, rs)
+	total, done, ready := d.countRequest(r.Name, mf, need, rs)
+	st.BytesTotal, st.BytesDone = total, done
 	st.State = server.StateDownloading
-	if need.Satisfied(mf, rs) && !checksPending(mf, need, rs) {
+	if ready {
 		st.State, st.Error = server.StateReady, ""
 	}
 	return st
+}
+
+// resolvedNeed is a request's need, worked out once for the request and
+// manifest it was worked out from: a consumer waiting on a request asks
+// for its status four times a second.
+type resolvedNeed struct {
+	name    string
+	updated time.Time
+	mf      *store.Manifest
+	need    *want.Need
+	err     error
+
+	// What the need came to against rs at generation gen.
+	rs                *store.RevisionState
+	gen               uint64
+	total, done       int64
+	ready, hasCounted bool
+}
+
+// resolveRequest resolves r against mf, reusing the last answer for the
+// same request version and manifest.
+func (d *Daemon) resolveRequest(r request.Request, m catalog.Model, mf *store.Manifest) (*want.Need, error) {
+	d.needMu.Lock()
+	c := d.needs[r.Name]
+	d.needMu.Unlock()
+	if c != nil && c.updated.Equal(r.Updated) && sameManifest(c.mf, mf) {
+		return c.need, c.err
+	}
+	need, err := want.Resolve(mf, want.Want{Model: m, Pieces: []catalog.Pieces{r.Pieces}})
+	d.needMu.Lock()
+	if d.needs == nil {
+		d.needs = make(map[string]*resolvedNeed)
+	}
+	d.needs[r.Name] = &resolvedNeed{name: r.Name, updated: r.Updated, mf: mf, need: need, err: err}
+	d.needMu.Unlock()
+	return need, err
+}
+
+// countRequest returns how much of need rs holds and whether all of it is
+// ready, reusing the last count while rs has not changed: over a
+// release's segments a count takes tens of ms, and a waiting consumer
+// asks four times a second.
+func (d *Daemon) countRequest(name string, mf *store.Manifest, need *want.Need, rs *store.RevisionState) (total, done int64, ready bool) {
+	gen := rs.Gen()
+	d.needMu.Lock()
+	c := d.needs[name]
+	if c != nil && c.need == need && c.hasCounted && c.rs == rs && c.gen == gen {
+		total, done, ready = c.total, c.done, c.ready
+		d.needMu.Unlock()
+		return
+	}
+	d.needMu.Unlock()
+	total, done = need.Bytes(mf), need.BytesDone(mf, rs)
+	ready = need.Satisfied(mf, rs) && !checksPending(mf, need, rs)
+	d.needMu.Lock()
+	if c != nil && c.need == need {
+		c.rs, c.gen, c.total, c.done, c.ready, c.hasCounted = rs, gen, total, done, ready, true
+	}
+	d.needMu.Unlock()
+	return
+}
+
+// sameManifest reports whether a and b describe the same files.
+func sameManifest(a, b *store.Manifest) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil || a.Model != b.Model || a.Revision != b.Revision || a.Commit != b.Commit || len(a.Files) != len(b.Files) {
+		return false
+	}
+	for i := range a.Files {
+		x, y := a.Files[i], b.Files[i]
+		if x.Path != y.Path || x.Size != y.Size || x.SHA256 != y.SHA256 || x.SegmentSize != y.SegmentSize || len(x.SegmentSHA256) != len(y.SegmentSHA256) {
+			return false
+		}
+	}
+	return true
 }
 
 // checksPending reports whether a consumer checksum in need has not yet

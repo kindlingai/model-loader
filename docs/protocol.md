@@ -201,6 +201,26 @@ another process answers on.
 within 3 s. Health checks, and consumers waiting for model-loader to start,
 use it.
 
+### `GET /catalog`
+
+The catalog's models, in catalog order: each entry's name, revision and
+source. A consumer that knows a model by its source (gr8 takes
+`https://huggingface.co/<org>/<repo>`) finds its catalog name here, so
+nobody has to tell it the name.
+
+```json
+{
+  "models": [
+    {"name": "glm-5.3-exlr8", "revision": "main",
+     "source": {"type": "huggingface", "repo": "kindlingai/glm-5.3-exlr8-k2-k3-k4"}},
+    {"name": "small", "revision": "v1",
+     "source": {"type": "http", "url": "https://files.example/small/"}}
+  ]
+}
+```
+
+Nothing else in the catalog (segment sizes, size hints, notes) is listed.
+
 ### `PUT /requests/{name}`
 
 Create the request `name`, or replace it. `name` is 1 to 128 of

@@ -275,6 +275,35 @@ func TestLocalAPI(t *testing.T) {
 	}
 }
 
+// GET /catalog lists every catalog entry's name, revision and source, so
+// a consumer can map a source it knows to the catalog's name for it.
+func TestLocalAPICatalog(t *testing.T) {
+	f := newRequestFleet(t)
+	d := f.node(t.TempDir())
+	d.cfg.Catalog = &catalog.Catalog{Models: []catalog.Model{f.model,
+		{Name: "glm-hf", Revision: "main", Source: catalog.Source{Type: catalog.SourceHuggingFace, Repo: "org/glm"}}}}
+	ts := httptest.NewServer(server.NewLocal(d))
+	t.Cleanup(ts.Close)
+	resp, err := http.Get(ts.URL + "/catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Models []server.CatalogModel `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("GET /catalog = %d, %v", resp.StatusCode, err)
+	}
+	want := []server.CatalogModel{
+		{Name: "glm", Revision: "r1", Source: server.CatalogSource{Type: "http", URL: "http://unused.invalid"}},
+		{Name: "glm-hf", Revision: "main", Source: server.CatalogSource{Type: "huggingface", Repo: "org/glm"}},
+	}
+	if len(got.Models) != 2 || got.Models[0] != want[0] || got.Models[1] != want[1] {
+		t.Fatalf("GET /catalog = %+v, want %+v", got.Models, want)
+	}
+}
+
 // Trailing content after the JSON object, or a body over the limit, is
 // refused.
 func TestLocalAPIBody(t *testing.T) {

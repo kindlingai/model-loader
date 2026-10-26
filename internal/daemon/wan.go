@@ -265,14 +265,18 @@ func (d *Daemon) downloadFile(ctx context.Context, src source.Source, m catalog.
 	}
 
 	w := &originWriter{
-		f: f, of: of, pos: of.BytesDone, whole: whole, seg: sha256.New(),
+		f: f, of: of, pos: of.BytesDone, start: of.BytesDone, whole: whole, seg: sha256.New(),
 		onWrite: func() { stall.Reset(d.cfg.StallTimeout) },
 		save: func() error {
 			progress(of.BytesDone)
 			return d.cfg.Store.SaveState(rs)
 		},
 	}
-	if _, err := io.Copy(w, rc); err != nil {
+	_, err = io.Copy(w, rc)
+	if werr := w.wait(); err == nil {
+		err = werr
+	}
+	if err != nil {
 		return stallCause(ctx, err)
 	}
 	if w.pos != of.Size {
@@ -305,21 +309,31 @@ func stallCause(ctx context.Context, err error) error {
 // segment from page cache, so a single multi-hundred-GB download doesn't
 // leave the whole file resident in page cache, which would compete with
 // GPU-visible RAM on unified-memory hardware. It then saves progress, so a
-// restart loses at most one segment.
+// restart loses at most two segments.
+//
+// A segment's sync and save run while the next segment downloads: on a
+// network store, syncing a segment takes long enough that the origin
+// connection would otherwise sit idle each time, and the download would
+// alternate between full speed and none.
 type originWriter struct {
-	f   *os.File
-	of  *store.OriginFile
-	pos int64 // bytes written; of.BytesDone catches up at each segment boundary
+	f     *os.File
+	of    *store.OriginFile
+	pos   int64 // bytes written; of.BytesDone catches up once a segment is flushed
+	start int64 // where the segment being written starts
 
 	whole, seg hash.Hash
 	onWrite    func()
 	save       func() error
+
+	// flushed gets the result of the last segment's flush while it runs;
+	// nil when none is. Until it is received, only the flush touches of.
+	flushed chan error
 }
 
 func (w *originWriter) Write(p []byte) (int, error) {
 	written := 0
 	for written < len(p) {
-		end := min(w.of.BytesDone+store.DefaultSegmentSize, w.of.Size)
+		end := min(w.start+store.DefaultSegmentSize, w.of.Size)
 		chunk := p[written:min(len(p), written+int(end-w.pos))]
 		if len(chunk) == 0 {
 			return written, fmt.Errorf("origin sent more than %d bytes", w.of.Size)
@@ -342,27 +356,54 @@ func (w *originWriter) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-// endSegment records the segment just written. Progress is saved after every
-// segment but the last; the caller checks the whole file and saves it as
-// complete.
+// endSegment records the segment just written and starts flushing it, once
+// the segment before it is flushed.
 func (w *originWriter) endSegment() error {
-	start := w.of.BytesDone
+	if err := w.wait(); err != nil {
+		return err
+	}
+	start, end := w.start, w.pos
+	w.start = end
+	sum := hex.EncodeToString(w.seg.Sum(nil))
+	w.seg.Reset()
+	var state []byte
+	if end != w.of.Size {
+		var err error
+		if state, err = w.whole.(encoding.BinaryMarshaler).MarshalBinary(); err != nil {
+			return fmt.Errorf("save hash state: %w", err)
+		}
+	}
+	flushed := make(chan error, 1)
+	w.flushed = flushed
+	go func() { flushed <- w.flush(start, end, sum, state) }()
+	return nil
+}
+
+// flush syncs the segment from start to end and records it in of. Progress
+// is saved after every segment but the last; the caller checks the whole
+// file and saves it as complete.
+func (w *originWriter) flush(start, end int64, sum string, state []byte) error {
 	if err := w.f.Sync(); err != nil {
 		return fmt.Errorf("sync: %w", err)
 	}
-	if err := store.Uncache(w.f, start, w.pos-start); err != nil {
+	if err := store.Uncache(w.f, start, end-start); err != nil {
 		return fmt.Errorf("uncache: %w", err)
 	}
-	w.of.SegmentSHA256 = append(w.of.SegmentSHA256, hex.EncodeToString(w.seg.Sum(nil)))
-	w.seg.Reset()
-	w.of.BytesDone = w.pos
-	if w.pos == w.of.Size {
+	w.of.SegmentSHA256 = append(w.of.SegmentSHA256, sum)
+	w.of.BytesDone = end
+	if end == w.of.Size {
 		return nil
-	}
-	state, err := w.whole.(encoding.BinaryMarshaler).MarshalBinary()
-	if err != nil {
-		return fmt.Errorf("save hash state: %w", err)
 	}
 	w.of.SHA256State = state
 	return w.save()
+}
+
+// wait returns the result of the last segment's flush, once it is done.
+func (w *originWriter) wait() error {
+	if w.flushed == nil {
+		return nil
+	}
+	err := <-w.flushed
+	w.flushed = nil
+	return err
 }

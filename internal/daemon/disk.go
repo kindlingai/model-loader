@@ -252,7 +252,7 @@ func (d *Daemon) makeRoom(ctx context.Context, needs []spaceNeed) (func(), error
 	}
 	used, need, err := d.measureLocked()
 	if err == nil && used+need > d.cfg.DiskBudget {
-		d.freeLocked(ctx)
+		d.freeLocked(ctx, nil)
 		used, need, err = d.measureLocked()
 	}
 	if err != nil {
@@ -287,17 +287,17 @@ func (d *Daemon) fitsLocked() bool {
 
 // freeLocked frees space until the store's use plus every reservation
 // fits the budget, or nothing more may be freed: first bytes no held
-// segment covers, then victims, oldest use first. It returns the victims
-// it listed and left, and whether it listed them. d.diskMu is held.
-func (d *Daemon) freeLocked(ctx context.Context) (left []victim, listed bool) {
+// segment covers, then victims, oldest use first. asked is as for
+// victims. d.diskMu is held.
+func (d *Daemon) freeLocked(ctx context.Context, asked map[string][]*server.SegmentsResponse) {
 	d.reclaimLocked()
 	if d.fitsLocked() {
-		return nil, false
+		return
 	}
-	vs, err := d.victims(ctx)
+	vs, err := d.victims(ctx, asked)
 	if err != nil {
 		log.Printf("model-loader: not evicting: %v", err)
-		return nil, true
+		return
 	}
 	// Read the pins again, under pinMu, now that the fleet has answered:
 	// a request made meanwhile pins what it names before it is answered.
@@ -306,11 +306,11 @@ func (d *Daemon) freeLocked(ctx context.Context) (left []victim, listed bool) {
 	pins, err := d.pins()
 	if err != nil {
 		log.Printf("model-loader: not evicting: %v", err)
-		return nil, true
+		return
 	}
 	used, need, err := d.measureLocked()
 	if err != nil {
-		return vs, true
+		return
 	}
 	over := used + need - d.cfg.DiskBudget
 	// Pick victims, oldest first, until their bytes cover what is over,
@@ -333,11 +333,10 @@ func (d *Daemon) freeLocked(ctx context.Context) (left []victim, listed bool) {
 			log.Printf("model-loader: evict: %v", err)
 		}
 		if used, need, err = d.measureLocked(); err != nil {
-			return vs, true
+			return
 		}
 		over = used + need - d.cfg.DiskBudget
 	}
-	return vs, true
 }
 
 // reclaimLocked frees, in every file nothing is writing, the space under
@@ -404,12 +403,11 @@ func (d *Daemon) diskPass(ctx context.Context) {
 	if d.cfg.DiskBudget > 0 {
 		d.retireLocked(ctx)
 	}
-	// What eviction left is what could be evicted, without asking the
-	// fleet again.
-	var vs []victim
-	listed := false
+	// Eviction and the count after it share what the fleet said: the
+	// pass asks each peer once.
+	asked := map[string][]*server.SegmentsResponse{}
 	if d.cfg.DiskBudget > 0 && !d.fitsLocked() {
-		vs, listed = d.freeLocked(ctx)
+		d.freeLocked(ctx, asked)
 	}
 	used, _, err := d.measureLocked()
 	if err != nil {
@@ -420,12 +418,11 @@ func (d *Daemon) diskPass(ctx context.Context) {
 		d.setDisk(server.DiskStatus{UsedBytes: used})
 		return
 	}
-	if !listed {
-		vs, _ = d.victims(ctx)
-	}
 	var evictable int64
-	for _, v := range vs {
-		evictable += v.bytes
+	if vs, err := d.victims(ctx, asked); err == nil {
+		for _, v := range vs {
+			evictable += v.bytes
+		}
 	}
 	d.setDisk(server.DiskStatus{BudgetBytes: d.cfg.DiskBudget, UsedBytes: used, EvictableBytes: evictable})
 }
@@ -492,7 +489,9 @@ func pinned(pins map[string]*want.Need, mf *store.Manifest, fm store.FileManifes
 
 // victims lists the held segments this node may evict now, least
 // recently used first: not pinned, not in use, and kept by the fleet.
-func (d *Daemon) victims(ctx context.Context) ([]victim, error) {
+// asked, if not nil, keeps what the fleet said of each revision, so
+// calls that share it ask each peer once.
+func (d *Daemon) victims(ctx context.Context, asked map[string][]*server.SegmentsResponse) ([]victim, error) {
 	pins, err := d.pins()
 	if err != nil {
 		return nil, err
@@ -531,10 +530,23 @@ func (d *Daemon) victims(ctx context.Context) ([]victim, error) {
 			continue
 		}
 		if !d.canRefetch(m) {
-			keeps := d.fleetKeeps(d.askPeers(ctx, m.Name, m.Revision, mf))
+			key := want.Key(m.Name, m.Revision)
+			answers, ok := asked[key]
+			if !ok {
+				answers = d.askPeers(ctx, m.Name, m.Revision, mf)
+				if asked != nil {
+					asked[key] = answers
+				}
+			}
+			keeps := d.fleetKeeps(answers)
 			kept := mine[:0]
+			var path string
+			var keep func(i int) bool
 			for _, v := range mine {
-				if v = v.filter(keeps(v.fm.Path)); len(v.runs) > 0 {
+				if v.fm.Path != path {
+					path, keep = v.fm.Path, keeps(v.fm.Path) // once a file
+				}
+				if v = v.filter(keep); len(v.runs) > 0 {
 					kept = append(kept, v)
 				}
 			}

@@ -364,7 +364,7 @@ func TestScaleVictims(t *testing.T) {
 	ctx := context.Background()
 	var vs []victim
 	took, allocMB := allocs(func() {
-		if vs, err = d.victims(ctx); err != nil {
+		if vs, err = d.victims(ctx, nil); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -379,8 +379,8 @@ func TestScaleVictims(t *testing.T) {
 	if took > 2*time.Second || allocMB > 64 {
 		t.Errorf("victims takes %v and allocates %.0f MB at release scale", took, allocMB)
 	}
-	// A disk pass counts what could be evicted; one over the budget
-	// counts what eviction left. Either asks the peer once.
+	// A disk pass counts what could be evicted, after evicting if it is
+	// over the budget. Either asks the peer once.
 	for _, over := range []bool{false, true} {
 		want := bytes
 		if over {

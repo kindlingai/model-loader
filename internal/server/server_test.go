@@ -311,6 +311,9 @@ func TestHeldSegmentsBits(t *testing.T) {
 	if _, ok := heldSegments(make([]bool, n), n, true); ok {
 		t.Fatal("a file with nothing held is answered")
 	}
+	if (FileSegments{Segments: 3, Bits: []byte{0xff}}).Has(5) {
+		t.Fatal("a bit past the file's segments is held")
+	}
 }
 
 func TestHandleSegments(t *testing.T) {

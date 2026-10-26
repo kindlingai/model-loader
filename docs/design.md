@@ -161,7 +161,8 @@ scale:
   about a million runs (14 MB), or about 2 MB as bitmaps, which nodes
   ask for (`?bits=1`); an answer may be up to 256 MiB. Eviction keeps
   its victims as runs, one per chunk, and a disk pass asks each peer
-  once: what eviction left is what it reports could be evicted.
+  once: counting what could be evicted after eviction reuses the
+  answers eviction got.
 - A blob request reads what is held from the state the node keeps in
   memory, not the state file.
 

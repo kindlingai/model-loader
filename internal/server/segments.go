@@ -50,13 +50,13 @@ type FileSegments struct {
 }
 
 // BitsParam is the query parameter of GET /segments by which an asker
-// says it takes FileSegments.Bits.
+// says it takes FileSegments.Bits: ?bits=1.
 const BitsParam = "bits"
 
 // Has reports whether segment i is held. Held is sorted (see Valid).
 func (f FileSegments) Has(i int) bool {
 	if f.Bits != nil {
-		return i >= 0 && i/8 < len(f.Bits) && f.Bits[i/8]&(1<<(i%8)) != 0
+		return i >= 0 && i < f.Segments && i/8 < len(f.Bits) && f.Bits[i/8]&(1<<(i%8)) != 0
 	}
 	k := sort.Search(len(f.Held), func(k int) bool { return f.Held[k][1] > i })
 	return k < len(f.Held) && f.Held[k][0] <= i
@@ -137,7 +137,7 @@ func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
 		return
 	}
-	bits := r.URL.Query().Has(BitsParam)
+	bits := r.URL.Query().Get(BitsParam) == "1"
 	for _, fm := range m.Files {
 		var held FileSegments
 		var ok bool

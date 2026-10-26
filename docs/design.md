@@ -188,7 +188,8 @@ Each held segment records how it was verified (its trust mode):
 - `origin`: a root fetched it from the origin over TLS, for a file with no
   segment hashes, and recorded its sha256. A peer that copies it from the
   root checks it against that sha256 (`X-Segment-SHA256`) and keeps the
-  root's trust mode.
+  root's trust mode, but for `manifest`: that is only the root's word, so
+  the peer holds it as `origin` until it checks the whole file itself.
 - `requester`: as `origin`, and a consumer's XXH64 (seed 0) for every
   range inside it matched. gr8 has one for every expert half in its index
   slices. Give it as `xxh64` on a selection range; a peer passes it on to
@@ -203,9 +204,10 @@ dropped and fetched again. If segments the manifest verified are left,
 the manifest disagrees with itself: nothing of the file is served, and the
 model is in error until the manifest changes. If it matches, every segment becomes
 `manifest`: the bytes are the origin's, and a consumer checksum that does
-not match them is not applied. A file with no origin digest and no segment
-hashes is complete once every segment is held, as nothing more is known to
-check it against.
+not match them is not applied. A node that copies part of the file checks
+consumer checksums all the same, as it has not checked the whole file. A
+file with no origin digest and no segment hashes is complete once every
+segment is held, as nothing more is known to check it against.
 
 A consumer checksum given after its range was fetched is checked against
 the held bytes on the next pass, once; one that fails drops what it covers.

@@ -161,7 +161,9 @@ none, and a file of small segments never has):
   against it. A node older than small segments sends this only for a
   request of one segment.
 - `X-Segment-Trust`: how this node verified each, in the same order:
-  `manifest`, `origin` or `requester`.
+  `manifest`, `origin` or `requester`. The requester takes `manifest` as
+  `origin`, unless its own manifest has segment hashes for the file: it
+  skips consumer checksums only on bytes it checked itself.
 
 ## Local request API
 

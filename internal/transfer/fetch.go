@@ -607,10 +607,13 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 					bad = fmt.Errorf("segment %d failed hash verification", i)
 				}
 			case claimSum != "":
-				if sum == claimSum {
-					trusts[j] = claimTrust
-				} else {
+				if sum != claimSum {
 					bad = fmt.Errorf("segment %d does not match the sha256 its source claims", i)
+				} else if claimTrust != store.TrustManifest {
+					// A claimed manifest is only the source's word: it is
+					// held as origin until this node checks the whole
+					// file (see store.RevisionState.SetComplete).
+					trusts[j] = claimTrust
 				}
 			case origin:
 				trusts[j] = store.TrustOrigin // fetched from the origin by this node.

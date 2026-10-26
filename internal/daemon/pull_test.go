@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -545,19 +546,25 @@ func TestPullThroughPrefersLAN(t *testing.T) {
 
 // Once a pull-through file is whole and matches the origin's digest, its
 // bytes are the origin's: a wrong consumer checksum does not drop them or
-// cause more origin traffic.
+// cause more origin traffic. A peer that copies all of it checks the whole
+// file and trusts it the same. One that copies part of it has only the
+// root's word for that, so it checks a consumer checksum itself (#35).
 func TestCompletedLazyFileTrustsOrigin(t *testing.T) {
 	content := pattern(40, 't')
 	f := newPullFleet(t, map[string][]byte{"w.bin": content}, nil)
-	whole, _ := f.peer(&catalog.Selection{Partial: []catalog.Pieces{{Model: "glm"}}})
+	whole, wst := f.peer(&catalog.Selection{Partial: []catalog.Pieces{{Model: "glm"}}})
 	if err := whole.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	all := []bool{true, true, true, true}
+	checkHeld(t, wst, "w.bin", content, all, store.TrustManifest)
 	served := f.origin.bytes.Load()
-	bad, _ := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 5, Length: 3, XXH64: "0123456789abcdef"}))
-	if err := bad.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
+	bad, bst := f.peer(rangeSel("w.bin", catalog.ByteRange{Offset: 5, Length: 3, XXH64: "0123456789abcdef"}))
+	if err := bad.Reconcile(context.Background()); !errors.Is(err, store.ErrCheckFailed) {
+		t.Fatalf("Reconcile = %v, want a failed consumer checksum", err)
 	}
+	checkHeld(t, bst, "w.bin", content, []bool{false}, "")
+	checkHeld(t, f.rootSt, "w.bin", content, all, store.TrustManifest)
 	if f.origin.bytes.Load() != served {
 		t.Fatal("origin refetched bytes that matched its own digest")
 	}

@@ -88,7 +88,7 @@ commits (Hugging Face); every file is of it, and a node that fetches from
 the origin fetches that commit. It is a hex git commit id or empty.
 
 A root publishes a manifest for pull-through the first time one is asked
-for, for a catalog model it does not want whole. Its files have
+for, for any catalog model, one it wants whole included. Its files have
 `segment_size` but no `segment_sha256`. Each segment is then verified as
 described under `/blob`. A file the catalog gives small segments (see
 "Small segments" in `docs/design.md`) has no `segment_sha256` in any

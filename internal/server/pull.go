@@ -35,8 +35,7 @@ const (
 const MaxClaimSegments = 256
 
 // ErrNotPullable means a Puller will not fetch that model or range: it is
-// not in its catalog, or it is being downloaded whole and is published
-// only when done.
+// not in its catalog, or not a file of it.
 var ErrNotPullable = errors.New("not available for pull-through")
 
 // Puller fetches what a node does not hold yet from the model's origin,

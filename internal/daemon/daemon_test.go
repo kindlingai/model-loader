@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,7 +32,7 @@ func (f fakeStatus) Status() server.StatusResponse { return f.resp }
 
 // newWANTestServer serves a single file "a.bin" as a plain HTTP source,
 // matching the contract internal/source/http.go expects: a manifest.json at
-// the root and the file itself at its path.
+// the root and the file itself at its path, with Range support.
 func newWANTestServer(t *testing.T, content []byte) *httptest.Server {
 	t.Helper()
 	sum := sha256.Sum256(content)
@@ -48,7 +47,7 @@ func newWANTestServer(t *testing.T, content []byte) *httptest.Server {
 		})
 	})
 	mux.HandleFunc("/a.bin", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(content)
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(content))
 	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -388,8 +387,9 @@ func TestDaemonAlreadyCompleteSkipsTransfer(t *testing.T) {
 	}
 }
 
-// newCountingWANServer serves files as a plain HTTP source and counts GETs
-// per file, so a test can tell which files were actually downloaded.
+// newCountingWANServer serves files as a plain HTTP source, with Range
+// support, and counts GETs per file, so a test can tell which files were
+// actually downloaded.
 func newCountingWANServer(t *testing.T, files map[string][]byte) (*httptest.Server, *sync.Map) {
 	t.Helper()
 	var entries []map[string]any
@@ -406,7 +406,7 @@ func newCountingWANServer(t *testing.T, files map[string][]byte) (*httptest.Serv
 		mux.HandleFunc("/"+name, func(w http.ResponseWriter, r *http.Request) {
 			n, _ := counts.LoadOrStore(name, new(atomic.Int32))
 			n.(*atomic.Int32).Add(1)
-			_, _ = w.Write(content)
+			http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(content))
 		})
 	}
 	ts := httptest.NewServer(mux)
@@ -420,104 +420,6 @@ func getCount(counts *sync.Map, name string) int32 {
 		return 0
 	}
 	return n.(*atomic.Int32).Load()
-}
-
-// A root restarted partway through a model keeps the files the previous run
-// finished and downloads only the rest, including the file it was cut off in.
-func TestDaemonWANResumeKeepsFinishedFiles(t *testing.T) {
-	done := []byte("finished by the previous run")
-	cut := []byte("this one was cut off halfway through")
-	ts, counts := newCountingWANServer(t, map[string][]byte{"done.bin": done, "cut.bin": cut})
-	m := wanModel("demo", ts.URL)
-
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(st.ModelDir("demo", "r1"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(st.FilePath("demo", "r1", "done.bin"), done, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A cut-off file is already its full size: EnsureFile pre-truncates it.
-	partial := make([]byte, len(cut))
-	copy(partial, cut[:len(cut)/2])
-	if err := os.WriteFile(st.FilePath("demo", "r1", "cut.bin"), partial, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	d := New(Config{
-		NodeID: "root-1", Roles: []string{"root"}, Store: st,
-		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
-		Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
-	})
-	if err := d.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if ms := d.Status().Models[0]; ms.State != server.StateReady {
-		t.Fatalf("state = %q, want ready (err: %s)", ms.State, ms.Error)
-	}
-	if n := getCount(counts, "done.bin"); n != 0 {
-		t.Fatalf("done.bin downloaded %d times, want 0", n)
-	}
-	if n := getCount(counts, "cut.bin"); n != 1 {
-		t.Fatalf("cut.bin downloaded %d times, want 1", n)
-	}
-	got, err := os.ReadFile(st.FilePath("demo", "r1", "cut.bin"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(cut) {
-		t.Fatalf("cut.bin = %q, want %q", got, cut)
-	}
-}
-
-// An origin that stops sending mid-file without closing the connection must
-// fail the download after StallTimeout instead of hanging the model forever.
-func TestDaemonWANStallTimesOut(t *testing.T) {
-	content := []byte("first half arrives, then the connection goes quiet")
-	sum := sha256.Sum256(content)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
-			{"path": "a.bin", "size": len(content), "sha256": hex.EncodeToString(sum[:])},
-		}})
-	})
-	mux.HandleFunc("/a.bin", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-		_, _ = w.Write(content[:len(content)/2])
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	})
-	ts := httptest.NewServer(mux)
-	t.Cleanup(ts.Close)
-	m := wanModel("demo", ts.URL)
-
-	st, err := store.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	d := New(Config{
-		NodeID: "root-1", Roles: []string{"root"}, Store: st,
-		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
-		Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
-		StallTimeout: 200 * time.Millisecond,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := d.Reconcile(ctx); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if ctx.Err() != nil {
-		t.Fatal("Reconcile only returned once the test deadline hit; the stall timeout never fired")
-	}
-	ms := d.Status().Models[0]
-	if ms.State != server.StatePending || !strings.Contains(ms.Error, errStalled.Error()) {
-		t.Fatalf("status = %q (%s), want pending with %q", ms.State, ms.Error, errStalled)
-	}
 }
 
 // newRangeWANServer serves content as "a.bin" from a plain HTTP source whose
@@ -559,91 +461,21 @@ func twoSegments() []byte {
 	return content
 }
 
-// A root restarted partway through a file asks the origin only for what is
-// missing, and builds the same manifest as hashing the whole file would. An
-// origin that can't serve a range gets the file from the start instead.
+// A root cut off partway through a model has published its manifest
+// anyway, and once restarted asks the origin only for the segment it does
+// not hold.
 func TestDaemonWANResumesCutOffFile(t *testing.T) {
 	content := twoSegments()
 	sum := sha256.Sum256(content)
-	want := &store.Manifest{Files: []store.FileManifest{{Path: "a.bin", Size: int64(len(content))}}}
-	if err := want.BuildSegmentHashes(func(string) (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(content)), nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	resumeAt := "bytes=" + strconv.FormatInt(store.DefaultSegmentSize, 10) + "-"
-
-	for _, tc := range []struct {
-		name       string
-		honorRange bool
-		wantRanges []string
-	}{
-		{"origin serves ranges", true, []string{"", resumeAt}},
-		{"origin ignores ranges", false, []string{"", resumeAt, ""}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ts, ranges := newRangeWANServer(t, content, hex.EncodeToString(sum[:]), func(n int, w http.ResponseWriter, r *http.Request) {
-				switch {
-				case n == 1: // cut off partway through the second segment
-					w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-					_, _ = w.Write(content[:store.DefaultSegmentSize+100])
-				case tc.honorRange:
-					http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(content))
-				default:
-					_, _ = w.Write(content)
-				}
-			})
-			m := wanModel("demo", ts.URL)
-			st, err := store.Open(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
-			}
-			d := New(Config{
-				NodeID: "root-1", Roles: []string{"root"}, Store: st,
-				Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
-				Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
-			})
-
-			if err := d.Reconcile(context.Background()); err != nil {
-				t.Fatalf("Reconcile: %v", err)
-			}
-			if ms := d.Status().Models[0]; ms.State != server.StatePending {
-				t.Fatalf("after the cut-off: state = %q, want pending", ms.State)
-			}
-			if err := d.Reconcile(context.Background()); err != nil {
-				t.Fatalf("Reconcile: %v", err)
-			}
-			if ms := d.Status().Models[0]; ms.State != server.StateReady {
-				t.Fatalf("state = %q, want ready (err: %s)", ms.State, ms.Error)
-			}
-
-			if got := ranges(); !slices.Equal(got, tc.wantRanges) {
-				t.Fatalf("Range headers = %q, want %q", got, tc.wantRanges)
-			}
-			got, err := os.ReadFile(st.FilePath("demo", "r1", "a.bin"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, content) {
-				t.Fatal("a.bin does not match the origin's content")
-			}
-			mf, err := st.LoadManifest("demo", "r1")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(mf.Files, want.Files) {
-				t.Fatalf("manifest files = %+v, want %+v", mf.Files, want.Files)
-			}
-		})
-	}
-}
-
-// A file that doesn't match the origin's digest is downloaded again from the
-// start, not resumed from its last saved segment.
-func TestDaemonWANDigestMismatchStartsOver(t *testing.T) {
-	content := twoSegments()
-	other := sha256.Sum256([]byte("what the origin says the file is"))
-	ts, ranges := newRangeWANServer(t, content, hex.EncodeToString(other[:]), func(n int, w http.ResponseWriter, r *http.Request) {
+	first := "bytes=0-" + strconv.FormatInt(store.DefaultSegmentSize-1, 10)
+	second := "bytes=" + strconv.FormatInt(store.DefaultSegmentSize, 10) + "-" + strconv.Itoa(len(content)-1)
+	var cut atomic.Bool
+	ts, ranges := newRangeWANServer(t, content, hex.EncodeToString(sum[:]), func(n int, w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == second && cut.CompareAndSwap(false, true) {
+			w.Header().Set("Content-Length", "1000") // cut off partway through
+			_, _ = w.Write(content[store.DefaultSegmentSize : store.DefaultSegmentSize+100])
+			return
+		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(content))
 	})
 	m := wanModel("demo", ts.URL)
@@ -651,22 +483,43 @@ func TestDaemonWANDigestMismatchStartsOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := New(Config{
-		NodeID: "root-1", Roles: []string{"root"}, Store: st,
-		Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
-		Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
-	})
-
-	for range 2 {
-		if err := d.Reconcile(context.Background()); err != nil {
-			t.Fatalf("Reconcile: %v", err)
-		}
-		if ms := d.Status().Models[0]; ms.State != server.StatePending || !strings.Contains(ms.Error, "does not match") {
-			t.Fatalf("status = %q (%s), want pending with a digest mismatch", ms.State, ms.Error)
-		}
+	root := func() *Daemon {
+		return New(Config{
+			NodeID: "root-1", Roles: []string{"root"}, Store: st,
+			Catalog:   &catalog.Catalog{Models: []catalog.Model{m}},
+			Selection: allSelection(), Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil),
+		})
 	}
-	if got := ranges(); !slices.Equal(got, []string{"", ""}) {
-		t.Fatalf("Range headers = %q, want two downloads from the start", got)
+
+	d := root()
+	if err := d.Reconcile(context.Background()); err == nil {
+		t.Fatal("Reconcile after the cut-off: no error")
+	}
+	if ms := d.Status().Models[0]; ms.State != server.StateError || ms.BytesDone != store.DefaultSegmentSize {
+		t.Fatalf("after the cut-off: %s with %d bytes, want error with the first segment", ms.State, ms.BytesDone)
+	}
+	if _, err := st.LoadManifest("demo", "r1"); err != nil {
+		t.Fatalf("manifest not published before the download is done: %v", err)
+	}
+
+	d = root()
+	if err := d.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if ms := d.Status().Models[0]; ms.State != server.StateReady {
+		t.Fatalf("state = %q, want ready (err: %s)", ms.State, ms.Error)
+	}
+	got := ranges()
+	slices.Sort(got)
+	if want := []string{first, second, second}; !slices.Equal(got, want) {
+		t.Fatalf("Range headers = %q, want %q", got, want)
+	}
+	file, err := os.ReadFile(st.FilePath("demo", "r1", "a.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(file, content) {
+		t.Fatal("a.bin does not match the origin's content")
 	}
 }
 

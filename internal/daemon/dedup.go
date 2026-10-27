@@ -18,7 +18,7 @@ import (
 // With Config.Dedup, a node about to fetch a whole file first looks for a
 // file of the same size and sha256 that a revision in its store holds
 // complete, and copies that instead: a root before it downloads the file
-// from the origin, a plain peer before it fetches it over the LAN. The
+// from the origin, a peer before it fetches it over the LAN. The
 // copy is a file of its own (see store.CopyFile), cloned where the
 // filesystem can, so eviction, repair and removal of one revision never
 // touch the other, as they would through a hard link.
@@ -46,7 +46,7 @@ func (d *Daemon) twins() map[string][]twin {
 	for _, ref := range refs {
 		mf, err := d.cfg.Store.LoadManifest(ref.Model, ref.Revision)
 		if err != nil {
-			continue // a root's download that has not finished
+			continue // a revision with no manifest
 		}
 		for _, fm := range mf.Files {
 			if fm.SHA256 != "" && fm.Size > 0 {
@@ -172,12 +172,17 @@ func (d *Daemon) reusedSums(m catalog.Model, fm store.FileManifest, t twin, rs *
 // of and holds none of: once copied, every segment of fm is marked held
 // and the file complete, and rs saved. A file it holds part of fetches
 // the rest: the copy writes the whole file, so one that failed would
-// leave segments marked held with the twin's bytes in them.
+// leave segments marked held with the twin's bytes in them. Every segment
+// is claimed as a root's pull claims those it fetches (see
+// claimSegments), so a peer's pull into the file waits for the copy
+// rather than writes under it; one already pulling part of it leaves the
+// file to be fetched.
 func (d *Daemon) reuseHeld(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, twins map[string][]twin) (bool, error) {
-	held := false
-	rs.View(fm, func(fs *store.FileState) { held = slices.Contains(fs.SegmentsDone, true) })
-	if held {
-		return false, nil
+	file := claimKey(m, fm)
+	mine, theirs := d.claimSegments(file, fm, rs, slices.Repeat([]bool{true}, fm.NumSegments()))
+	defer d.releaseSegments(file, mine)
+	if theirs != nil || mine == nil || slices.Contains(mine, false) {
+		return false, nil // held or being pulled, in part
 	}
 	sums, ok := d.reuse(ctx, m, fm, twins, func(int64) {})
 	if !ok {
@@ -196,27 +201,23 @@ func (d *Daemon) reuseHeld(ctx context.Context, m catalog.Model, fm store.FileMa
 	return true, d.cfg.Store.SaveState(rs)
 }
 
-// reuseOrigin is reuse for a root's download of m from its origin, of the
-// file of: once copied, of is complete, and rs saved. It reports whether
-// it wrote the side file of a file the catalog gives small segments. A
-// file partly downloaded resumes instead: a copy that failed would leave
-// the twin's bytes under the hash state the download resumes from.
-func (d *Daemon) reuseOrigin(ctx context.Context, m catalog.Model, rs *store.RevisionState, of *store.OriginFile, twins map[string][]twin, progress func(int64)) (bool, error) {
-	if of.BytesDone > 0 {
-		return false, nil
+// hashSmallFile writes the sha256 of every segment of fm, a file of small
+// segments held whole, to its side file, a chunk at a time.
+func (d *Daemon) hashSmallFile(m catalog.Model, fm store.FileManifest) error {
+	f, err := os.Open(d.cfg.Store.FilePath(m.Name, m.Revision, fm.Path))
+	if err != nil {
+		return err
 	}
-	fm := of.FileManifest
-	fm.SegmentSHA256 = nil
-	if size := m.SegmentSizeFor(fm.Path); size > 0 && size != store.DefaultSegmentSize {
-		fm.SegmentSize = size // as the manifest will have it; see downloadFromWAN
+	defer f.Close()
+	for c := range fm.NumChunks() {
+		first, end := fm.ChunkBounds(c)
+		sums, err := store.HashSegments(f, fm, first, end-first)
+		if err != nil {
+			return err
+		}
+		if err := d.cfg.Store.WriteSegmentHashes(m.Name, m.Revision, fm, first, sums); err != nil {
+			return err
+		}
 	}
-	sums, ok := d.reuse(ctx, m, fm, twins, progress)
-	if !ok {
-		return false, nil
-	}
-	if fm.SegmentSize != store.DefaultSegmentSize {
-		sums = nil
-	}
-	of.SegmentSHA256, of.SHA256State, of.BytesDone, of.Complete = sums, nil, of.Size, true
-	return fm.Small(), d.cfg.Store.SaveState(rs)
+	return nil
 }

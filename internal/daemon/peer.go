@@ -22,10 +22,9 @@ import (
 // once don't both hit WAN for the same new catalog entry if one of them (or
 // a plain peer that already mirrored it) answers first.
 //
-// A root without the manifest downloads a model it wants whole from the
-// origin and publishes the manifest when done, as before; for one it wants
-// only part of it publishes a manifest for pull-through at once (see
-// Manifest).
+// A root without the manifest publishes one at once from the origin's file
+// list (see Manifest), whether it wants the model whole or only part of it,
+// and then fetches what it wants through it, as it does for a peer.
 func (d *Daemon) acquireManifest(ctx context.Context, w want.Want) (*store.Manifest, error) {
 	m := w.Model
 	peers, err := d.cfg.Discoverer.Peers(ctx)
@@ -53,15 +52,7 @@ func (d *Daemon) acquireManifest(ctx context.Context, w want.Want) (*store.Manif
 	if !d.IsWANEligible() {
 		return nil, fmt.Errorf("no peer has %s@%s yet, and this node is not WAN-eligible", m.Name, m.Revision)
 	}
-	if !w.Whole {
-		return d.Manifest(ctx, m.Name, m.Revision)
-	}
-
-	if err := d.limit.Acquire(ctx, w.Priority); err != nil {
-		return nil, err
-	}
-	defer d.limit.Release()
-	return d.downloadFromWAN(ctx, m)
+	return d.Manifest(ctx, m.Name, m.Revision)
 }
 
 // manifestTimeout bounds how long one peer's /manifest may take, so a

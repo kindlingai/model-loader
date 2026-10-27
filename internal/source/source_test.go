@@ -2,12 +2,15 @@ package source
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 )
@@ -193,6 +196,72 @@ func TestHuggingfaceSourceTokenStaysOnHub(t *testing.T) {
 	defer rc.Close()
 	if data, _ := io.ReadAll(rc); string(data) != "hello" {
 		t.Fatalf("got %q, want %q", data, "hello")
+	}
+}
+
+// The segments of a file go to the CDN URL the Hub redirects it to, which
+// is resolved once rather than per segment (#43), and again once expired.
+func TestHuggingfaceSourceResolvesEachFileOnce(t *testing.T) {
+	content := strings.Repeat("0123456789", 100)
+	var mu sync.Mutex
+	resolves := 0
+	expired := ""
+	mux := http.NewServeMux()
+	mux.HandleFunc("/org/repo/resolve/rev/w.bin", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("resolve: %s, want HEAD", r.Method)
+		}
+		mu.Lock()
+		resolves++
+		n := resolves
+		mu.Unlock()
+		http.Redirect(w, r, fmt.Sprintf("https://cas-bridge.xethub.hf.co/signed/w.bin?sig=%d", n), http.StatusFound)
+	})
+	mux.HandleFunc("/signed/w.bin", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gone := r.URL.RawQuery == expired
+		mu.Unlock()
+		if gone {
+			http.Error(w, "expired", http.StatusForbidden)
+			return
+		}
+		http.ServeContent(w, r, "w.bin", time.Time{}, strings.NewReader(content))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	hf := &huggingfaceSource{client: &http.Client{Transport: rewriteHostTransport{target: srv.URL, base: http.DefaultTransport}}}
+	model := catalog.Model{
+		Source:   catalog.Source{Type: catalog.SourceHuggingFace, Repo: "org/repo"},
+		Revision: "rev",
+	}
+	read := func(off int64) {
+		rc, err := hf.Open(context.Background(), model, "w.bin", off, 10)
+		if err != nil {
+			t.Errorf("Open at %d: %v", off, err)
+			return
+		}
+		defer rc.Close()
+		if data, _ := io.ReadAll(rc); string(data) != content[off:off+10] {
+			t.Errorf("at %d got %q, want %q", off, data, content[off:off+10])
+		}
+	}
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() { read(int64(i) * 10) })
+	}
+	wg.Wait()
+	if resolves != 1 {
+		t.Fatalf("50 segments resolved %d times, want 1", resolves)
+	}
+
+	mu.Lock()
+	expired = "sig=1"
+	mu.Unlock()
+	read(0)
+	read(10)
+	if resolves != 2 {
+		t.Fatalf("after expiry resolved %d times in all, want 2", resolves)
 	}
 }
 

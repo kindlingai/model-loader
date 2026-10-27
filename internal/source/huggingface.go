@@ -8,20 +8,34 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 )
 
 // huggingfaceSource fetches a model from the Hugging Face Hub, using its
 // plain HTTP API directly rather than depending on huggingface_hub: the tree
-// API for the file list, and the ordinary resolve URL (which supports Range)
-// for content.
+// API for the file list, and for content the CDN URL each file's resolve
+// URL redirects to (which supports Range).
 type huggingfaceSource struct {
 	client *http.Client
 	// token, if set, is sent as a bearer token so gated and private repos
-	// can be fetched. net/http drops the Authorization header when the Hub
-	// redirects a download to its CDN, so it only ever goes to huggingface.co.
+	// can be fetched. It only ever goes to huggingface.co, never the CDN.
 	token string
+
+	mu sync.Mutex
+	// files maps a file's resolve URL to where its content is served.
+	// shortcut: entries are never pruned (about 1 KB per file ever fetched);
+	// drop them after expiry if a daemon ever fetches enough files to care.
+	files map[string]*hfFile
+}
+
+// hfFile is where one file's content is served: the Hub's redirect target,
+// usually a signed CDN URL. mu is held while it is resolved, so all the
+// segments of a file wait for one resolve.
+type hfFile struct {
+	mu  sync.Mutex
+	url string
 }
 
 type hfTreeEntry struct {
@@ -34,12 +48,12 @@ type hfTreeEntry struct {
 	} `json:"lfs,omitempty"`
 }
 
-func (s *huggingfaceSource) get(ctx context.Context, u string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+func (s *huggingfaceSource) request(ctx context.Context, method, u string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return nil, err
 	}
-	if s.token != "" {
+	if s.token != "" && req.URL.Host == "huggingface.co" {
 		req.Header.Set("Authorization", "Bearer "+s.token)
 	}
 	return req, nil
@@ -47,7 +61,7 @@ func (s *huggingfaceSource) get(ctx context.Context, u string) (*http.Request, e
 
 // getJSON decodes the JSON answer to a GET of u into v.
 func (s *huggingfaceSource) getJSON(ctx context.Context, u string, v any) error {
-	req, err := s.get(ctx, u)
+	req, err := s.request(ctx, http.MethodGet, u)
 	if err != nil {
 		return err
 	}
@@ -109,30 +123,99 @@ func (s *huggingfaceSource) Resolve(ctx context.Context, m catalog.Model) (*Reso
 	return resolved, nil
 }
 
+// contentURL returns where the file at resolve URL hub is served, asking
+// the Hub only when that isn't known yet or is stale, a URL the caller
+// found expired. The Hub rate-limits resolve URLs far below the request
+// rate of a small-segment fetch, so each file is resolved once and its
+// segments go to the CDN (#43).
+func (s *huggingfaceSource) contentURL(ctx context.Context, hub, stale string) (string, error) {
+	s.mu.Lock()
+	if s.files == nil {
+		s.files = map[string]*hfFile{}
+	}
+	f := s.files[hub]
+	if f == nil {
+		f = &hfFile{}
+		s.files[hub] = f
+	}
+	s.mu.Unlock()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.url != "" && f.url != stale {
+		return f.url, nil
+	}
+	req, err := s.request(ctx, http.MethodHead, hub)
+	if err != nil {
+		return "", err
+	}
+	noRedirect := *s.client
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("huggingface source: HEAD %s: %w", hub, err)
+	}
+	resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		f.url = hub // the Hub serves the file itself
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		loc, err := resp.Location()
+		if err != nil {
+			return "", fmt.Errorf("huggingface source: HEAD %s: %s: %w", hub, resp.Status, err)
+		}
+		f.url = loc.String()
+	default:
+		return "", fmt.Errorf("huggingface source: HEAD %s: %s", hub, resp.Status)
+	}
+	return f.url, nil
+}
+
+// Open reads a range of the file at path. Errors name its resolve URL,
+// not the signed CDN URL, which would let whoever reads the log fetch it.
 func (s *huggingfaceSource) Open(ctx context.Context, m catalog.Model, path string, offset, length int64) (io.ReadCloser, error) {
-	u := joinURLPath(fmt.Sprintf("https://huggingface.co/%s/resolve/%s", m.Source.Repo, m.Revision), path)
-	req, err := s.get(ctx, u)
+	hub := joinURLPath(fmt.Sprintf("https://huggingface.co/%s/resolve/%s", m.Source.Repo, m.Revision), path)
+	ranged := offset > 0 || length > 0
+	get := func(u string) (*http.Response, error) {
+		req, err := s.request(ctx, http.MethodGet, u)
+		if err != nil {
+			return nil, err
+		}
+		if ranged {
+			req.Header.Set("Range", rangeHeader(offset, length))
+		}
+		resp, err := s.client.Do(req)
+		if ue, ok := err.(*url.Error); ok {
+			err = ue.Err // it names the signed URL
+		}
+		return resp, err
+	}
+	u, err := s.contentURL(ctx, hub, "")
 	if err != nil {
 		return nil, err
 	}
-	ranged := offset > 0 || length > 0
-	if ranged {
-		req.Header.Set("Range", rangeHeader(offset, length))
+	resp, err := get(u)
+	if err == nil && resp.StatusCode == http.StatusForbidden {
+		// The signed CDN URL has expired: resolve the file again.
+		resp.Body.Close()
+		if u, err = s.contentURL(ctx, hub, u); err != nil {
+			return nil, err
+		}
+		resp, err = get(u)
 	}
-	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("huggingface source: GET %s: %w", u, err)
+		return nil, fmt.Errorf("huggingface source: GET %s: %w", hub, err)
 	}
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusPartialContent:
 		if ranged && resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
-			return nil, fmt.Errorf("huggingface source: GET %s: %w", u, ErrRangeIgnored)
+			return nil, fmt.Errorf("huggingface source: GET %s: %w", hub, ErrRangeIgnored)
 		}
 		return resp.Body, nil
 	default:
 		resp.Body.Close()
-		return nil, fmt.Errorf("huggingface source: GET %s: %s", u, resp.Status)
+		return nil, fmt.Errorf("huggingface source: GET %s: %s", hub, resp.Status)
 	}
 }
 

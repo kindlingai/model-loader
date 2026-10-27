@@ -84,24 +84,61 @@ func TestDedupRootCopiesTwin(t *testing.T) {
 		t.Error("b's w.bin is a's file: evicting one would punch holes in both")
 	}
 
-	mfA, _ := st.LoadManifest("a", "r1")
-	mfB, _ := st.LoadManifest("b", "r1")
-	fa, _ := mfA.Find("w.bin")
-	fb, _ := mfB.Find("w.bin")
-	if !fb.Hashed() || !slices.Equal(fa.SegmentSHA256, fb.SegmentSHA256) {
-		t.Errorf("b's w.bin segment hashes %v, want a's %v", fb.SegmentSHA256, fa.SegmentSHA256)
+	sums := func(model, path string) []string {
+		mf, _ := st.LoadManifest(model, "r1")
+		fm, _ := mf.Find(path)
+		rs, _ := d.revState(mf)
+		out := make([]string, fm.NumSegments())
+		for i := range out {
+			out[i] = st.SegmentHashOf(model, "r1", fm, rs.FileState(fm), i)
+		}
+		return out
 	}
-	fa, _ = mfA.Find("experts/x.k4.safetensors")
-	fb, _ = mfB.Find("experts/x.k4.safetensors")
-	sa := st.SegmentSums("a", "r1", fa, 0, fa.NumSegments())
-	sb := st.SegmentSums("b", "r1", fb, 0, fb.NumSegments())
-	if fb.SegmentSize != 64<<10 || fb.Hashed() || slices.Contains(sb, "") || !slices.Equal(sa, sb) {
-		t.Errorf("b's x: %d byte segments, side file %v; want 64 KiB, a's %v", fb.SegmentSize, sb, sa)
+	for _, p := range []string{"w.bin", "experts/x.k4.safetensors"} {
+		if a, b := sums("a", p), sums("b", p); slices.Contains(b, "") || !slices.Equal(a, b) {
+			t.Errorf("b's %s segment hashes %v, want a's %v", p, b, a)
+		}
 	}
-	fb, _ = mfB.Find("experts/y.k3.safetensors")
 	sum := sha256.Sum256(shared["experts/y.k3.safetensors"])
-	if fb.SegmentSize != store.DefaultSegmentSize || !slices.Equal(fb.SegmentSHA256, []string{hex.EncodeToString(sum[:])}) {
-		t.Errorf("b's y: %d byte segments, hashes %v; want one 64 MiB segment hashed", fb.SegmentSize, fb.SegmentSHA256)
+	if got := sums("b", "experts/y.k3.safetensors"); !slices.Equal(got, []string{hex.EncodeToString(sum[:])}) {
+		t.Errorf("b's y segment hashes %v, want one 64 MiB segment, hashed", got)
+	}
+}
+
+// A root does not copy a twin into a file a peer's pull is fetching part
+// of, as the copy would write under the pull; once the pull is over, it
+// does.
+func TestDedupWaitsOutPull(t *testing.T) {
+	w := pattern(300, 'w')
+	tsA, _ := newCountingWANServer(t, map[string][]byte{"w.bin": w})
+	tsB, _ := newCountingWANServer(t, map[string][]byte{"w.bin": w})
+	mA, mB := wanModel("a", tsA.URL), wanModel("b", tsB.URL)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(Config{
+		NodeID: "root-1", Roles: []string{"root"}, Store: st,
+		Catalog: &catalog.Catalog{Models: []catalog.Model{mA, mB}}, Selection: &catalog.Selection{Wanted: []string{"a"}},
+		Sources: source.New(nil, ""), Discoverer: discovery.NewStatic(nil), Dedup: true,
+	})
+	if err := d.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mf, err := d.Manifest(context.Background(), "b", "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm := mf.Files[0]
+	rs, _ := d.revState(mf)
+
+	pull, _ := d.claimSegments(claimKey(mB, fm), fm, rs, []bool{true})
+	if ok, err := d.reuseHeld(context.Background(), mB, fm, rs, d.twins()); ok || err != nil {
+		t.Fatalf("reuseHeld during a pull = %v, %v; want no copy", ok, err)
+	}
+	d.releaseSegments(claimKey(mB, fm), pull)
+	if ok, err := d.reuseHeld(context.Background(), mB, fm, rs, d.twins()); !ok || err != nil {
+		t.Fatalf("reuseHeld after the pull = %v, %v; want a copy", ok, err)
 	}
 }
 

@@ -318,8 +318,61 @@ func TestPullThroughMasterCopyNoWAN(t *testing.T) {
 	if got := f.origin.bytes.Load(); got != served {
 		t.Fatalf("origin served %d more bytes for a range the root holds", got-served)
 	}
-	// The root downloaded it whole, in default-size segments: one here.
-	checkHeld(t, st, "w.bin", content, []bool{true}, store.TrustManifest)
+	// The root checked it whole; the peer holds the root's word for it.
+	checkHeld(t, st, "w.bin", content, []bool{7: true, 8: true, 9: false}, store.TrustOrigin)
+}
+
+// A root that wants a model whole publishes its manifest before it has
+// downloaded it, and fetches several files at once: while one file is
+// held up at the origin it gets the next, and a peer gets that one from it.
+func TestRootWholeServesWhileDownloading(t *testing.T) {
+	a, b := pattern(20, 'a'), pattern(20, 'b')
+	held := make(chan struct{})
+	f := newPullFleet(t, map[string][]byte{"a.bin": a, "b.bin": b}, &catalog.Selection{Wanted: []string{"glm"}}, func(o *fakeOrigin) {
+		o.onRange = func(path, _ string) {
+			if path == "a.bin" {
+				<-held
+			}
+		}
+	})
+	release := sync.OnceFunc(func() { close(held) })
+	var rootErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rootErr = f.root.Reconcile(context.Background())
+	}()
+	t.Cleanup(func() { release(); <-done }) // before the origin closes
+
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if mf, err := f.rootSt.LoadManifest("glm", "r1"); err == nil {
+			rs, _ := f.root.revState(mf)
+			if rs.FileState(mf.Files[1]).Complete {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("root did not get b.bin while a.bin was held up")
+		}
+	}
+	peer, st := f.peer(&catalog.Selection{Partial: []catalog.Pieces{{Model: "glm", Include: []string{"b.bin"}}}})
+	if err := peer.Reconcile(context.Background()); err != nil {
+		t.Fatalf("peer Reconcile: %v", err)
+	}
+	checkHeld(t, st, "b.bin", b, []bool{true, true}, store.TrustManifest) // checked whole
+	select {
+	case <-done:
+		t.Fatalf("root finished (%v) with a.bin held up", rootErr)
+	default:
+	}
+
+	release()
+	if <-done; rootErr != nil {
+		t.Fatalf("root Reconcile: %v", rootErr)
+	}
+	if ms := f.root.Status().Models; len(ms) != 1 || ms[0].State != server.StateReady {
+		t.Fatalf("root status = %+v, want ready", ms)
+	}
 }
 
 // Pulling many segments reuses kept-alive connections: no more connections

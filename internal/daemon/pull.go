@@ -106,18 +106,12 @@ func (d *Daemon) catalogModel(name, revision string) (catalog.Model, bool) {
 	return catalog.Model{}, false
 }
 
-// wantsWhole reports whether the selection names m whole.
-func (d *Daemon) wantsWhole(m catalog.Model) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.cfg.Selection != nil && d.cfg.Selection.Matches(m.Name)
-}
-
 // Manifest implements server.Puller. A root that has no manifest for a
-// catalog model it does not want whole publishes one from the origin's
-// file list, with no segment hashes (see store.FileManifest.Hashed), so
-// that peers can fetch parts of it through this root. A model it wants
-// whole is downloaded whole first, as before, and published only then.
+// catalog model publishes one from the origin's file list, with no segment
+// hashes (see store.FileManifest.Hashed), so that peers can fetch parts of
+// it through this root. A model it wants whole is published the same way,
+// before it is downloaded: peers fetch each segment as soon as the root
+// holds it, or have the root pull it through first.
 func (d *Daemon) Manifest(ctx context.Context, name, revision string) (*store.Manifest, error) {
 	m, ok := d.catalogModel(name, revision)
 	if !ok || !d.IsWANEligible() {
@@ -125,9 +119,6 @@ func (d *Daemon) Manifest(ctx context.Context, name, revision string) (*store.Ma
 	}
 	if mf, err := d.cfg.Store.LoadManifest(name, revision); err == nil {
 		return mf, nil
-	}
-	if d.wantsWhole(m) {
-		return nil, server.ErrNotPullable
 	}
 	v, err := d.once(ctx, "manifest "+want.Key(name, revision), func() (any, error) {
 		if mf, err := d.cfg.Store.LoadManifest(name, revision); err == nil {
@@ -363,7 +354,7 @@ func (d *Daemon) originSources(m catalog.Model) *sources {
 // transfer.FetchFile), so callers wanting disjoint segments of one chunk
 // fetch them in parallel.
 func (d *Daemon) pullSegments(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, segs []bool, srcs *sources) error {
-	file := want.Key(m.Name, m.Revision) + "\x00" + fm.Path
+	file := claimKey(m, fm)
 	// Each round fetches what this call claimed and waits for the rest.
 	// What another call failed to fetch is claimed by this one next
 	// round; a fetch of this call's own that fails ends it.
@@ -387,6 +378,11 @@ func (d *Daemon) pullSegments(ctx context.Context, m catalog.Model, fm store.Fil
 			}
 		}
 	}
+}
+
+// claimKey keys the claims on the segments of m's file fm.
+func claimKey(m catalog.Model, fm store.FileManifest) string {
+	return want.Key(m.Name, m.Revision) + "\x00" + fm.Path
 }
 
 // pullClaim is one segment a call is fetching: done is closed when it

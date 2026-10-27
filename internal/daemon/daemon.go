@@ -32,11 +32,6 @@ import (
 // default for a box that may also be serving an LLM workload.
 const defaultMaxConcurrentTransfers = 2
 
-// defaultStallTimeout aborts a download from a model's origin that has
-// received no bytes for this long. A CDN connection can stall without
-// closing, which would otherwise hang that model's reconcile forever.
-const defaultStallTimeout = 2 * time.Minute
-
 // Config configures a Daemon. Store, Catalog, Selection, Sources, and
 // Discoverer are required; the rest have sane defaults.
 type Config struct {
@@ -66,17 +61,15 @@ type Config struct {
 	// all files and models. Defaults to defaultMaxConcurrentTransfers.
 	MaxConcurrentTransfers int
 
-	// StallTimeout bounds how long a download from a model's origin may go
-	// without receiving any bytes. Defaults to defaultStallTimeout.
-	StallTimeout time.Duration
-
 	// VerifyOnStart re-hashes every held segment of a model the first time
 	// this process reconciles it, and fetches again any that no longer
 	// match the manifest.
 	VerifyOnStart bool
 
 	// PullWorkers bounds how many segments a root fetches from origins at
-	// once for pull-through. Defaults to defaultPullWorkers.
+	// once, for pull-through and for what it wants itself, and how many
+	// files of one model it fetches at once. Defaults to
+	// defaultPullWorkers.
 	PullWorkers int
 
 	// SegmentSize is the segment size of manifests a root publishes for
@@ -142,9 +135,6 @@ func New(cfg Config) *Daemon {
 	}
 	if cfg.MaxConcurrentTransfers <= 0 {
 		cfg.MaxConcurrentTransfers = defaultMaxConcurrentTransfers
-	}
-	if cfg.StallTimeout <= 0 {
-		cfg.StallTimeout = defaultStallTimeout
 	}
 	if cfg.PullWorkers <= 0 {
 		cfg.PullWorkers = defaultPullWorkers
@@ -451,49 +441,65 @@ func (d *Daemon) reconcileModel(ctx context.Context, w want.Want) error {
 	// Transfers this pass makes ask for slots at the want's priority, here
 	// and, through the priority header, at a root pulling through.
 	ctx = server.WithPriority(ctx, w.Priority)
-	var errs []error
-	lastProgress := time.Now()
-	var twins map[string][]twin // see dedup.go; read when first needed
+	// A root fetches several files from the origin at once, so a model of
+	// many files is not fetched one file at a time; their segment fetches
+	// share its pull slots all the same (see pullFetch).
+	files := 1
+	if pull {
+		files = d.cfg.PullWorkers
+	}
+	slots := make(chan struct{}, files)
+	var (
+		wg           sync.WaitGroup
+		mu           sync.Mutex // guards errs and lastProgress
+		errs         []error
+		lastProgress = time.Now()
+	)
+	twins := sync.OnceValue(d.twins) // see dedup.go; read when first needed
 	for _, fm := range manifest.Files {
 		fn := need.Files[fm.Path]
 		if fn == nil || rs.FileState(fm).Complete {
 			continue
 		}
-		var err error
-		reused := false
-		done := d.writing(m.Name, m.Revision, fm)
-		// Not on a root: a peer's pull may be writing into the file
-		// meanwhile, and the copy could mark held a segment it wrote bad.
-		if d.cfg.Dedup && fn.Whole && !d.IsWANEligible() {
-			if twins == nil {
-				twins = d.twins()
+		slots <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+			var err error
+			reused := false
+			done := d.writing(m.Name, m.Revision, fm)
+			if d.cfg.Dedup && fn.Whole {
+				reused, err = d.reuseHeld(ctx, m, fm, rs, twins())
 			}
-			reused, err = d.reuseHeld(ctx, m, fm, rs, twins)
-		}
-		switch {
-		case reused || err != nil:
-		case pull:
-			err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
-		default:
-			err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
-				Need: fn.Segments, Order: srcs.order(fm), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
-			})
-		}
-		done()
-		if err != nil {
-			// Go on with the other files: one bad piece (a consumer
-			// checksum that does not match, say) must not hold back
-			// every other request for the model.
-			errs = append(errs, fmt.Errorf("fetch %s: %w", fm.Path, err))
-			continue
-		}
-		// Progress is worked out over every needed segment: at most once
-		// a second, not after each of hundreds of files.
-		if time.Since(lastProgress) >= time.Second {
-			d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
-			lastProgress = time.Now()
-		}
+			switch {
+			case reused || err != nil:
+			case pull:
+				err = d.pullFile(ctx, m, manifest, fm, fn.Segments, fn.Checks)
+			default:
+				err = transfer.FetchFile(ctx, d.cfg.Store, m.Name, m.Revision, fm, rs, srcs.fetchers, transfer.Options{
+					Need: fn.Segments, Order: srcs.order(fm), Limit: d.limit, Priority: w.Priority, Checks: fn.Checks,
+				})
+			}
+			done()
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				// Go on with the other files: one bad piece (a consumer
+				// checksum that does not match, say) must not hold back
+				// every other request for the model.
+				errs = append(errs, fmt.Errorf("fetch %s: %w", fm.Path, err))
+				return
+			}
+			// Progress is worked out over every needed segment: at most
+			// once a second, not after each of hundreds of files.
+			if time.Since(lastProgress) >= time.Second {
+				d.setStatus(progress(w, manifest, need, rs, server.StateDownloading))
+				lastProgress = time.Now()
+			}
+		}()
 	}
+	wg.Wait()
 	if err := errors.Join(errs...); err != nil {
 		ms := progress(w, manifest, need, rs, server.StateError)
 		ms.Error = err.Error()

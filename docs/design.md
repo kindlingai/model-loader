@@ -113,9 +113,8 @@ models:
   records the sha256 of each it fetched over TLS from the origin, and a
   peer checks each it copies against the sha256 its source sends with it.
   The whole file is checked against the origin's sha256 once every
-  segment is held, as before. A root that downloads such a file whole
-  checks it whole, then records the sha256 of each of its segments. A
-  node vouches for a segment only with a sha256 recorded when its bytes
+  segment is held, as before. A root that wants such a file whole fetches
+  it the same way, segment by segment. A node vouches for a segment only with a sha256 recorded when its bytes
   were verified, never by hashing them as they are when asked.
 - With 64 KiB segments a request for one rank's halves holds about 1.3x
   their bytes (a half is not aligned to segments, so each holds part of
@@ -168,18 +167,24 @@ scale:
 
 ### Pull-through
 
-A root downloads a model its selection wants whole from the origin first,
-and publishes the manifest only when it is done, as before. For any other
-catalog model it publishes a manifest at once, from the origin's file list,
-the first time a peer (or its own partial selection) asks for it. That
+A root publishes a manifest for a catalog model at once, from the origin's
+file list, the first time a peer or its own selection asks for it. That
 manifest has no segment hashes. When a peer asks the root for a range it
 does not hold, the root fetches the segments that range touches from the
 origin, stores them, and serves them.
 
+A root fetches what its own selection wants the same way, a model it wants
+whole included (kindlingai/model-loader#44). So peers get the manifest when
+the download starts, not when it ends, and each segment as soon as the root
+holds it. The root fetches several files of a model at once, and several
+chunks of each, all within its `-pull-workers` slots. The origin must serve
+HTTP Range requests: one that answers a range with the whole file fails the
+fetch.
+
 - Two requests for the same segment at once cause one fetch from the
   origin. The fetch finishes even if the request that started it goes away.
 - At most `-pull-workers` segments (default 4) are fetched from origins at
-  once. The source HTTP client keeps connections alive, so range GETs reuse
+  once, for peers and for the root's own selection together. The source HTTP client keeps connections alive, so range GETs reuse
   them instead of each opening a connection (kindlingai/gr8#147).
 - A root that holds a file (a NAS with the full release) serves it with no
   WAN traffic. A root takes a segment it does not hold from a LAN node that
@@ -399,9 +404,7 @@ failed transfer wrote included, and holds across restarts.
 Before a fetch, the node reserves room for every segment it still has to
 fetch, counted in the filesystem blocks it touches. Fetches of the same
 segment share one reservation, and one that joins a fetch already let in
-is not checked again. A root's download from its origin reserves what of
-the revision is not on disk yet before it writes; a file whose progress
-does not hold is started over, and its old bytes freed, first.
+is not checked again.
 If the store's use plus every reservation would go over the budget, it
 frees space until it fits: first bytes no held segment covers, in files
 nothing is writing or serving (what a failed transfer left; a segment

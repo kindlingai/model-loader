@@ -511,12 +511,18 @@ answer:
   it uses), its `node_ip`, then its `addrs`. The choice is kept for 30 s,
   or until that list changes. `link_ip` is the LAN address. To copy over
   ConnectX, `-mentat-prefer-tags` (such as `connectx`, the spark-os
-  default) puts first each of the box's `addrs` that meets two tests. The
-  box's `addr_tags` gives the address one of those tags. The box's
-  `probes` holds `"ok": true` for the address under one of this box's
-  addresses. A ConnectX address may be on a direct cable to another box
-  only, so the tag alone is not enough. Several such addresses keep their
-  `addrs` order. A row from an older mentatd lacks `addr_tags` or
+  default, and what `deploy/k8s/components/mentat` passes) puts first each
+  of the box's `addrs` that meets two tests. The box's `addr_tags` gives
+  the address one of those tags. A probe from this box holds `"ok": true`
+  and `"direct": true` for it. Mentat sets `direct` only when the ARP
+  neighbour on the probing interface is that address's own MAC, so a
+  forward (`"direct": false`) or a probe with no `direct` bit does not
+  count. A ConnectX address may be on a direct cable to another box only,
+  so the tag alone is not enough. Several such addresses keep their
+  `addrs` order. The dial does not bind a source address. That is enough
+  when each fabric address is in its own subnet, as spark boxes number
+  ConnectX; two fabric ports in one subnet are the routing table's choice,
+  not this list's. A row from an older mentatd lacks `addr_tags` or
   `probes`, so the order stays as without the flag.
   Each box publishes a record through its own mentatd every 5 s
   (`PUT /records/model-loader`, kindlingai/mentat#4): its port, its roles,
@@ -567,8 +573,8 @@ One repo, one binary, three deploy trees under `deploy/`:
   headless Service for discovery, a ConfigMap for the catalog.
   `examples/gr8` adds gr8 on one node, with a NAS outside the cluster as
   the root. `components/mentat` switches the peers to mentat discovery on
-  the host network, for nodes that run mentatd; `examples/gr8-mentat` is
-  gr8 with it.
+  the host network, for nodes that run mentatd, and passes
+  `-mentat-prefer-tags=connectx`; `examples/gr8-mentat` is gr8 with it.
 - `deploy/compose/` — a `docker-compose.yml` with role and peer list set by
   environment variables, `gr8.yml` to add gr8 on the same box, and env
   files for a NAS root and for a Spark peer.

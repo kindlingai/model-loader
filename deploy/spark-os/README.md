@@ -37,10 +37,12 @@ records is taken to be on 7762.
 
 Boxes copy from each other over ConnectX. The unit sets
 `-mentat-prefer-tags=connectx`, so model-loader tries first a box's
-addresses that mentatd tags `connectx` and has an ok probe to. When a
-box's mentatd lacks tags or probes, model-loader starts at its `link_ip`,
-as before. Set `MODEL_LOADER_MENTAT_PREFER_TAGS=` (empty) to always start
-at `link_ip`.
+addresses that mentatd tags `connectx` and has probed direct: the ARP
+neighbour is that address, not a box forwarding for it. When a box's
+mentatd lacks tags or probes, or the probe is not direct, model-loader
+starts at its `link_ip`, as before. Set `MODEL_LOADER_MENTAT_PREFER_TAGS=`
+(empty) to always start at `link_ip`. The unit already defaults the flag,
+so leaving the env line commented does the same.
 
 ## gr8
 

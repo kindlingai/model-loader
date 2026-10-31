@@ -15,7 +15,8 @@
 # Peers come from the box's mentatd (-discovery=mentat), which already finds
 # the other boxes; MODEL_LOADER_PEERS adds a NAS root, which runs no mentatd.
 # model-loader tries first a box's ConnectX addresses that this box's
-# mentatd has an ok probe to, so copies go over the fabric.
+# mentatd has probed direct, so copies go over that cable rather than a
+# forwarder or the LAN.
 # MODEL_LOADER_MENTAT_PREFER_TAGS uses "-" where the others use ":-", so
 # setting it empty turns this off and starts at link_ip, as before.
 # The store must be on the DGX OS disk: install spark-os with

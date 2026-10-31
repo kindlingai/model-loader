@@ -14,7 +14,7 @@ address, and its node ID is the box's hostname. `MODEL_LOADER_PORT` is the
 port it listens on and, with `MODEL_LOADER_DISCOVERY=mentat`, the port it
 takes every other box to listen on. With mentat discovery,
 `MODEL_LOADER_MENTAT_PREFER_TAGS=connectx` reaches each box first at a
-ConnectX address that the local mentatd has an ok probe to.
+ConnectX address that the local mentatd has probed direct.
 
 An earlier version of this file published port 7762 from docker's own
 network rather than use the host's. Its project and store volume keep the

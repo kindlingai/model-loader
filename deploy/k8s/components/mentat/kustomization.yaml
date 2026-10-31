@@ -12,6 +12,10 @@
 # running this cannot also run deploy/spark-os's unit, which takes the same
 # port.
 #
+# Copies go over ConnectX. The peer args pass -mentat-prefer-tags=connectx,
+# so a box is tried first at an address mentatd tags connectx and has probed
+# direct. An overlay that should start at link_ip drops that arg.
+#
 # Only the DaemonSet changes. A root Deployment in the cluster is not in
 # mentatd's table, so name it in -peers, or keep the root outside the
 # cluster as examples/gr8 does.
@@ -35,3 +39,6 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/args/4
         value: -discovery=mentat
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: -mentat-prefer-tags=connectx

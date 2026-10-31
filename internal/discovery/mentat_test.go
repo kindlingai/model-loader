@@ -111,10 +111,13 @@ func TestMentatFallback(t *testing.T) {
 
 // A mentatd /status whose peer rows carry addr_tags and probes, as since
 // mentatd tags ConnectX addresses. Box x has two ConnectX addresses, and
-// this box has an ok probe to each from a different local address. Box y
-// has two ConnectX addresses: this box's probe to one failed, and this box
-// never probed the other, as for a direct cable to another box. Box z is from an older mentatd, with neither field, and box
-// w has a probes field that is not a table.
+// this box has a direct probe to each. One of those also has a forwarded
+// probe, which does not veto the direct one. Box y has two ConnectX
+// addresses: this box's probe to one failed, and this box never probed
+// the other, as for a direct cable to another box. Box v's ConnectX
+// probes are a forward and an ok with no direct bit. Box z is from an
+// older mentatd, with neither field, and box w has a probes field that
+// is not a table.
 const mentatTaggedJSON = `{
   "node_id": "a",
   "peers": {
@@ -124,12 +127,19 @@ const mentatTaggedJSON = `{
       "addr_ifaces": {"10.0.1.5": "enp1s0f1np1", "10.0.2.5": "enP2p1s0f1np1"},
       "probes": {
         "10.0.1.1": {"10.0.1.5": {"ok": true, "direct": true, "rtt_ms": 0}},
+        "10.0.9.1": {"10.0.1.5": {"ok": true, "direct": false}},
         "10.0.2.1": {"10.0.2.5": {"ok": true, "direct": true, "rtt_ms": 0}},
         "10.0.0.1": {"10.0.0.5": {"ok": true, "rtt_ms": 0}}}},
     "y": {"node_ip": "10.0.0.6", "link_ip": "10.0.0.6", "alive": true,
       "addrs": ["10.0.3.6", "10.0.4.6", "10.0.0.6"],
       "addr_tags": {"10.0.3.6": ["connectx"], "10.0.4.6": ["connectx"], "10.0.0.6": ["lan"]},
       "probes": {"10.0.3.1": {"10.0.3.6": {"ok": false, "error": "timed out"}}, "10.0.0.1": {"10.0.0.6": {"ok": true}}}},
+    "v": {"node_ip": "10.0.0.9", "link_ip": "10.0.0.9", "alive": true,
+      "addrs": ["10.0.7.9", "10.0.8.9", "10.0.0.9"],
+      "addr_tags": {"10.0.7.9": ["connectx"], "10.0.8.9": ["connectx"], "10.0.0.9": ["lan"]},
+      "probes": {
+        "10.0.7.1": {"10.0.7.9": {"ok": true, "direct": false, "neighbour_mac": "aa:00:00:00:00:02"}},
+        "10.0.8.1": {"10.0.8.9": {"ok": true}}}},
     "z": {"node_ip": "10.0.0.7", "link_ip": "10.0.0.7", "addrs": ["10.0.5.7", "10.0.0.7"], "alive": true},
     "w": {"node_ip": "10.0.0.8", "link_ip": "10.0.0.8", "addrs": ["10.0.6.8", "10.0.0.8"], "alive": true,
       "addr_tags": {"10.0.6.8": ["connectx"]}, "probes": "not a table"}
@@ -137,14 +147,15 @@ const mentatTaggedJSON = `{
 }`
 
 // With preferred tags, a box's candidates start with its tagged addresses
-// that have an ok probe, in addrs order. A failed or missing probe leaves
-// a tagged address in its old place. A box from an older mentatd, or with
-// a malformed probes field, keeps the old order: link_ip first.
+// that a probe reached directly, in addrs order. A failed, missing,
+// forwarded, or non-direct probe leaves a tagged address in its old place.
+// A box from an older mentatd, or with a malformed probes field, keeps the
+// old order: link_ip first.
 func TestMentatPreferTags(t *testing.T) {
 	m := newMentat(t, fakeMentatd(t, http.StatusOK, mentatTaggedJSON))
 	m.prefer = []string{"connectx"}
 	got, err := m.Peers(context.Background())
-	want := []Peer{{Addr: "10.0.0.8:7762"}, {Addr: "10.0.2.5:7762"}, {Addr: "10.0.0.6:7762"}, {Addr: "10.0.0.7:7762"}}
+	want := []Peer{{Addr: "10.0.0.9:7762"}, {Addr: "10.0.0.8:7762"}, {Addr: "10.0.2.5:7762"}, {Addr: "10.0.0.6:7762"}, {Addr: "10.0.0.7:7762"}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("Peers = %v, %v; want %v", got, err, want)
 	}
@@ -156,6 +167,7 @@ func TestMentatPreferTags(t *testing.T) {
 	for id, want := range map[string][]string{
 		"x": {"10.0.2.5", "10.0.1.5", "10.0.0.5"},
 		"y": {"10.0.0.6", "10.0.3.6", "10.0.4.6"},
+		"v": {"10.0.0.9", "10.0.7.9", "10.0.8.9"},
 		"z": {"10.0.0.7", "10.0.5.7"},
 		"w": {"10.0.0.8", "10.0.6.8"},
 	} {
@@ -173,7 +185,7 @@ func TestMentatPreferTags(t *testing.T) {
 // link_ip first, as before.
 func TestMentatPreferTagsUnset(t *testing.T) {
 	got, err := newMentat(t, fakeMentatd(t, http.StatusOK, mentatTaggedJSON)).Peers(context.Background())
-	want := []Peer{{Addr: "10.0.0.8:7762"}, {Addr: "10.0.0.5:7762"}, {Addr: "10.0.0.6:7762"}, {Addr: "10.0.0.7:7762"}}
+	want := []Peer{{Addr: "10.0.0.9:7762"}, {Addr: "10.0.0.8:7762"}, {Addr: "10.0.0.5:7762"}, {Addr: "10.0.0.6:7762"}, {Addr: "10.0.0.7:7762"}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("Peers = %v, %v; want %v", got, err, want)
 	}

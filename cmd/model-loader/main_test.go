@@ -162,12 +162,12 @@ func TestBuildDiscovererMentat(t *testing.T) {
 }
 
 // With -mentat-prefer-tags, Peers gives a box at its tagged address when
-// the local mentatd has an ok probe to that address.
+// the local mentatd has a direct probe to that address.
 func TestBuildDiscovererMentatPreferTags(t *testing.T) {
 	mentatd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"node_id": "a", "peers": {"b": {"node_ip": "127.0.0.1", "link_ip": "127.0.0.1", "alive": true,
 		  "addrs": ["::1", "127.0.0.1"], "addr_tags": {"::1": ["connectx"]},
-		  "probes": {"::1": {"::1": {"ok": true}}}}}}`))
+		  "probes": {"::1": {"::1": {"ok": true, "direct": true}}}}}}`))
 	}))
 	defer mentatd.Close()
 	// Nothing listens on this port, so each dial fails at once and the box

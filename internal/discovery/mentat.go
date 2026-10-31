@@ -71,8 +71,8 @@ type Mentat struct {
 // NewMentat builds a discoverer that asks the mentatd at baseURL (such as
 // DefaultMentatURL) for its peers, and reaches model-loader on each at
 // port. A box's addresses that mentatd tags with one of preferTags (such
-// as "connectx") and that this box's mentatd probes ok are tried before
-// its others.
+// as "connectx") and that this box's mentatd has probed direct are tried
+// before its others.
 func NewMentat(baseURL string, port int, preferTags []string) (*Mentat, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -130,9 +130,10 @@ type mentatPeer struct {
 	// "connectx" and "rdma" or "lan". Older mentatd sends none.
 	AddrTags json.RawMessage `json:"addr_tags"`
 	// Probes is this box's mentatd's probes to the box: by this box's
-	// address, then the box's address. Older mentatd sends none. Like
-	// AddrTags it is parsed on its own (see preferred), so one that is
-	// malformed costs only that box its preferred addresses.
+	// address, then the box's address, each with ok and direct. Older
+	// mentatd sends none. Like AddrTags it is parsed on its own (see
+	// preferred), so one that is malformed costs only that box its
+	// preferred addresses.
 	Probes json.RawMessage `json:"probes"`
 }
 
@@ -168,18 +169,22 @@ func (p mentatPeer) candidates(prefer []string) []string {
 }
 
 // preferred returns the box's addresses, in addrs order, that carry one
-// of the tags in prefer and that this box's mentatd has an ok probe to
-// from any of its own addresses. A tag alone is not enough: a box's
-// ConnectX address may be on a cable to another box only. preferred
-// returns nil when prefer is empty or the row lacks tags or probes, as
-// from an older mentatd.
+// of the tags in prefer and that a probe from this box reached directly.
+// Mentat sets direct only when the ARP neighbour on the probing interface
+// is that address's own MAC. An ok probe another box forwarded
+// (direct false), or one with no direct bit, such as a probe from the LAN
+// address, does not count. A tag alone is not enough: a box's ConnectX
+// address may be on a cable to another box only. preferred returns nil
+// when prefer is empty or the row lacks tags or probes, as from an older
+// mentatd.
 func (p mentatPeer) preferred(prefer []string) []string {
 	if len(prefer) == 0 {
 		return nil
 	}
 	var tags map[string][]string
 	var probes map[string]map[string]struct {
-		OK bool `json:"ok"`
+		OK     bool  `json:"ok"`
+		Direct *bool `json:"direct"`
 	}
 	if json.Unmarshal(p.AddrTags, &tags) != nil || json.Unmarshal(p.Probes, &probes) != nil {
 		return nil
@@ -194,7 +199,7 @@ func (p mentatPeer) preferred(prefer []string) []string {
 	reached := make(map[string]bool)
 	for _, row := range probes {
 		for addr, r := range row {
-			if h, ok := normHost(addr); ok && r.OK {
+			if h, ok := normHost(addr); ok && r.OK && r.Direct != nil && *r.Direct {
 				reached[h] = true
 			}
 		}

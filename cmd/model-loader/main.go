@@ -85,7 +85,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list; with -discovery=k8s or mentat, more peers to add, such as a NAS root outside the cluster")
 	fs.StringVar(&cfg.mentatURL, "mentat-url", discovery.DefaultMentatURL, "the local mentatd's HTTP side port, for -discovery=mentat")
 	fs.IntVar(&cfg.mentatPort, "mentat-port", defaultPort, "port model-loader listens on at a box that publishes none in its mentat record, for -discovery=mentat")
-	fs.StringVar(&cfg.mentatPrefer, "mentat-prefer-tags", "", "comma-separated mentat address tags, such as connectx: reach a box first at its addresses with one of these tags that the local mentatd probes ok, for -discovery=mentat. Empty: link_ip, node_ip, then addrs")
+	fs.StringVar(&cfg.mentatPrefer, "mentat-prefer-tags", "", "comma-separated mentat address tags, such as connectx: reach a box first at its addresses with one of these tags that the local mentatd probes ok and direct, for -discovery=mentat. Empty: link_ip, node_ip, then addrs")
 	fs.StringVar(&cfg.k8sService, "k8s-service", "", "headless Service DNS name, for -discovery=k8s")
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")

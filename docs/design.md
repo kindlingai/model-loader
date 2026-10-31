@@ -508,7 +508,16 @@ answer:
   already solves LAN peer discovery there. Every box mentatd holds alive is
   a peer, at its port on the first of its addresses that takes a
   connection there: its `link_ip` (the address mentatd's working link to
-  it uses), its `node_ip`, then its `addrs`. The choice is kept for 30 s.
+  it uses), its `node_ip`, then its `addrs`. The choice is kept for 30 s,
+  or until that list changes. `link_ip` is the LAN address. To copy over
+  ConnectX, `-mentat-prefer-tags` (such as `connectx`, the spark-os
+  default) puts first each of the box's `addrs` that meets two tests. The
+  box's `addr_tags` gives the address one of those tags. The box's
+  `probes` holds `"ok": true` for the address under one of this box's
+  addresses. A ConnectX address may be on a direct cable to another box
+  only, so the tag alone is not enough. Several such addresses keep their
+  `addrs` order. A row from an older mentatd lacks `addr_tags` or
+  `probes`, so the order stays as without the flag.
   Each box publishes a record through its own mentatd every 5 s
   (`PUT /records/model-loader`, kindlingai/mentat#4): its port, its roles,
   and its holdings, the revisions it holds `ready` or `partial`, sorted, so

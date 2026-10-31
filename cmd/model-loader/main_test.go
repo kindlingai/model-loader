@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/kindlingai/model-loader/internal/discovery"
@@ -155,6 +157,40 @@ func TestBuildDiscovererMentat(t *testing.T) {
 		args := append([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "mentat", "-peers", "nas.lan:7762"}, bad...)
 		if _, err := parseFlags(args); err == nil {
 			t.Fatalf("%v accepted", bad)
+		}
+	}
+}
+
+// With -mentat-prefer-tags, Peers gives a box at its tagged address when
+// the local mentatd has an ok probe to that address.
+func TestBuildDiscovererMentatPreferTags(t *testing.T) {
+	mentatd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"node_id": "a", "peers": {"b": {"node_ip": "127.0.0.1", "link_ip": "127.0.0.1", "alive": true,
+		  "addrs": ["::1", "127.0.0.1"], "addr_tags": {"::1": ["connectx"]},
+		  "probes": {"::1": {"::1": {"ok": true}}}}}}`))
+	}))
+	defer mentatd.Close()
+	// Nothing listens on this port, so each dial fails at once and the box
+	// is at its first candidate.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	ln.Close()
+	for tags, want := range map[string]string{"": "127.0.0.1:" + port, " rdma, ,connectx ": "[::1]:" + port} {
+		cfg, err := parseFlags([]string{"-mode", "peer", "-catalog", "c.yaml", "-discovery", "mentat", "-mentat-url", mentatd.URL,
+			"-mentat-port", port, "-mentat-prefer-tags", tags})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, _, err := buildDiscoverer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := d.Peers(context.Background())
+		if err != nil || len(got) != 1 || got[0].Addr != want {
+			t.Fatalf("-mentat-prefer-tags %q: Peers = %v, %v; want %s", tags, got, err, want)
 		}
 	}
 }

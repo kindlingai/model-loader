@@ -35,6 +35,13 @@ store under `MODEL_LOADER_DISK_BUDGET`. The NAS runs `deploy/compose` with
 through mentatd (kindlingai/mentat#4); a box whose mentatd predates
 records is taken to be on 7762.
 
+Boxes copy from each other over ConnectX. The unit sets
+`-mentat-prefer-tags=connectx`, so model-loader tries first a box's
+addresses that mentatd tags `connectx` and has an ok probe to. When a
+box's mentatd lacks tags or probes, model-loader starts at its `link_ip`,
+as before. Set `MODEL_LOADER_MENTAT_PREFER_TAGS=` (empty) to always start
+at `link_ip`.
+
 ## gr8
 
 `gr8.override.yml` goes with gr8's own `docker/compose.yaml`:

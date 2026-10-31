@@ -61,6 +61,7 @@ type config struct {
 	k8sPort       int
 	mentatURL     string
 	mentatPort    int
+	mentatPrefer  string
 
 	reconcileInterval time.Duration
 	maxConcurrent     int
@@ -84,6 +85,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.staticPeers, "peers", "", "comma-separated host:port list; with -discovery=k8s or mentat, more peers to add, such as a NAS root outside the cluster")
 	fs.StringVar(&cfg.mentatURL, "mentat-url", discovery.DefaultMentatURL, "the local mentatd's HTTP side port, for -discovery=mentat")
 	fs.IntVar(&cfg.mentatPort, "mentat-port", defaultPort, "port model-loader listens on at a box that publishes none in its mentat record, for -discovery=mentat")
+	fs.StringVar(&cfg.mentatPrefer, "mentat-prefer-tags", "", "comma-separated mentat address tags, such as connectx: reach a box first at its addresses with one of these tags that the local mentatd probes ok, for -discovery=mentat. Empty: link_ip, node_ip, then addrs")
 	fs.StringVar(&cfg.k8sService, "k8s-service", "", "headless Service DNS name, for -discovery=k8s")
 	fs.IntVar(&cfg.k8sPort, "k8s-port", defaultPort, "port other nodes listen on, for -discovery=k8s")
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
@@ -115,7 +117,7 @@ func parseFlags(args []string) (*config, error) {
 		errs = append(errs, fmt.Errorf("-discovery: unknown backend %q (want static, k8s or mentat)", cfg.discoveryKind))
 	}
 	if cfg.discoveryKind == "mentat" {
-		if _, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
+		if _, err := discovery.NewMentat(cfg.mentatURL, cfg.mentatPort, splitList(cfg.mentatPrefer)); err != nil {
 			errs = append(errs, fmt.Errorf("-mentat-url, -mentat-port: %w", err))
 		}
 	}
@@ -368,7 +370,7 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, *discovery.Mentat, erro
 	case "k8s":
 		d = discovery.NewK8sDNS(cfg.k8sService, cfg.k8sPort)
 	case "mentat":
-		if mentat, err = discovery.NewMentat(cfg.mentatURL, cfg.mentatPort); err != nil {
+		if mentat, err = discovery.NewMentat(cfg.mentatURL, cfg.mentatPort, splitList(cfg.mentatPrefer)); err != nil {
 			return nil, nil, err
 		}
 		d = mentat
@@ -384,18 +386,25 @@ func buildDiscoverer(cfg *config) (discovery.Discoverer, *discovery.Mentat, erro
 	return discovery.NewMulti(d, static), mentat, nil
 }
 
+// splitList returns the items of a comma-separated list, trimmed, without
+// empty ones.
+func splitList(list string) []string {
+	var out []string
+	for _, s := range strings.Split(list, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // staticPeers parses -peers, a comma-separated host:port list.
 func staticPeers(list string) (discovery.Discoverer, error) {
-	var addrs []string
-	for _, a := range strings.Split(list, ",") {
-		a = strings.TrimSpace(a)
-		if a == "" {
-			continue
-		}
+	addrs := splitList(list)
+	for _, a := range addrs {
 		if _, _, err := net.SplitHostPort(a); err != nil {
 			return nil, fmt.Errorf("-peers: invalid address %q: %w", a, err)
 		}
-		addrs = append(addrs, a)
 	}
 	return discovery.NewStatic(addrs), nil
 }

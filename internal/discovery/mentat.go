@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,11 +49,13 @@ const mentatTimeout = 5 * time.Second
 // mentatd (see Publish), and a box with no record, such as one whose
 // mentatd predates records, is taken to listen on the default port. A box
 // with several addresses is reached at the first that takes a connection
-// on it (see choose).
+// on it (see choose). Addresses with a preferred tag go first (see
+// NewMentat).
 type Mentat struct {
 	statusURL string
 	recordURL string
 	port      int
+	prefer    []string // address tags to try first (see candidates)
 	client    *http.Client
 
 	mu      sync.Mutex
@@ -67,8 +70,10 @@ type Mentat struct {
 
 // NewMentat builds a discoverer that asks the mentatd at baseURL (such as
 // DefaultMentatURL) for its peers, and reaches model-loader on each at
-// port.
-func NewMentat(baseURL string, port int) (*Mentat, error) {
+// port. A box's addresses that mentatd tags with one of preferTags (such
+// as "connectx") and that this box's mentatd has probed direct are tried
+// before its others.
+func NewMentat(baseURL string, port int, preferTags []string) (*Mentat, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("mentat discovery: %w", err)
@@ -94,6 +99,7 @@ func NewMentat(baseURL string, port int) (*Mentat, error) {
 		statusURL: statusURL,
 		recordURL: u.String(),
 		port:      port,
+		prefer:    preferTags,
 		client:    &http.Client{Timeout: mentatTimeout},
 		dial:      net.DialTimeout,
 	}, nil
@@ -120,6 +126,15 @@ type mentatPeer struct {
 	// by name. Each is parsed on its own, so one that is malformed costs
 	// only that box its port.
 	Records map[string]json.RawMessage `json:"records"`
+	// AddrTags is the tags the box gives each of its addresses, such as
+	// "connectx" and "rdma" or "lan". Older mentatd sends none.
+	AddrTags json.RawMessage `json:"addr_tags"`
+	// Probes is this box's mentatd's probes to the box: by this box's
+	// address, then the box's address, each with ok and direct. Older
+	// mentatd sends none. Like AddrTags it is parsed on its own (see
+	// preferred), so one that is malformed costs only that box its
+	// preferred addresses.
+	Probes json.RawMessage `json:"probes"`
 }
 
 // portOr returns the port the box's model-loader record gives, or def
@@ -134,30 +149,79 @@ func (p mentatPeer) portOr(def int) int {
 	return rec.Port
 }
 
-// candidates returns the hosts the box may be reached at, best first:
-// link_ip, which a working connection from this box uses (an IP, or the
-// host name of a seed mentatd dialled), then node_ip, then addrs. Each is
-// normalized (brackets off an IPv6 address, an IPv4-mapped one unmapped)
-// and listed once; what is not a usable host is left out.
-func (p mentatPeer) candidates() []string {
+// candidates returns the hosts the box may be reached at, best first.
+// First come the addresses preferred returns, then link_ip, node_ip and
+// addrs. A working connection from this box uses link_ip: an IP, or the
+// host name of a seed mentatd dialled. candidates normalizes each host
+// (see normHost), lists it once, and leaves out what is not a usable host.
+func (p mentatPeer) candidates(prefer []string) []string {
 	var out []string
 	seen := make(map[string]bool)
-	for _, h := range append([]string{p.LinkIP, p.NodeIP}, p.Addrs...) {
-		h = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(h), "["), "]")
-		if a, err := netip.ParseAddr(h); err == nil {
-			if a.IsUnspecified() {
-				continue
-			}
-			h = a.Unmap().String()
-		} else if !validHostname(h) {
-			continue
-		}
-		if !seen[h] {
+	hosts := append(p.preferred(prefer), p.LinkIP, p.NodeIP)
+	for _, h := range append(hosts, p.Addrs...) {
+		h, ok := normHost(h)
+		if ok && !seen[h] {
 			seen[h] = true
 			out = append(out, h)
 		}
 	}
 	return out
+}
+
+// preferred returns the box's addresses, in addrs order, that carry one
+// of the tags in prefer and that a probe from this box reached directly.
+// Mentat sets direct only when the ARP neighbour on the probing interface
+// is that address's own MAC. An ok probe another box forwarded
+// (direct false), or one with no direct bit, such as a probe from the LAN
+// address, does not count. A tag alone is not enough: a box's ConnectX
+// address may be on a cable to another box only. preferred returns nil
+// when prefer is empty or the row lacks tags or probes, as from an older
+// mentatd.
+func (p mentatPeer) preferred(prefer []string) []string {
+	if len(prefer) == 0 {
+		return nil
+	}
+	var tags map[string][]string
+	var probes map[string]map[string]struct {
+		OK     bool  `json:"ok"`
+		Direct *bool `json:"direct"`
+	}
+	if json.Unmarshal(p.AddrTags, &tags) != nil || json.Unmarshal(p.Probes, &probes) != nil {
+		return nil
+	}
+	tagged := make(map[string]bool)
+	for addr, ts := range tags {
+		h, ok := normHost(addr)
+		if ok && slices.ContainsFunc(ts, func(t string) bool { return slices.Contains(prefer, t) }) {
+			tagged[h] = true
+		}
+	}
+	reached := make(map[string]bool)
+	for _, row := range probes {
+		for addr, r := range row {
+			if h, ok := normHost(addr); ok && r.OK && r.Direct != nil && *r.Direct {
+				reached[h] = true
+			}
+		}
+	}
+	var out []string
+	for _, addr := range p.Addrs {
+		if h, ok := normHost(addr); ok && tagged[h] && reached[h] {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// normHost strips the brackets from an IPv6 address and unmaps an
+// IPv4-mapped address. normHost reports whether h is a usable host: an IP
+// other than the unspecified address, or a DNS host name.
+func normHost(h string) (string, bool) {
+	h = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(h), "["), "]")
+	if a, err := netip.ParseAddr(h); err == nil {
+		return a.Unmap().String(), !a.IsUnspecified()
+	}
+	return h, validHostname(h)
 }
 
 // validHostname reports whether h can be a DNS host name.
@@ -259,7 +323,7 @@ func (m *Mentat) fetch() ([]Peer, error) {
 	var rows []row
 	for _, id := range ids {
 		p := table[id]
-		if hosts := p.candidates(); p.Alive && id != st.NodeID && len(hosts) > 0 {
+		if hosts := p.candidates(m.prefer); p.Alive && id != st.NodeID && len(hosts) > 0 {
 			rows = append(rows, row{id, hosts, p.portOr(m.port)})
 		}
 	}

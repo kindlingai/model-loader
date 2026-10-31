@@ -30,6 +30,7 @@ services:
       MODEL_LOADER_MODE: ${MODEL_LOADER_MODE:-both}
       MODEL_LOADER_DISCOVERY: ${MODEL_LOADER_DISCOVERY:-static}
       MODEL_LOADER_PEERS: ${MODEL_LOADER_PEERS:-}
+      MODEL_LOADER_MENTAT_PREFER_TAGS: ${MODEL_LOADER_MENTAT_PREFER_TAGS:-}
       MODEL_LOADER_SELECTION: ${MODEL_LOADER_SELECTION:-}
       MODEL_LOADER_DISK_BUDGET: ${MODEL_LOADER_DISK_BUDGET:-}
       MODEL_LOADER_NODE_ID: ${MODEL_LOADER_NODE_ID:-}
@@ -48,6 +49,7 @@ services:
         -local-listen=unix:model-loader.sock
         -discovery="$$MODEL_LOADER_DISCOVERY"
         -mentat-port=$${MODEL_LOADER_PORT:-7762}
+        -mentat-prefer-tags="$$MODEL_LOADER_MENTAT_PREFER_TAGS"
         -peers="$$MODEL_LOADER_PEERS"
         -disk-budget="$$MODEL_LOADER_DISK_BUDGET"
         -node-id="$$MODEL_LOADER_NODE_ID"

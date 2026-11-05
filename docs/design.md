@@ -186,6 +186,19 @@ fetch.
 - At most `-pull-workers` segments (default 4) are fetched from origins at
   once, for peers and for the root's own selection together. The source HTTP client keeps connections alive, so range GETs reuse
   them instead of each opening a connection (kindlingai/gr8#147).
+- Origin fetches speak HTTP/1.1, so each range in flight has a TCP
+  connection of its own: at most `-pull-workers` to a host. Over HTTP/2
+  every range to a host (the Hugging Face CDN) shares one connection.
+  `-origin-http2` turns HTTP/2 back on (kindlingai/model-loader#49).
+- A segment fetch holds its slot only while it reads from the origin and
+  writes to the store. Each segment is hashed as it streams in, through a
+  write-only descriptor (on NFS, one open for reading makes the client
+  read pages back). The sync, page-cache drop and state save run after the
+  slot is free, at most `-pull-workers` at once, so a store slower than
+  the origin still holds the origin back. A pull's state is saved at most
+  once a second while it runs. Once a minute a root logs how many
+  transfers it made, the rate, and how long each stage (slot wait, origin
+  read, store write, hash, sync, save) took per transfer.
 - A root that holds a file (a NAS with the full release) serves it with no
   WAN traffic. A root takes a segment it does not hold from a LAN node that
   holds it before it goes to the origin.

@@ -126,6 +126,8 @@ type Daemon struct {
 	needs     map[string]*resolvedNeed // see resolveRequest
 	pullSrcs  map[string]cachedSources
 	pullLimit *transfer.Limiter // pull-through segment fetches, by priority
+	pullFlush *transfer.Limiter // pull-through syncs to the store
+	pullStats transfer.Stats    // where pull-through transfers spend their time
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -154,6 +156,7 @@ func New(cfg Config) *Daemon {
 		pulls:      make(map[string]*pullCall),
 		pullSrcs:   make(map[string]cachedSources),
 		pullLimit:  transfer.NewLimiter(cfg.PullWorkers),
+		pullFlush:  transfer.NewLimiter(cfg.PullWorkers),
 	}
 }
 
@@ -208,6 +211,13 @@ func (d *Daemon) Run(ctx context.Context, interval time.Duration, onErr func(err
 	var busy sync.Map
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	if d.IsWANEligible() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.logPullStats(ctx, pullStatsEvery)
+		}()
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

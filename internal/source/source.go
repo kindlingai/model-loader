@@ -104,6 +104,22 @@ func joinURLPath(base, relPath string) string {
 	return strings.TrimRight(base, "/") + "/" + strings.Join(segments, "/")
 }
 
+// NewClient returns the HTTP client a Source uses by default. With http2
+// false it speaks only HTTP/1.1 to origins, so each range in flight has a
+// TCP connection of its own; with it true, Go negotiates HTTP/2 and every
+// range to one host shares one connection, one congestion window. From a
+// root on a 1 Gbps WAN, 8 ranges took 143 MiB/s over 8 HTTP/1.1
+// connections and 93 MiB/s over one HTTP/2 connection
+// (kindlingai/model-loader#49).
+func NewClient(http2 bool) *http.Client {
+	c := defaultClient()
+	var p http.Protocols
+	p.SetHTTP1(true)
+	p.SetHTTP2(http2)
+	c.Transport.(*http.Transport).Protocols = &p
+	return c
+}
+
 func defaultClient() *http.Client {
 	return &http.Client{
 		// No overall request timeout: file downloads can legitimately run
@@ -114,7 +130,9 @@ func defaultClient() *http.Client {
 			// A root serving pull-through issues many range GETs to one
 			// host (or its CDN). Keep enough connections alive for every
 			// pull worker, so ranges reuse them instead of each opening a
-			// new connection and DNS lookup (kindlingai/gr8#147).
+			// new connection and DNS lookup (kindlingai/gr8#147). A root
+			// has at most -pull-workers ranges in flight, so over HTTP/1.1
+			// it holds at most that many connections to a host.
 			MaxIdleConnsPerHost: 32,
 			IdleConnTimeout:     90 * time.Second,
 		},

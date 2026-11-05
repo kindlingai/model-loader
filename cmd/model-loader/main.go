@@ -66,6 +66,7 @@ type config struct {
 	reconcileInterval time.Duration
 	maxConcurrent     int
 	pullWorkers       int
+	originHTTP2       bool
 	verifyOnStart     bool
 	localListen       string
 	diskBudget        string
@@ -91,6 +92,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.DurationVar(&cfg.reconcileInterval, "reconcile-interval", 30*time.Second, "how often to re-check the catalog against local disk")
 	fs.IntVar(&cfg.maxConcurrent, "max-concurrent-transfers", 2, "maximum simultaneous segment transfers")
 	fs.IntVar(&cfg.pullWorkers, "pull-workers", 4, "root only: maximum segments fetched from origins at once, for peers and for this node's own selection")
+	fs.BoolVar(&cfg.originHTTP2, "origin-http2", false, "root only: let origin fetches negotiate HTTP/2, which carries every range to one host on one connection; default HTTP/1.1, a connection per range in flight")
 	fs.BoolVar(&cfg.verifyOnStart, "verify-on-start", false, "re-hash every held segment of each model once at start, and fetch again any that no longer match")
 	fs.StringVar(&cfg.diskBudget, "disk-budget", "", "most the store may hold, as bytes (500G, 2T) or a percentage of its filesystem (80%); fetches evict unwanted segments the fleet keeps copies of to stay under it. Empty: no budget, nothing evicted")
 	fs.StringVar(&cfg.dedup, "dedup", "off", "copy: before fetching a file, copy one the store already holds whole with the same sha256 (cloned where the filesystem can, on the server on NFS 4.2); off: fetch every file")
@@ -221,7 +223,7 @@ func run(args []string) error {
 		SelectionPath: cfg.selPath,
 		// HF_TOKEN, as in huggingface_hub, authenticates gated or private
 		// Hugging Face repos. Only a root ever uses it.
-		Sources:                source.New(nil, strings.TrimSpace(os.Getenv("HF_TOKEN"))),
+		Sources:                source.New(source.NewClient(cfg.originHTTP2), strings.TrimSpace(os.Getenv("HF_TOKEN"))),
 		Discoverer:             disc,
 		MaxConcurrentTransfers: cfg.maxConcurrent,
 		PullWorkers:            cfg.pullWorkers,

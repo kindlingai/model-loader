@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/kindlingai/model-loader/internal/catalog"
 	"github.com/kindlingai/model-loader/internal/source"
@@ -94,13 +95,30 @@ type Options struct {
 	// segments it covers. A source that takes checks (see CheckedFetcher)
 	// is given those inside the segment it is asked for.
 	Checks []store.RangeCheck
-	// SaveSoon saves the state of a file of small segments at most once a
-	// second (store.SaveStateSoon), also at the end, unless a check
-	// dropped a segment. A root's pull-through sets it: the peer it fills
-	// is served from memory, and a whole save of a release-sized state
-	// per pull would cap the root at a few pulls a second. A local fetch
-	// does not: its consumer reads the state file once it is ready.
+	// SaveSoon saves the state at most once a second
+	// (store.SaveStateSoon) as segments land; a file of small segments
+	// always does. At the end a file of small segments is saved soon too,
+	// unless a check dropped a segment; any other file is saved then. A
+	// root's pull-through sets it: the peer it fills is served from
+	// memory, and a whole save of a release-sized state per segment would
+	// cap the root at a few segments a second (#49). A local fetch does
+	// not: its consumer reads the state file once it is ready.
 	SaveSoon bool
+	// Wait, if set, bounds waiting for a Limit slot instead of ctx: a
+	// root's pull-through waits for a slot only as long as the request
+	// for it does, but finishes a transfer once it has started.
+	Wait context.Context
+	// Timeout, if set, bounds each transfer from when it has its Limit
+	// slot until its bytes are in, not counting the wait for the slot.
+	Timeout time.Duration
+	// Flush, if set, bounds how many transfers sync what they wrote at
+	// once, across every transfer that shares it. A transfer gives its
+	// Limit slot back once its bytes are written, and syncs them while
+	// another uses the slot; it takes a Flush slot first, so a store
+	// slower than the sources holds the sources back.
+	Flush *Limiter
+	// Stats, if set, adds up where each segment transfer spends its time.
+	Stats *Stats
 }
 
 // Claimer is implemented by a reader whose source vouches for the
@@ -174,6 +192,24 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		}
 		return f, nil
 	}
+	// A transfer writes through a descriptor of its own, opened
+	// write-only: an NFS client reads back from the server each page a
+	// write covers only part of when the file is open for reading, and
+	// those reads wait behind the segments being flushed (#37). Nothing
+	// is read back: each segment is hashed as it streams in.
+	openWriter := func() (*os.File, error) {
+		f, err := openFile()
+		if err != nil {
+			return nil, err
+		}
+		name := f.Name()
+		f.Close()
+		w, err := os.OpenFile(name, os.O_WRONLY, 0)
+		if err != nil {
+			return nil, fmt.Errorf("fetch %s: %w", fm.Path, err)
+		}
+		return w, nil
+	}
 
 	order := opts.Order
 	if order == nil {
@@ -185,7 +221,10 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	}
 	workers := 1
 	if opts.Limit != nil {
-		workers = opts.Limit.Cap()
+		// Twice the slots: a transfer gives its slot back once its bytes
+		// are in, and flushes them to the store while another one uses
+		// the slot (see flush).
+		workers = 2 * opts.Limit.Cap()
 	}
 	runs := groupRuns(fm, todo, order)
 	workers = min(workers, max(1, len(runs)))
@@ -206,27 +245,84 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	// A file of small segments saves its state at most once a second as
 	// segments land (see store.SaveStateSoon), and once at the end.
 	save := st.SaveState
-	if fm.Small() {
+	if fm.Small() || opts.SaveSoon {
 		save = st.SaveStateSoon
 	}
+	wait := ctx
+	if opts.Wait != nil {
+		wait = opts.Wait
+	}
+	stats := opts.Stats
+	if stats == nil {
+		stats = &Stats{}
+	}
 	var marked atomic.Bool
-	// fetch fetches segments first to first+n-1 and marks them held.
-	fetch := func(f *os.File, first, n int) error {
-		start, _ := fm.SegmentBounds(first)
-		_, end := fm.SegmentBounds(first + n - 1)
-		sums, trusts, err := fetchRun(ctx, f, fm, first, n, fetchers, order(first), checksOverlapping(opts.Checks, start, end), dead, &mu)
-		if err != nil {
-			return err
+	// download fetches segments first to first+n-1 into f, segment by
+	// segment if the run fails as a whole. It holds the transfer's slot.
+	download := func(ctx context.Context, f *os.File, first, n int) ([]landed, error) {
+		fetch := func(first, n int) (landed, error) {
+			start, _ := fm.SegmentBounds(first)
+			_, end := fm.SegmentBounds(first + n - 1)
+			sums, trusts, err := fetchRun(ctx, f, fm, first, n, fetchers, order(first), checksOverlapping(opts.Checks, start, end), dead, &mu, stats)
+			return landed{first, n, sums, trusts}, err
 		}
-		if fm.Small() && !fm.Hashed() {
-			// The sha256 of each is what a later copier or re-verify
-			// checks it against: on disk before the segment is held.
-			if err := st.WriteSegmentHashes(model, revision, fm, first, sums); err != nil {
-				return fmt.Errorf("save segment hashes: %w", err)
+		l, err := fetch(first, n)
+		if err == nil {
+			return []landed{l}, nil
+		}
+		if n == 1 || ctx.Err() != nil {
+			return nil, err
+		}
+		// One at a time: a source too old to vouch for a run, or one bad
+		// segment, fails only that one.
+		var got []landed
+		var errs []error
+		for i := first; i < first+n; i++ {
+			if rs.SegmentTrust(fm, i) != "" {
+				continue
+			}
+			l, err := fetch(i, 1)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("segment %d: %w", i, err))
+				continue
+			}
+			got = append(got, l)
+		}
+		return got, errors.Join(errs...)
+	}
+	// flush makes what download wrote durable, drops it from page cache
+	// and marks it held. It runs after the transfer has given its slot
+	// back: on a network store a sync takes long enough that the origin
+	// connection would otherwise sit idle each time (#36, #49).
+	flush := func(f *os.File, got []landed) error {
+		if len(got) == 0 {
+			return nil
+		}
+		t := time.Now()
+		if err := syncFile(f); err != nil {
+			return fmt.Errorf("sync: %w", err)
+		}
+		for _, l := range got {
+			start, _ := fm.SegmentBounds(l.first)
+			_, end := fm.SegmentBounds(l.first + l.n - 1)
+			if err := store.Uncache(f, start, end-start); err != nil {
+				return fmt.Errorf("uncache: %w", err)
 			}
 		}
-		for k := range n {
-			rs.MarkSegment(fm, first+k, hex.EncodeToString(sums[k][:]), trusts[k])
+		stats.sync.Add(int64(time.Since(t)))
+		t = time.Now()
+		defer func() { stats.save.Add(int64(time.Since(t))) }()
+		for _, l := range got {
+			if fm.Small() && !fm.Hashed() {
+				// The sha256 of each is what a later copier or re-verify
+				// checks it against: on disk before the segment is held.
+				if err := st.WriteSegmentHashes(model, revision, fm, l.first, l.sums); err != nil {
+					return fmt.Errorf("save segment hashes: %w", err)
+				}
+			}
+			for k := range l.n {
+				rs.MarkSegment(fm, l.first+k, hex.EncodeToString(l.sums[k][:]), l.trusts[k])
+			}
 		}
 		marked.Store(true)
 		if err := save(rs); err != nil {
@@ -241,31 +337,41 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 			defer wg.Done()
 			for r := range queue {
 				if opts.Limit != nil {
-					if err := opts.Limit.Acquire(ctx, opts.Priority); err != nil {
+					t := time.Now()
+					err := opts.Limit.Acquire(wait, opts.Priority)
+					stats.wait.Add(int64(time.Since(t)))
+					if err != nil {
 						fail(err)
 						continue
 					}
 				}
-				f, err := openFile()
+				tctx, cancel := ctx, context.CancelFunc(func() {})
+				if opts.Timeout > 0 {
+					tctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+				}
+				f, err := openWriter()
+				var got []landed
 				if err == nil {
-					err = fetch(f, r[0], r[1]-r[0])
-					if err != nil && r[1]-r[0] > 1 && ctx.Err() == nil {
-						// One at a time: a source too old to vouch for a
-						// run, or one bad segment, fails only that one.
-						var errs []error
-						for i := r[0]; i < r[1]; i++ {
-							if rs.SegmentTrust(fm, i) == "" {
-								if err := fetch(f, i, 1); err != nil {
-									errs = append(errs, fmt.Errorf("segment %d: %w", i, err))
-								}
-							}
-						}
-						err = errors.Join(errs...)
+					got, err = download(tctx, f, r[0], r[1]-r[0])
+				}
+				cancel()
+				flushing := opts.Flush != nil && len(got) > 0
+				if flushing {
+					if ferr := opts.Flush.Acquire(context.WithoutCancel(ctx), opts.Priority); ferr != nil {
+						flushing = false // cannot happen: it does not end
 					}
-					f.Close()
 				}
 				if opts.Limit != nil {
 					opts.Limit.Release()
+				}
+				if f != nil {
+					if ferr := flush(f, got); ferr != nil {
+						err = errors.Join(err, ferr)
+					}
+					f.Close()
+				}
+				if flushing {
+					opts.Flush.Release()
 				}
 				if err != nil {
 					fail(fmt.Errorf("fetch %s segments %d-%d: %w", fm.Path, r[0], r[1]-1, err))
@@ -279,7 +385,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	close(queue)
 	wg.Wait()
 	if firstErr != nil && (ctx.Err() != nil || len(PendingChecks(fm, rs, opts.Checks)) == 0) {
-		if marked.Load() && fm.Small() {
+		if marked.Load() && (fm.Small() || opts.SaveSoon) {
 			// What landed, before giving up.
 			if opts.SaveSoon {
 				_ = st.SaveStateSoon(rs)
@@ -295,9 +401,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		return errors.Join(firstErr, err)
 	}
 	defer f.Close()
-	if err := syncAndUncache(f); err != nil {
-		return errors.Join(firstErr, fmt.Errorf("fetch %s: %w", fm.Path, err))
-	}
+	// Every transfer synced and uncached what it wrote (see flush).
 	// Checks run even when a segment failed: a check over segments that
 	// did land (another request's range, say) is judged now, not held
 	// back by the one that failed.
@@ -458,6 +562,21 @@ func allDone(segments []bool) bool {
 	return true
 }
 
+// copyBufs holds the buffers transfers copy through: larger than
+// io.Copy's 32 KiB, so a segment reaches the store in fewer writes.
+var copyBufs = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
+
+// syncFile is f.Sync; tests replace it to see when a transfer syncs.
+var syncFile = (*os.File).Sync
+
+// landed is a run of segments a transfer downloaded and verified, not yet
+// synced or marked held.
+type landed struct {
+	first, n int
+	sums     [][sha256.Size]byte
+	trusts   []string
+}
+
 // syncAndUncache fsyncs f, then advises the kernel to drop its page cache.
 // Only data that's durable on disk should ever be dropped from cache, hence
 // the fsync first.
@@ -511,10 +630,10 @@ func groupRuns(fm store.FileManifest, todo []int, order func(int) []int) [][2]in
 // address again for every segment. mu guards dead.
 //
 // At most the run's own bytes are written, so a source that sends too
-// much cannot overwrite a neighbouring segment another worker holds. The
-// run is synced before it is verified, so verifying drops its pages from
-// page cache.
-func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex) ([][sha256.Size]byte, []string, error) {
+// much cannot overwrite a neighbouring segment another worker holds. Each
+// segment is hashed as it streams in; the caller syncs the run before it
+// marks it held.
+func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex, stats *Stats) ([][sha256.Size]byte, []string, error) {
 	start, _ := fm.SegmentBounds(first)
 	_, end := fm.SegmentBounds(first + n - 1)
 	length := end - start
@@ -558,8 +677,15 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 		}
 
 		// Write at most the run's own bytes, so a source that sends too
-		// much cannot overwrite a neighbouring segment that is held.
-		copied, copyErr := io.Copy(io.NewOffsetWriter(f, start), io.LimitReader(rc, length))
+		// much cannot overwrite a neighbouring segment that is held. Each
+		// segment is hashed as it is written, not read back from the
+		// store: on NFS that read is as slow as the write.
+		hs := newSegmentHasher(fm, first, n, stats)
+		dst := io.MultiWriter(timedWriter{io.NewOffsetWriter(f, start), &stats.write}, hs)
+		buf := copyBufs.Get().(*[]byte)
+		copied, copyErr := io.CopyBuffer(dst, timedReader{io.LimitReader(rc, length), &stats.read}, *buf)
+		copyBufs.Put(buf)
+		stats.bytes.Add(copied)
 		extra := 0
 		if copyErr == nil && copied == length {
 			// Only a full, good copy is probed for more: a failed one is
@@ -584,12 +710,9 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 			continue
 		}
 
-		if err := f.Sync(); err != nil {
-			return nil, nil, fmt.Errorf("sync: %w", err)
-		}
-		sums, err := store.HashSegments(f, fm, first, n)
-		if err != nil {
-			return nil, nil, err
+		sums := hs.done()
+		if len(sums) != n {
+			return nil, nil, fmt.Errorf("hash %s segments %d-%d: %d of %d segments written whole", fm.Path, first, first+n-1, len(sums), n)
 		}
 		trusts := make([]string, n)
 		for j := range n {

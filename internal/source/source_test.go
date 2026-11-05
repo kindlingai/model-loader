@@ -308,3 +308,32 @@ func (t rewriteHostTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	req2.Host = parsedTarget.Host
 	return t.base.RoundTrip(req2)
 }
+
+// NewClient(false) speaks only HTTP/1.1 to an origin that offers HTTP/2,
+// so ranges in flight do not share one connection (#49); NewClient(true)
+// negotiates HTTP/2.
+func TestNewClientHTTP2(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, r.Proto)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+	for _, c := range []struct {
+		http2 bool
+		want  string
+	}{{false, "HTTP/1.1"}, {true, "HTTP/2.0"}} {
+		client := NewClient(c.http2)
+		tr := client.Transport.(*http.Transport)
+		tr.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		resp, err := client.Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(got) != c.want {
+			t.Fatalf("NewClient(%v) spoke %s, want %s", c.http2, got, c.want)
+		}
+	}
+}

@@ -20,9 +20,9 @@ import (
 // in gr8 (kindlingai/gr8#147).
 const defaultPullWorkers = 4
 
-// pullTimeout bounds one segment's fetch from the origin. It runs on after
-// the request that started it goes away, so other requests waiting on the
-// same segment still get it.
+// pullTimeout bounds one segment's fetch from the origin, from when it has
+// a pull slot. It runs on after the request that started it goes away, so
+// other requests waiting on the same segment still get it.
 const pullTimeout = 10 * time.Minute
 
 // pullCall is one in-flight fetch that later callers wait on.
@@ -489,19 +489,21 @@ loop:
 
 // pullFetch fetches the segments need marks, at the caller's priority.
 func (d *Daemon) pullFetch(ctx context.Context, m catalog.Model, fm store.FileManifest, rs *store.RevisionState, need []bool, srcs *sources) error {
-	// Wait for a slot, at the caller's priority (the first caller's, for
-	// a chunk many want), as long as the caller does; once the fetch has
-	// started it finishes even if the caller goes away, as others may be
-	// waiting on it (see pullTimeout).
-	if err := d.pullLimit.Acquire(ctx, server.Priority(ctx)); err != nil {
-		return err
-	}
-	defer d.pullLimit.Release()
-	pctx, cancel := context.WithTimeout(transfer.WithNoPull(context.WithoutCancel(ctx)), pullTimeout)
-	defer cancel()
+	// Each transfer waits for a slot, at the caller's priority (the first
+	// caller's, for a chunk many want), as long as the caller does (Wait);
+	// once a transfer has started it finishes even if the caller goes
+	// away, as others may be waiting on it (see pullTimeout). It holds
+	// the slot while it reads from the source and writes to the store,
+	// and syncs within pullFlush, so a slow store sync does not hold the
+	// source connection idle (#49).
+	pctx := transfer.WithNoPull(context.WithoutCancel(ctx))
 	defer d.writing(m.Name, m.Revision, fm)()
 	return transfer.FetchFile(pctx, d.cfg.Store, m.Name, m.Revision, fm, rs,
-		srcs.fetchers, transfer.Options{Need: need, Order: srcs.order(fm), SaveSoon: true})
+		srcs.fetchers, transfer.Options{
+			Need: need, Order: srcs.order(fm), SaveSoon: true,
+			Limit: d.pullLimit, Flush: d.pullFlush, Priority: server.Priority(ctx), Wait: ctx,
+			Timeout: pullTimeout, Stats: &d.pullStats,
+		})
 }
 
 // lazy reports whether mf has a file with no segment hashes: a manifest a

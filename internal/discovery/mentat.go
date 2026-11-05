@@ -157,7 +157,8 @@ func (p mentatPeer) portOr(def int) int {
 func (p mentatPeer) candidates(prefer []string) []string {
 	var out []string
 	seen := make(map[string]bool)
-	hosts := append(p.preferred(prefer), p.LinkIP, p.NodeIP)
+	pref, _ := p.preferred(prefer)
+	hosts := append(pref, p.LinkIP, p.NodeIP)
 	for _, h := range append(hosts, p.Addrs...) {
 		h, ok := normHost(h)
 		if ok && !seen[h] {
@@ -176,18 +177,19 @@ func (p mentatPeer) candidates(prefer []string) []string {
 // address, does not count. A tag alone is not enough: a box's ConnectX
 // address may be on a cable to another box only. preferred returns nil
 // when prefer is empty or the row lacks tags or probes, as from an older
-// mentatd.
-func (p mentatPeer) preferred(prefer []string) []string {
+// mentatd; known reports whether it had prefer, tags and probes to judge
+// by, so an address it does not return is known not to be preferred.
+func (p mentatPeer) preferred(prefer []string) (out []string, known bool) {
 	if len(prefer) == 0 {
-		return nil
+		return nil, false
 	}
 	var tags map[string][]string
 	var probes map[string]map[string]struct {
 		OK     bool  `json:"ok"`
 		Direct *bool `json:"direct"`
 	}
-	if json.Unmarshal(p.AddrTags, &tags) != nil || json.Unmarshal(p.Probes, &probes) != nil {
-		return nil
+	if json.Unmarshal(p.AddrTags, &tags) != nil || json.Unmarshal(p.Probes, &probes) != nil || tags == nil || probes == nil {
+		return nil, false
 	}
 	tagged := make(map[string]bool)
 	for addr, ts := range tags {
@@ -204,13 +206,24 @@ func (p mentatPeer) preferred(prefer []string) []string {
 			}
 		}
 	}
-	var out []string
 	for _, addr := range p.Addrs {
 		if h, ok := normHost(addr); ok && tagged[h] && reached[h] {
 			out = append(out, h)
 		}
 	}
-	return out
+	return out, true
+}
+
+// link returns the Link class of host, one of p's candidates.
+func (p mentatPeer) link(prefer []string, host string) string {
+	pref, known := p.preferred(prefer)
+	switch {
+	case slices.Contains(pref, host):
+		return LinkPreferred
+	case known:
+		return LinkOther
+	}
+	return ""
 }
 
 // normHost strips the brackets from an IPv6 address and unmaps an
@@ -317,6 +330,7 @@ func (m *Mentat) fetch() ([]Peer, error) {
 	sort.Strings(ids)
 	type row struct {
 		id    string
+		p     mentatPeer
 		hosts []string
 		port  int
 	}
@@ -324,25 +338,26 @@ func (m *Mentat) fetch() ([]Peer, error) {
 	for _, id := range ids {
 		p := table[id]
 		if hosts := p.candidates(m.prefer); p.Alive && id != st.NodeID && len(hosts) > 0 {
-			rows = append(rows, row{id, hosts, p.portOr(m.port)})
+			rows = append(rows, row{id, p, hosts, p.portOr(m.port)})
 		}
 	}
-	chosen := make([]string, len(rows))
+	chosen := make([]Peer, len(rows))
 	var wg sync.WaitGroup
 	for k, r := range rows {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			chosen[k] = net.JoinHostPort(m.choose(r.id, r.hosts, r.port), strconv.Itoa(r.port))
+			host := m.choose(r.id, r.hosts, r.port)
+			chosen[k] = Peer{Addr: net.JoinHostPort(host, strconv.Itoa(r.port)), Link: r.p.link(m.prefer, host)}
 		}()
 	}
 	wg.Wait()
 	seen := make(map[string]bool)
 	var out []Peer
-	for _, addr := range chosen {
-		if !seen[addr] {
-			seen[addr] = true
-			out = append(out, Peer{Addr: addr})
+	for _, p := range chosen {
+		if !seen[p.Addr] {
+			seen[p.Addr] = true
+			out = append(out, p)
 		}
 	}
 	return out, nil

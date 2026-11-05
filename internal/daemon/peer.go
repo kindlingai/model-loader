@@ -74,7 +74,12 @@ type sources struct {
 	// whole[k] means peer k is a plain peer too old for /segments whose
 	// /status reports the revision ready: it holds every segment.
 	whole []bool
-	peers int
+	// link[k] is how this node reaches peer k (discovery.Peer.Link).
+	link []string
+	// relays[k] is what the nodes peer k relays for hold (see
+	// server.SegmentsResponse.Relayed), nil if it relays none.
+	relays [][]server.RelayedHolder
+	peers  int
 	// holdersOnly leaves out of each segment's order the LAN nodes that
 	// do not hold it: a root filling a pull asks them with
 	// server.HeaderNoPull, so they could only answer 416.
@@ -88,9 +93,13 @@ const availabilityQueries = 8
 // buildSources lists m's sources and asks every peer, in parallel, which
 // segments it holds.
 func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, manifest *store.Manifest, peers []discovery.Peer) *sources {
-	s := &sources{avail: make([]*server.SegmentsResponse, len(peers)), whole: make([]bool, len(peers)), peers: len(peers)}
+	s := &sources{
+		avail: make([]*server.SegmentsResponse, len(peers)), whole: make([]bool, len(peers)),
+		link: make([]string, len(peers)), relays: make([][]server.RelayedHolder, len(peers)), peers: len(peers),
+	}
 	var wg sync.WaitGroup
 	for k, p := range peers {
+		s.link[k] = p.Link
 		s.fetchers = append(s.fetchers, transfer.PeerFetcher{
 			Client: d.cfg.Peers, Addr: p.Addr, Model: m.Name, Revision: m.Revision,
 		})
@@ -112,6 +121,7 @@ func (d *Daemon) buildSources(ctx context.Context, m catalog.Model, manifest *st
 			if err == nil {
 				if resp.Valid(manifest) {
 					s.avail[k] = resp
+					s.relays[k] = resp.ValidRelayed(manifest, d.cfg.NodeID)
 				}
 				return
 			}
@@ -157,6 +167,12 @@ func (d *Daemon) olderPeerHasAll(ctx context.Context, addr string, m catalog.Mod
 // the origin); then the other peers, in case they gained it since they
 // were asked; and last this node's own WAN source.
 //
+// A relay that relays a node holding the segment (see relay.go) goes
+// after the holders this node reaches at a preferred address
+// (discovery.LinkPreferred) and before every other holder: a holder
+// reached at no preferred address may be a box on the slow LAN that the
+// relay reaches on a fast link.
+//
 // The rotation is by chunk (see store.ChunkSize), the same for every
 // segment of one: a segment of a file of 64 MiB segments, so each one
 // starts at a different node, as before; the segments of one chunk of a
@@ -166,11 +182,16 @@ func (s *sources) order(fm store.FileManifest) func(i int) []int {
 	path := fm.Path
 	return func(i int) []int {
 		rot := fm.ChunkOf(i)
-		var peerHolders, rootHolders, unknown, roots, others []int
+		var peerHolders, rootHolders, farPeers, farRoots, relays, unknown, roots, others []int
 		for k := 0; k < s.peers; k++ {
 			a := s.avail[k]
 			has := s.whole[k] || (a != nil && a.Files[path].Has(i))
+			far := has && s.far(k, path, i)
 			switch {
+			case has && far && (s.whole[k] || !a.IsRoot()):
+				farPeers = append(farPeers, k)
+			case has && far:
+				farRoots = append(farRoots, k)
 			case s.whole[k]:
 				peerHolders = append(peerHolders, k)
 			case a == nil:
@@ -179,6 +200,8 @@ func (s *sources) order(fm store.FileManifest) func(i int) []int {
 				rootHolders = append(rootHolders, k)
 			case has:
 				peerHolders = append(peerHolders, k)
+			case s.relays[k] != nil && relayHolds(s.relays[k], path, i):
+				relays = append(relays, k)
 			case a.IsRoot():
 				roots = append(roots, k)
 			default:
@@ -188,6 +211,9 @@ func (s *sources) order(fm store.FileManifest) func(i int) []int {
 		out := make([]int, 0, len(s.fetchers))
 		out = appendRotated(out, peerHolders, rot)
 		out = appendRotated(out, rootHolders, rot)
+		out = appendRotated(out, relays, rot)
+		out = appendRotated(out, farPeers, rot)
+		out = appendRotated(out, farRoots, rot)
 		out = append(out, unknown...)
 		if !s.holdersOnly {
 			out = append(out, roots...)
@@ -198,6 +224,46 @@ func (s *sources) order(fm store.FileManifest) func(i int) []int {
 		}
 		return out
 	}
+}
+
+// far reports whether holder k of segment i of the file at path ranks
+// after a relay of it: some other peer relays a node holding it, and this
+// node reaches k at an address with no preferred tag
+// (discovery.LinkOther), or does not know how it reaches k and k is a node
+// that relay relays for (a box named in -peers, say).
+func (s *sources) far(k int, path string, i int) bool {
+	if s.link[k] == discovery.LinkPreferred {
+		return false
+	}
+	id := ""
+	if a := s.avail[k]; a != nil {
+		id = a.NodeID
+	}
+	for j := 0; j < s.peers; j++ {
+		if j == k || s.relays[j] == nil {
+			continue
+		}
+		for _, h := range s.relays[j] {
+			if fs, ok := h.Files[path]; !ok || !fs.Has(i) {
+				continue
+			}
+			if s.link[k] == discovery.LinkOther || (id != "" && h.NodeID == id) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// relayHolds reports whether one of hs holds segment i of the file at
+// path.
+func relayHolds(hs []server.RelayedHolder, path string, i int) bool {
+	for _, h := range hs {
+		if fs, ok := h.Files[path]; ok && fs.Has(i) {
+			return true
+		}
+	}
+	return false
 }
 
 // appendRotated appends ks to out starting at ks[i % len(ks)].

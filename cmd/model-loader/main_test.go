@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/kindlingai/model-loader/internal/daemon"
 	"github.com/kindlingai/model-loader/internal/discovery"
 	"github.com/kindlingai/model-loader/internal/server"
 )
@@ -232,5 +233,19 @@ func TestMentatRecord(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mentatRecord = %+v, want %+v", got, want)
+	}
+}
+
+// -relay takes a host:port list, and rejects anything else.
+func TestParseFlagsRelay(t *testing.T) {
+	cfg, err := parseFlags([]string{"-mode", "peer", "-catalog", "c.yaml", "-relay", " s.lan:7762, 10.0.0.9:7762 ,"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := daemon.ParseRelayFor(cfg.relay); !reflect.DeepEqual(got, []string{"s.lan:7762", "10.0.0.9:7762"}) {
+		t.Fatalf("relay = %v", got)
+	}
+	if _, err := parseFlags([]string{"-mode", "peer", "-catalog", "c.yaml", "-relay", "s.lan"}); err == nil {
+		t.Fatal("-relay s.lan accepted")
 	}
 }

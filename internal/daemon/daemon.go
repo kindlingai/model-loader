@@ -122,12 +122,13 @@ type Daemon struct {
 	pulls  map[string]*pullCall          // see once
 	claims map[string]map[int]*pullClaim // see claimSegments
 
-	needMu    sync.Mutex
-	needs     map[string]*resolvedNeed // see resolveRequest
-	pullSrcs  map[string]cachedSources
-	pullLimit *transfer.Limiter // pull-through segment fetches, by priority
-	pullFlush *transfer.Limiter // pull-through syncs to the store
-	pullStats transfer.Stats    // where pull-through transfers spend their time
+	needMu      sync.Mutex
+	needs       map[string]*resolvedNeed // see resolveRequest
+	pullSrcs    map[string]cachedSources
+	pullLimit   *transfer.Limiter // pull-through segment fetches, by priority
+	pullFlush   *transfer.Limiter // pull-through syncs to the store
+	pullReorder *transfer.Reorder // pull-through runs waiting for their file's whole-file hash
+	pullStats   transfer.Stats    // where pull-through transfers spend their time
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -157,6 +158,9 @@ func New(cfg Config) *Daemon {
 		pullSrcs:   make(map[string]cachedSources),
 		pullLimit:  transfer.NewLimiter(cfg.PullWorkers),
 		pullFlush:  transfer.NewLimiter(cfg.PullWorkers),
+		// Room for one run per pull slot to land ahead of the file's
+		// whole-file hash (#52).
+		pullReorder: transfer.NewReorder(int64(cfg.PullWorkers) * store.DefaultSegmentSize),
 	}
 }
 

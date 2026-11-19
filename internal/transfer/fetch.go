@@ -117,6 +117,11 @@ type Options struct {
 	// another uses the slot; it takes a Flush slot first, so a store
 	// slower than the sources holds the sources back.
 	Flush *Limiter
+	// Reorder, if set, holds runs that land ahead of their file's
+	// in-order whole-file hash until it reaches them, so the whole-file
+	// check need not read them back from the store (see FinishFile).
+	// Without it, only runs that land in order are hashed as they stream.
+	Reorder *Reorder
 	// Stats, if set, adds up where each segment transfer spends its time.
 	Stats *Stats
 }
@@ -155,8 +160,10 @@ type CheckedFetcher interface {
 // falling back to the next one when a fetcher doesn't have it yet or
 // fails. Each segment is verified as soon as it lands: against the
 // manifest when fm has segment hashes, else against the sha256 its source
-// claims for it (see Claimer). Once every segment of the file is done,
-// needed or not, the whole file is verified once more and marked complete;
+// claims for it (see Claimer). Each run is also hashed in file order as it
+// lands, as far as it can be (see Options.Reorder). Once every segment of
+// the file is done, needed or not, the whole file is verified once more and
+// marked complete;
 // until then the file is partial, a sparse file with every held segment at
 // its own offset. rs is updated and persisted to st as progress is made,
 // so a restart resumes from the last saved segment rather than from
@@ -228,6 +235,8 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	}
 	runs := groupRuns(fm, todo, order)
 	workers = min(workers, max(1, len(runs)))
+	whole := wholeFor(st.FilePath(model, revision, fm.Path), fm)
+	unexpect := whole.expect(runs, fileState.SegmentsDone)
 
 	var (
 		mu       sync.Mutex // guards dead and firstErr
@@ -263,7 +272,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 		fetch := func(first, n int) (landed, error) {
 			start, _ := fm.SegmentBounds(first)
 			_, end := fm.SegmentBounds(first + n - 1)
-			sums, trusts, err := fetchRun(ctx, f, fm, first, n, fetchers, order(first), checksOverlapping(opts.Checks, start, end), dead, &mu, stats)
+			sums, trusts, err := fetchRun(ctx, f, fm, first, n, fetchers, order(first), checksOverlapping(opts.Checks, start, end), dead, &mu, stats, whole, opts.Reorder)
 			return landed{first, n, sums, trusts}, err
 		}
 		l, err := fetch(first, n)
@@ -384,6 +393,7 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 	}
 	close(queue)
 	wg.Wait()
+	unexpect()
 	if firstErr != nil && (ctx.Err() != nil || len(PendingChecks(fm, rs, opts.Checks)) == 0) {
 		if marked.Load() && (fm.Small() || opts.SaveSoon) {
 			// What landed, before giving up.
@@ -423,11 +433,13 @@ func FetchFile(ctx context.Context, st *store.Store, model, revision string, fm 
 }
 
 // FinishFile verifies fm whole and marks it complete once every segment is
-// held. A file with segments still missing is left partial. If the whole
-// file fails its check, every segment not verified against manifest
-// segment hashes is dropped, so it is fetched again rather than served. If
-// segments the manifest verified are left, fetching them again cannot
-// change them; the file is marked WholeFailed and nothing of it is served.
+// held. What FetchFile hashed in order as it landed is not read back from
+// the store; the rest is. A file with segments still missing is left
+// partial. If the whole file fails its check, every segment not verified
+// against manifest segment hashes is dropped, so it is fetched again
+// rather than served. If segments the manifest verified are left,
+// fetching them again cannot change them; the file is marked WholeFailed
+// and nothing of it is served.
 func FinishFile(st *store.Store, f *os.File, fm store.FileManifest, rs *store.RevisionState) error {
 	unlock := rs.LockFile(fm.Path)
 	defer unlock()
@@ -439,7 +451,8 @@ func FinishFile(st *store.Store, f *os.File, fm store.FileManifest, rs *store.Re
 	if fs.WholeFailed {
 		return failed // checked before; the bytes have not changed since.
 	}
-	ok, err := store.VerifyWholeFile(f, fm)
+	h, from := takeWhole(f.Name(), fm)
+	ok, err := store.VerifyWholeFileFrom(f, fm, h, from)
 	if err != nil {
 		return fmt.Errorf("fetch %s: verify whole file: %w", fm.Path, err)
 	}
@@ -631,9 +644,9 @@ func groupRuns(fm store.FileManifest, todo []int, order func(int) []int) [][2]in
 //
 // At most the run's own bytes are written, so a source that sends too
 // much cannot overwrite a neighbouring segment another worker holds. Each
-// segment is hashed as it streams in; the caller syncs the run before it
-// marks it held.
-func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex, stats *Stats) ([][sha256.Size]byte, []string, error) {
+// segment is hashed as it streams in, and the run into whole too; the
+// caller syncs the run before it marks it held.
+func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n int, fetchers []Fetcher, order []int, checks []store.RangeCheck, dead []bool, mu *sync.Mutex, stats *Stats, whole *wholeHash, reorder *Reorder) ([][sha256.Size]byte, []string, error) {
 	start, _ := fm.SegmentBounds(first)
 	_, end := fm.SegmentBounds(first + n - 1)
 	length := end - start
@@ -681,7 +694,8 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 		// segment is hashed as it is written, not read back from the
 		// store: on NFS that read is as slow as the write.
 		hs := newSegmentHasher(fm, first, n, stats)
-		dst := io.MultiWriter(timedWriter{io.NewOffsetWriter(f, start), &stats.write}, hs)
+		run := whole.begin(first, n, length, reorder, stats)
+		dst := io.MultiWriter(timedWriter{io.NewOffsetWriter(f, start), &stats.write}, hs, run)
 		buf := copyBufs.Get().(*[]byte)
 		copied, copyErr := io.CopyBuffer(dst, timedReader{io.LimitReader(rc, length), &stats.read}, *buf)
 		copyBufs.Put(buf)
@@ -705,6 +719,7 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 			bad = closeErr
 		}
 		if bad != nil {
+			run.done(false)
 			kill(k)
 			lastErr = bad
 			continue
@@ -712,6 +727,7 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 
 		sums := hs.done()
 		if len(sums) != n {
+			run.done(false)
 			return nil, nil, fmt.Errorf("hash %s segments %d-%d: %d of %d segments written whole", fm.Path, first, first+n-1, len(sums), n)
 		}
 		trusts := make([]string, n)
@@ -743,6 +759,7 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 			case n > 1:
 				// Not the source's fault yet: it may vouch for one
 				// segment at a time.
+				run.done(false)
 				return nil, nil, errUnclaimed
 			default:
 				bad = errUnclaimed
@@ -755,10 +772,12 @@ func fetchRun(ctx context.Context, f *os.File, fm store.FileManifest, first, n i
 			}
 		}
 		if bad != nil {
+			run.done(false)
 			kill(k)
 			lastErr = bad
 			continue
 		}
+		run.done(true)
 		return sums, trusts, nil
 	}
 	if lastErr == nil {

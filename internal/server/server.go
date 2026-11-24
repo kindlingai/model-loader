@@ -94,7 +94,8 @@ type StatusProvider interface {
 type Server struct {
 	store  *store.Store
 	status StatusProvider
-	puller Puller // nil unless pull-through is on; see SetPuller
+	puller Puller  // nil unless pull-through is on; see SetPuller
+	relay  Relayer // nil unless relay mode is on; see SetRelayer
 	mux    *http.ServeMux
 }
 

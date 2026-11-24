@@ -76,6 +76,7 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 	if err != nil {
 		return nil, err
 	}
+	markRelayed(req)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("peer %s: manifest: %w", addr, err)
@@ -95,6 +96,22 @@ func (c *PeerClient) Manifest(ctx context.Context, addr, model, revision string)
 }
 
 type noPullKey struct{}
+
+type relayedKey struct{}
+
+// WithRelayed marks ctx so that requests made with it say they come from
+// a relay (see server.HeaderRelayed): the node asked answers from what it
+// holds itself.
+func WithRelayed(ctx context.Context) context.Context {
+	return context.WithValue(ctx, relayedKey{}, true)
+}
+
+// markRelayed sets server.HeaderRelayed on req if its context asks for it.
+func markRelayed(req *http.Request) {
+	if req.Context().Value(relayedKey{}) != nil {
+		req.Header.Set(server.HeaderRelayed, "1")
+	}
+}
 
 // WithNoPull marks ctx so that blob requests made with it ask the node to
 // serve only what it holds (see server.HeaderNoPull).
@@ -121,6 +138,7 @@ func (c *PeerClient) Segments(ctx context.Context, addr, model, revision string)
 	if err != nil {
 		return nil, err
 	}
+	markRelayed(req)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("peer %s: segments: %w", addr, err)
@@ -198,6 +216,54 @@ func (c *PeerClient) OpenBlob(ctx context.Context, addr, model, revision, path s
 			return nil, fmt.Errorf("peer %s: blob %s: %s: %s", addr, path, resp.Status, m)
 		}
 		return nil, fmt.Errorf("peer %s: blob %s: %s", addr, path, resp.Status)
+	}
+}
+
+// relayRequestHeaders are the headers of a blob request a relay passes on
+// to the node that holds the range.
+var relayRequestHeaders = []string{"Range", server.HeaderRangeXXH64, server.HeaderPriority}
+
+// RelayBlob asks the node at addr for the blob in, a blob request this
+// node is relaying, with the same method, range, checks and priority, for
+// only what that node holds (server.HeaderNoPull and
+// server.HeaderRelayed). It returns the answer as it is: for 200 or 206
+// the caller closes its body; any other answer is closed and returned as
+// ErrRangeUnavailable (404, 416) or an error.
+func (c *PeerClient) RelayBlob(ctx context.Context, addr, model, revision, path string, in *http.Request) (*http.Response, error) {
+	method := http.MethodGet
+	if in.Method == http.MethodHead {
+		method = http.MethodHead
+	}
+	u := fmt.Sprintf("http://%s/blob/%s/%s/%s", addr, model, revision, escapePath(path))
+	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range relayRequestHeaders {
+		if v := in.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	req.Header.Set(server.HeaderNoPull, "1")
+	req.Header.Set(server.HeaderRelayed, "1")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("peer %s: blob %s: %w", addr, path, err)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent:
+		return resp, nil
+	case http.StatusNotFound, http.StatusRequestedRangeNotSatisfiable:
+		resp.Body.Close()
+		return nil, ErrRangeUnavailable
+	case http.StatusUnprocessableEntity:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		return nil, checkFailed(fmt.Sprintf("peer %s: blob %s: %s", addr, path, strings.TrimSpace(string(msg))))
+	default:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		return nil, fmt.Errorf("peer %s: blob %s: %s: %s", addr, path, resp.Status, strings.TrimSpace(string(msg)))
 	}
 }
 

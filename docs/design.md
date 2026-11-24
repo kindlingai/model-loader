@@ -234,6 +234,37 @@ segment is held, as nothing more is known to check it against.
 A consumer checksum given after its range was fetched is checked against
 the held bytes on the next pass, once; one that fails drops what it covers.
 
+### Relay
+
+A node can copy a segment only from a node it reaches. When the box that
+holds a model (S, a store with room for several releases) reaches the
+serving boxes only over the slow LAN, but another box (R) links it to
+their fast fabric, R can relay: `-relay=s.lan:7762` names the nodes R
+relays for (kindlingai/model-loader#48).
+
+- A blob request for a range R does not hold goes to each node it relays
+  for that holds some of the file, in turn, with `X-No-Pull` and
+  `X-Relayed`. R streams the first answer to the asker as it arrives,
+  through a buffer of 256 KiB, and stores none of it: R's disk is not
+  used, and R needs no manifest of the model.
+- R passes on the holder's `X-Segment-SHA256` and `X-Segment-Trust`. The
+  asker checks the bytes as it would a direct copy, so the relay adds no
+  trust.
+- R's `/segments` lists, apart from what it holds, what each node it relays
+  for holds (`relayed`, with that node's ID). R asks each at most once per
+  5 s.
+- A relayed transfer holds one of R's `-max-concurrent-transfers` slots,
+  at the asker's priority, as well as the asker's own slot.
+- A request with `X-Relayed` is answered only from what the node holds,
+  and its `/segments` has no `relayed`: relays do not chain or loop.
+
+Source selection ranks a relay of a segment after the holders the asker
+reaches at a preferred address (`-mentat-prefer-tags`) and before the
+other holders: those mentat discovery reaches at an address with no
+preferred tag, and those the relay names as relayed (a box in `-peers`,
+say, whose link discovery does not know). A relay that fails drops out
+for the rest of the file, as a failed peer does.
+
 ### Requests
 
 The selection file is static. A local consumer says what it needs at run
@@ -492,6 +523,10 @@ needs, it then tries, in order:
 3. peers that did not answer the question (an older root, or a timeout);
 4. the other peers, in case they gained the segment since they were asked;
 5. (root mode only) the file's WAN source.
+
+A relay (see "Relay") of a segment goes after the holders this node
+reaches at a preferred address, and before the holders it reaches only at
+one with no preferred tag or that the relay relays for.
 
 Within the first two groups each segment starts at a different node, so the
 segments of one file come from several nodes at once. Every segment

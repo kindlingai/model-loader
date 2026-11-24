@@ -88,6 +88,12 @@ type Config struct {
 	// Dedup copies a file another revision in the store holds whole with
 	// the same sha256 instead of fetching it (see dedup.go).
 	Dedup bool
+
+	// RelayFor is the nodes, as host:port, this node relays for: it
+	// serves a range it does not hold that one of them holds by fetching
+	// it from that node as it is asked for, without storing it, and lists
+	// what they hold in its /segments (see relay.go). Empty: no relay.
+	RelayFor []string
 }
 
 // Daemon runs the reconcile loop and reports status via the StatusProvider
@@ -128,6 +134,9 @@ type Daemon struct {
 	pullLimit *transfer.Limiter // pull-through segment fetches, by priority
 	pullFlush *transfer.Limiter // pull-through syncs to the store
 	pullStats transfer.Stats    // where pull-through transfers spend their time
+
+	relayMu sync.Mutex
+	relayed map[string]cachedRelayed // see relayedAt
 }
 
 // New builds a Daemon from cfg, applying defaults for anything left zero.
@@ -157,6 +166,7 @@ func New(cfg Config) *Daemon {
 		pullSrcs:   make(map[string]cachedSources),
 		pullLimit:  transfer.NewLimiter(cfg.PullWorkers),
 		pullFlush:  transfer.NewLimiter(cfg.PullWorkers),
+		relayed:    make(map[string]cachedRelayed),
 	}
 }
 

@@ -11,7 +11,23 @@ import "context"
 // Peer is one other node's address, as "host:port".
 type Peer struct {
 	Addr string
+	// Link is how this node reaches the peer at Addr, as far as the
+	// backend knows: LinkPreferred, LinkOther, or "" for unknown.
+	Link string
 }
+
+// Link classes of a Peer. A node ranks a relay (see docs/design.md,
+// "Relay") after the holders it reaches at a preferred address or does
+// not know how it reaches, and before those it reaches at LinkOther.
+const (
+	// LinkPreferred is an address with a preferred tag (such as
+	// connectx), probed direct.
+	LinkPreferred = "preferred"
+	// LinkOther is an address with no preferred tag, at a box whose
+	// addresses are tagged: the LAN, when the box has a fabric address
+	// this node cannot reach.
+	LinkOther = "other"
+)
 
 // Discoverer lists the currently known peers. Implementations may cache or
 // re-resolve on every call; callers should treat the result as a snapshot

@@ -26,6 +26,11 @@ type SegmentsResponse struct {
 	// sources can prefer a peer to a root with one request.
 	Roles []string                `json:"roles"`
 	Files map[string]FileSegments `json:"files"`
+	// Relayed is what the nodes this one relays for hold, apart from
+	// Files: this node serves those segments by fetching them from that
+	// node as they are asked for, and does not hold them (see Relayer).
+	// A node in no relay mode, or asked by a relay, leaves it out.
+	Relayed []RelayedHolder `json:"relayed,omitempty"`
 }
 
 // IsRoot reports whether the node has the root role.
@@ -69,11 +74,22 @@ func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
 	if r.Model != m.Model || r.Revision != m.Revision {
 		return false
 	}
+	return validFiles(r.Files, segmentCounts(m))
+}
+
+// segmentCounts maps each file of m to its number of segments.
+func segmentCounts(m *store.Manifest) map[string]int {
 	segs := make(map[string]int, len(m.Files))
 	for _, fm := range m.Files {
 		segs[fm.Path] = fm.NumSegments()
 	}
-	for path, fs := range r.Files {
+	return segs
+}
+
+// validFiles reports whether files are all files of segs, with held
+// ranges inside each file's segments.
+func validFiles(files map[string]FileSegments, segs map[string]int) bool {
+	for path, fs := range files {
 		if n, ok := segs[path]; !ok || fs.Segments != n {
 			return false
 		}
@@ -87,6 +103,25 @@ func (r *SegmentsResponse) Valid(m *store.Manifest) bool {
 		}
 	}
 	return true
+}
+
+// ValidRelayed returns the entries of r.Relayed whose files are all in m,
+// with held ranges inside each file's segments, leaving out any for
+// self, the asking node's own ID: a node does not copy from itself
+// through a relay. Valid does not judge Relayed, so a relayed entry that
+// is not valid costs only that entry.
+func (r *SegmentsResponse) ValidRelayed(m *store.Manifest, self string) []RelayedHolder {
+	if len(r.Relayed) == 0 {
+		return nil
+	}
+	segs := segmentCounts(m)
+	var out []RelayedHolder
+	for _, h := range r.Relayed {
+		if (h.NodeID == "" || h.NodeID != self) && validFiles(h.Files, segs) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // HeldRanges packs done into half-open index ranges.
@@ -124,6 +159,9 @@ func (s *Server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	if c, ok := s.status.(Cataloger); ok {
 		named := c.Cataloged(model, revision)
 		resp.Cataloged = &named
+	}
+	if s.relayable(r) {
+		resp.Relayed = s.relay.RelayedSegments(r.Context(), model, revision)
 	}
 	m, err := s.store.LoadManifest(model, revision)
 	if err != nil {

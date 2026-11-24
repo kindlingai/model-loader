@@ -135,6 +135,20 @@ revision: a root's copy lets a peer evict its own only while it is `true`
 (see "Disk budget and eviction" in `docs/design.md`). A fetching node asks every peer once per reconcile pass
 and prefers plain peers that hold a segment to roots that hold it.
 
+A node in relay mode (`-relay`) adds what each node it relays for holds,
+apart from `files`:
+
+```json
+"relayed": [
+  {"node_id": "nas", "files": {"w.bin": {"segments": 12, "held": [[0, 12]]}}}
+]
+```
+
+It serves those segments by fetching them from that node when they are
+asked for, and does not hold them. An asker ignores an entry for itself
+or one that does not fit its manifest. A request with `X-Relayed` gets no
+`relayed`.
+
 ## `GET /blob/{model}/{revision}/{path}`
 
 Serves the file at `path`, honoring `Range` requests (`Accept-Ranges: bytes`).
@@ -162,6 +176,14 @@ Request header:
 - `X-Priority: N`: the priority of the request this range is for on the
   asking node. A root pulling through gives a free pull slot to the
   highest waiting priority first. Default 0.
+- `X-Relayed: 1`: a relay sends this request for the node that asked it.
+  Serve only what this node holds; do not relay it on.
+
+A node in relay mode answers a range it does not hold, of a revision it
+may have no manifest of, from a node it relays for that holds it, with
+that node's status, `Content-Range`, `X-Segment-SHA256` and
+`X-Segment-Trust`. If none holds it, the answer is as without relay; if
+one failed, a `502`.
 
 Response headers, for a request of whole segments, at most 256, that
 this node holds a sha256 for every one of (the requester's manifest may

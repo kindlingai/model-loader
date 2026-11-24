@@ -155,7 +155,10 @@ func TestMentatPreferTags(t *testing.T) {
 	m := newMentat(t, fakeMentatd(t, http.StatusOK, mentatTaggedJSON))
 	m.prefer = []string{"connectx"}
 	got, err := m.Peers(context.Background())
-	want := []Peer{{Addr: "10.0.0.9:7762"}, {Addr: "10.0.0.8:7762"}, {Addr: "10.0.2.5:7762"}, {Addr: "10.0.0.6:7762"}, {Addr: "10.0.0.7:7762"}}
+	// Each says how it is reached: x at a preferred address; v and y,
+	// whose tagged addresses this box does not reach direct, at another;
+	// z (older mentatd) and w (malformed probes) unknown.
+	want := []Peer{{Addr: "10.0.0.9:7762", Link: LinkOther}, {Addr: "10.0.0.8:7762"}, {Addr: "10.0.2.5:7762", Link: LinkPreferred}, {Addr: "10.0.0.6:7762", Link: LinkOther}, {Addr: "10.0.0.7:7762"}}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("Peers = %v, %v; want %v", got, err, want)
 	}

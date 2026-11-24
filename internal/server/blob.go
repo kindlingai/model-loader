@@ -23,12 +23,16 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 
 	manifest, err := s.store.LoadManifest(model, revision)
 	if err != nil {
-		http.NotFound(w, r)
+		if !s.relayable(r) || !s.relayBlob(w, r, model, revision, relPath) {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	fm, ok := manifest.Find(relPath)
 	if !ok {
-		http.NotFound(w, r)
+		if !s.relayable(r) || !s.relayBlob(w, r, model, revision, relPath) {
+			http.NotFound(w, r)
+		}
 		return
 	}
 
@@ -58,6 +62,12 @@ func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	state, err := s.revisionState(manifest)
 	if err != nil {
 		http.Error(w, "state unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	// A relay serves what it does not hold from a node it relays for that
+	// holds it, before a root would pull it from the origin.
+	if fm.Size > 0 && s.relayable(r) && !state.RangeReady(fm, start, end+1) && s.relayBlob(w, r, model, revision, relPath) {
 		return
 	}
 

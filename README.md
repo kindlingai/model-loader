@@ -46,13 +46,31 @@ end-to-end.
 
 ## Releases
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which publishes:
+Releases are automated with `release-please` (`release-please-config.json`,
+`.release-please-manifest.json`, `.github/workflows/release.yml`). Pull request
+titles follow [Conventional Commits](https://www.conventionalcommits.org/)
+(checked by `.github/workflows/pr-title.yml`): before `1.0.0`, `feat:`, `fix:`,
+`perf:`, and `revert:` bump the patch version (`0.1.x`), while breaking changes
+(`!:` or `BREAKING CHANGE:`) bump the minor version (`0.x.0`); use a
+`Release-As: X.Y.Z` footer to request an explicit version.
 
-- `ghcr.io/kindlingai/model-loader:<version>` for linux/amd64 and
-  linux/arm64 (and `:latest` for versions without a `-suffix`). The binary is
-  at `/usr/local/bin/model-loader`.
-- A GitHub release with `model-loader_<version>_linux_{amd64,arm64}.tar.gz`
-  and `SHA256SUMS`.
+Merging the Release PR updates `CHANGELOG.md` and `.release-please-manifest.json`,
+creates the `vX.Y.Z` tag and GitHub Release, and publishes:
+
+- `ghcr.io/kindlingai/model-loader:<version>` and `:v<version>` for linux/amd64
+  and linux/arm64 (plus `:latest` for the newest non-prerelease version). The
+  binary is at `/usr/local/bin/model-loader`.
+- GitHub Release assets (`model-loader_<version>_linux_{amd64,arm64}.tar.gz`
+  and `SHA256SUMS`) with GitHub build-provenance attestations for the tarballs,
+  `SHA256SUMS`, and container image:
+
+```bash
+gh attestation verify model-loader_<version>_linux_arm64.tar.gz -R kindlingai/model-loader
+gh attestation verify oci://ghcr.io/kindlingai/model-loader@sha256:<digest> -R kindlingai/model-loader
+```
+
+To republish or backfill an existing `vX.Y.Z` tag manually, trigger
+`.github/workflows/release.yml` via `workflow_dispatch` with the `tag` input.
 
 `model-loader -version` prints the version the binary was built from.
 

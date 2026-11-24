@@ -79,7 +79,12 @@ partial:
   absolute offsets from the file's own index. Bytes outside held segments
   are holes and read as zeros; only the ranges asked for are meaningful.
 - A file is checked against its whole-file sha256, and marked complete,
-  once every one of its segments is held.
+  once every one of its segments is held. The sha256 is taken in file
+  order as segments stream in; a root keeps a run that lands ahead of it
+  in memory (one 64 MiB run per pull worker, node-wide) until it gets
+  there. Only what it could not reach, a run that landed with no room or
+  was held before a restart and everything after it, is read back from
+  the store, so a store across the network is not read a second time.
 - `-verify-on-start` re-hashes every held segment of each model once when
   the process starts, and fetches again any segment that no longer matches.
 

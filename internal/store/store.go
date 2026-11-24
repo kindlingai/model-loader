@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -570,6 +571,12 @@ func HashSegments(f *os.File, fm FileManifest, first, n int) ([][sha256.Size]byt
 // correctness, used once every segment is believed done. Pages are dropped
 // from page cache chunk by chunk as they are hashed.
 func VerifyWholeFile(f *os.File, fm FileManifest) (bool, error) {
+	return VerifyWholeFileFrom(f, fm, sha256.New(), 0)
+}
+
+// VerifyWholeFileFrom is VerifyWholeFile for a caller whose h, a sha256,
+// has the file's first from bytes in it already: only the rest is read.
+func VerifyWholeFileFrom(f *os.File, fm FileManifest, h hash.Hash, from int64) (bool, error) {
 	if fm.SHA256 == "" {
 		// A file the origin gave no digest for (only in a manifest a root
 		// published for pull-through): every segment was checked as it
@@ -584,8 +591,7 @@ func VerifyWholeFile(f *os.File, fm FileManifest) (bool, error) {
 	if info.Size() != fm.Size {
 		return false, nil
 	}
-	h := sha256.New()
-	if err := hashUncached(f, 0, fm.Size, h); err != nil {
+	if err := hashUncached(f, from, fm.Size-from, h); err != nil {
 		return false, fmt.Errorf("%s: %w", fm.Path, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)) == fm.SHA256, nil

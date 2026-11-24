@@ -501,7 +501,7 @@ func (d *Daemon) pullFetch(ctx context.Context, m catalog.Model, fm store.FileMa
 	return transfer.FetchFile(pctx, d.cfg.Store, m.Name, m.Revision, fm, rs,
 		srcs.fetchers, transfer.Options{
 			Need: need, Order: srcs.order(fm), SaveSoon: true,
-			Limit: d.pullLimit, Flush: d.pullFlush, Priority: server.Priority(ctx), Wait: ctx,
+			Limit: d.pullLimit, Flush: d.pullFlush, Reorder: d.pullReorder, Priority: server.Priority(ctx), Wait: ctx,
 			Timeout: pullTimeout, Stats: &d.pullStats,
 		})
 }

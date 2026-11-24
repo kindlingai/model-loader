@@ -170,7 +170,7 @@ func New(cfg Config) *Daemon {
 		// Room for one run per pull slot to land ahead of the file's
 		// whole-file hash (#52).
 		pullReorder: transfer.NewReorder(int64(cfg.PullWorkers) * store.DefaultSegmentSize),
-		relayed:    make(map[string]cachedRelayed),
+		relayed:     make(map[string]cachedRelayed),
 	}
 }
 
